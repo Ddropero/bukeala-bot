@@ -1,0 +1,47 @@
+name = "bukeala-bot"
+main = "src/index.ts"
+compatibility_date = "2025-02-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Smart Placement: place the Worker close to the backend (Bukeala is in
+# AWS us-east-1) so all fetches go via a US datacenter and avoid the AMS
+# CF WAF rule that blocks European traffic to Bukeala.
+[placement]
+mode = "smart"
+
+# Keep-alive cron: ping Bukeala every 5 min during business hours so the
+# Java session doesn't expire. Reduces how often the user has to re-capture.
+[triggers]
+# Multiple crons:
+#   "*/5 12-23 * * *"  → keepAlive (every 5 min, 7am-6pm Colombia)
+#   "0 12 * * *"       → dailySummary (7am Colombia exactly)
+#   "*/10 12-23 * * *" → newBookingsWatch (every 10 min, 7am-6pm Colombia)
+crons = ["*/5 12-23 * * *", "0 12 * * *", "*/10 12-23 * * *"]
+
+[vars]
+BUKEALA_BASE = "https://appoint.tuscitasmedicas.com/keraltyadscritos"
+BRANCH_ID = "456"
+
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "854907b4b344415abe9d46b9d62fa744"
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "372dbe91417340d995ac6aa831344898"
+
+# Durable Object: geographic relay pinned to us-east. See src/proxy.ts.
+[[durable_objects.bindings]]
+name = "BUKEALA_PROXY"
+class_name = "BukealaProxy"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["BukealaProxy"]
+
+# Secrets — set with `wrangler secret put <NAME>`:
+#   CAPTURE_TOKEN        random 32+ char string, used by the extension
+#   ENCRYPTION_KEY       64 hex chars (=32 bytes), AES-256-GCM key for cookies
+#   TELEGRAM_BOT_TOKEN   from @BotFather
+#   ALLOWED_CHAT_ID      your numeric Telegram chat id (from @userinfobot)
+#   WEBHOOK_SECRET       random string, used by Telegram → Worker webhook auth

@@ -1,0 +1,20 @@
+{
+  "name": "bukeala-native-host",
+  "version": "1.0.0",
+  "description": "Local Windows service that periodically logs in to Bukeala via Playwright and pushes fresh cookies to the Cloudflare Worker. Bypasses CAS-TGC expiry by re-logging in from a real Chromium browser (with stealth plugin to bypass Radware Bot Manager).",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "run": "node index.js",
+    "test-once": "node index.js --once",
+    "postinstall": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

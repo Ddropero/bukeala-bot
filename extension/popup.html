@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>Bukeala Session</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        width: 320px; padding: 14px; margin: 0;
+      }
+      h1 { font-size: 14px; margin: 0 0 10px; }
+      label { display: block; font-size: 12px; margin: 8px 0 2px; opacity: .8; }
+      input[type=text], input[type=password] {
+        width: 100%; box-sizing: border-box; padding: 6px 8px;
+        border: 1px solid #ccc; border-radius: 4px; font-size: 12px;
+      }
+      button {
+        width: 100%; padding: 9px; margin-top: 12px; border: 0; border-radius: 4px;
+        background: #2563eb; color: white; cursor: pointer; font-weight: 600;
+      }
+      button:disabled { background: #9aa6b6; cursor: not-allowed; }
+      #status { margin-top: 10px; font-size: 12px; min-height: 1em; }
+      .ok { color: #059669; }
+      .err { color: #dc2626; }
+      .hint { font-size: 11px; opacity: .7; margin-top: 4px; }
+      .auto-row {
+        display: flex; align-items: center; gap: 8px;
+        padding: 8px; margin-top: 12px;
+        border: 1px solid #ddd; border-radius: 4px;
+      }
+      .auto-row input[type=checkbox] { margin: 0; }
+      .auto-row label { margin: 0; font-size: 12px; opacity: 1; flex: 1; cursor: pointer; }
+      #lastAuto { font-size: 11px; opacity: .6; margin-top: 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>Sesión Bukeala</h1>
+
+    <label>Worker URL (endpoint /capture)</label>
+    <input id="workerUrl" type="text" placeholder="https://...workers.dev/capture" />
+
+    <label>Capture token</label>
+    <input id="captureToken" type="password" placeholder="CAPTURE_TOKEN" />
+
+    <button id="sendBtn">Enviar sesión ahora</button>
+
+    <div class="auto-row">
+      <input type="checkbox" id="autoMode" />
+      <label for="autoMode">Auto-enviar cada 10 min mientras Bukeala esté abierto</label>
+    </div>
+
+    <div id="status"></div>
+    <div id="lastAuto"></div>
+    <div class="hint">Antes de enviar: estar logueado en Bukeala en otra pestaña.</div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
