@@ -62,7 +62,9 @@ function readConfig() {
       `Config not found. Run install.ps1 first. Expected at: ${CONFIG_PATH}`,
     );
   }
-  const raw = fs.readFileSync(CONFIG_PATH, "utf8");
+  let raw = fs.readFileSync(CONFIG_PATH, "utf8");
+  // Strip UTF-8 BOM if PowerShell wrote it
+  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
   const cfg = JSON.parse(raw);
   if (!cfg.workerUrl || !cfg.captureToken) {
     throw new Error("config.json must have workerUrl and captureToken");
