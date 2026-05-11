@@ -62,13 +62,22 @@ const CONTEXT_OPTIONS = {
  * { username, password } in plaintext (only this Windows user can decrypt).
  */
 function readCredentials(credsPath) {
-  if (!fs.existsSync(credsPath)) {
+  // Priority 1: BUKEALA_CREDS_RAW env var (set by watcher) — bypasses
+  // file visibility issues in scheduled-task spawn context.
+  let enc;
+  if (process.env.BUKEALA_CREDS_RAW) {
+    enc = process.env.BUKEALA_CREDS_RAW.trim();
+  } else if (fs.existsSync(credsPath)) {
+    enc = fs.readFileSync(credsPath, "utf8").trim();
+  } else {
     throw new Error(
       `Credentials not configured. Run: node index.js --save-credentials`,
     );
   }
-  const enc = fs.readFileSync(credsPath, "utf8").trim();
   if (!enc) throw new Error("creds.dat is empty");
+
+  // Strip BOM if present
+  if (enc.charCodeAt(0) === 0xfeff) enc = enc.slice(1);
 
   const sep = enc.indexOf("|");
   if (sep < 1) throw new Error("creds.dat format invalid");

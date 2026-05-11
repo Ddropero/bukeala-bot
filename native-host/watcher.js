@@ -137,33 +137,75 @@ async function reportComplete(cfg, ok, message) {
   }
 }
 
+// Auto-login enabled if --auto-login-mode flag is passed (set by install.ps1
+// when 2Captcha key is configured) AND creds.dat is reachable.
+function autoLoginEnabled() {
+  // Two ways to enable: CLI flag OR env var
+  const argv = process.argv.slice(2);
+  if (argv.includes("--auto-login-mode")) return true;
+  if (process.env.BUKEALA_AUTO_LOGIN === "1") return true;
+  return false;
+}
+
 function runSetup() {
   return new Promise((resolve) => {
     const indexPath = path.join(__dirname, "index.js");
-    // If credentials exist AND config has 2Captcha key, use --auto-login (zero
-    // human intervention). Otherwise fall back to --setup (visible Chromium,
-    // user logs in manually).
-    const credsPath = path.join(APP_DIR, "creds.dat");
-    let mode = "--setup";
-    try {
-      if (fs.existsSync(credsPath)) {
-        const configPath = path.join(APP_DIR, "config.json");
-        let raw = fs.readFileSync(configPath, "utf8");
-        if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
-        const cfg = JSON.parse(raw);
-        if (cfg.twoCaptchaApiKey) mode = "--auto-login";
-      }
-    } catch {
-      // fall back to --setup
-    }
+    let mode = autoLoginEnabled() ? "--auto-login" : "--setup";
     log("info", `spawning index.js ${mode}`);
+    // Pass config values as env vars so the spawned process doesn't need to
+    // read config.json (which sometimes isn't visible from scheduled task spawn
+    // context due to Windows ACLs / OneDrive sync).
+    const argv = process.argv.slice(2);
+    const argMap = new Map();
+    for (let i = 0; i < argv.length; i++) {
+      if (argv[i].startsWith("--") && i + 1 < argv.length) {
+        argMap.set(argv[i].slice(2), argv[i + 1]);
+        i++;
+      }
+    }
+    const childEnv = { ...process.env };
+    if (argMap.has("worker")) childEnv.BUKEALA_WORKER_URL = argMap.get("worker");
+    if (argMap.has("token")) childEnv.BUKEALA_CAPTURE_TOKEN = argMap.get("token");
+    if (argMap.has("2captcha-key")) childEnv.TWO_CAPTCHA_API_KEY = argMap.get("2captcha-key");
+
+    // Pass creds.dat content via env var so spawned process doesn't need to
+    // read it from disk. Try multiple paths (script dir first, then APPDATA)
+    // since Scheduled Task spawn context sometimes can't see APPDATA files.
+    const credsCandidates = [
+      path.join(__dirname, "creds.dat"),       // C:\BukealaBot\creds.dat
+      path.join(APP_DIR, "creds.dat"),         // %APPDATA%\BukealaBot\creds.dat
+    ];
+    let credsLoaded = false;
+    for (const credsPath of credsCandidates) {
+      try {
+        const credsContent = fs.readFileSync(credsPath, "utf8");
+        childEnv.BUKEALA_CREDS_RAW = credsContent;
+        log("info", "creds.dat passed via env", { from: credsPath, bytes: credsContent.length });
+        credsLoaded = true;
+        break;
+      } catch {
+        // try next path
+      }
+    }
+    if (!credsLoaded) {
+      log("warn", "could not read creds.dat from any path", { tried: credsCandidates });
+    }
+
     const child = spawn(process.execPath, [indexPath, mode], {
       cwd: __dirname,
-      env: process.env,
-      stdio: "inherit",
+      env: childEnv,
+      stdio: ["ignore", "pipe", "pipe"],
     });
+    let stderrBuf = "";
+    let stdoutBuf = "";
+    child.stdout.on("data", (d) => { stdoutBuf += d.toString(); });
+    child.stderr.on("data", (d) => { stderrBuf += d.toString(); });
     child.on("exit", (code) => {
-      log("info", `index.js ${mode} exited`, { code });
+      log("info", `index.js ${mode} exited`, {
+        code,
+        stdoutTail: stdoutBuf.slice(-800),
+        stderrTail: stderrBuf.slice(-800),
+      });
       resolve(code === 0);
     });
     child.on("error", (err) => {

@@ -57,13 +57,22 @@ function log(level, msg, meta = {}) {
 }
 
 function readConfig() {
+  // Priority 1: env vars (set by watcher.js when spawning this script).
+  // This bypasses Windows scheduled-task file visibility issues with config.json.
+  if (process.env.BUKEALA_WORKER_URL && process.env.BUKEALA_CAPTURE_TOKEN) {
+    return {
+      workerUrl: process.env.BUKEALA_WORKER_URL,
+      captureToken: process.env.BUKEALA_CAPTURE_TOKEN,
+      twoCaptchaApiKey: process.env.TWO_CAPTCHA_API_KEY || undefined,
+    };
+  }
+  // Priority 2: config.json file
   if (!fs.existsSync(CONFIG_PATH)) {
     throw new Error(
       `Config not found. Run install.ps1 first. Expected at: ${CONFIG_PATH}`,
     );
   }
   let raw = fs.readFileSync(CONFIG_PATH, "utf8");
-  // Strip UTF-8 BOM if PowerShell wrote it
   if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
   const cfg = JSON.parse(raw);
   if (!cfg.workerUrl || !cfg.captureToken) {
@@ -341,8 +350,23 @@ async function main() {
   }
 
   if (args.has("--auto-login")) {
-    const { runAutoLogin } = require("./autoLogin");
-    const cfg = readConfig();
+    log("info", "auto-login mode start");
+    let runAutoLogin;
+    try {
+      ({ runAutoLogin } = require("./autoLogin"));
+      log("info", "autoLogin module loaded OK");
+    } catch (e) {
+      log("error", "failed to require autoLogin", { error: e.message, stack: e.stack });
+      process.exit(2);
+    }
+    let cfg;
+    try {
+      cfg = readConfig();
+      log("info", "config loaded OK", { hasKey: !!cfg.twoCaptchaApiKey });
+    } catch (e) {
+      log("error", "failed to read config", { error: e.message });
+      process.exit(2);
+    }
     if (!cfg.twoCaptchaApiKey) {
       log("error", "twoCaptchaApiKey missing in config.json");
       process.exit(2);
