@@ -58,7 +58,16 @@ import {
   setActiveDoctor,
   buildDoctorSelectorKeyboard,
 } from "./doctors";
-import { sendHelloWorld, normalizeColombianPhone, sendAppointmentConfirmation, sendText as sendWaText } from "./whatsapp";
+import {
+  sendHelloWorld,
+  normalizeColombianPhone,
+  sendAppointmentConfirmation,
+  sendAppointmentReminder,
+  sendAppointmentCanceled,
+  sendAppointmentFollowup,
+  sendPostSurgeryCheckin,
+  sendText as sendWaText,
+} from "./whatsapp";
 import { suggestReply, appendHistory, getMode, setMode, type WaMode } from "./claudeAi";
 import { getNativeHostEvents, requestRefresh } from "./handlers/nativeHostEvent";
 import { isAllowed, isDoctor, getRole, getUserName, listUsers, addUser, removeUser, type Role } from "./users";
@@ -172,6 +181,10 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
       "/wa_reply &lt;num&gt; &lt;mensaje&gt;",
       "/wa_mode &lt;num&gt; &lt;manual|review|auto&gt;",
       "/wa_status &lt;num&gt;",
+      "/wa_recordar &lt;num&gt; | &lt;nombre&gt; | &lt;fecha&gt; | &lt;hora&gt; | &lt;lugar&gt;",
+      "/wa_cancelar_aviso &lt;num&gt; | &lt;nombre&gt; | &lt;fecha&gt; | &lt;hora&gt;",
+      "/wa_followup &lt;num&gt; | &lt;nombre&gt;",
+      "/wa_postcirugia &lt;num&gt; | &lt;nombre&gt; | &lt;días&gt;",
       "",
       "<b>🔄 Sesión Bukeala</b>",
       "/sesion_renew — pedir nuevo login (cualquiera, abre ventana en PC)",
@@ -406,13 +419,13 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     return;
   }
 
-  // /sesion_renew — request the local Native Host to open a fresh login window
+  // /sesion_renew — request the local Native Host to renew the session
   if (text === "/sesion_renew") {
     await requestRefresh(env, chatId);
     await sendMessage(
       env,
       chatId,
-      "🔔 <b>Solicitud enviada</b>\n\nVe al PC del consultorio en los próximos 30 segundos.\nSe abrirá una ventana de Chromium con el login de Bukeala.\nLoguea con tus credenciales (incluido reCAPTCHA) y la ventana se cerrará sola.\n\n<i>Te aviso aquí cuando termine.</i>",
+      "🔔 <b>Solicitud enviada</b>\n\nEl Native Host la procesará en los próximos 30 segundos.\n\n• Si tienes 2Captcha activo: login automático (~30 seg, sin tu intervención)\n• Si no: se abre Chromium en el PC para login manual\n\n<i>Te aviso aquí cuando termine.</i>",
     );
     return;
   }
@@ -453,6 +466,68 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
       lines.push("", "💚 ¡Sesión 100% estable los últimos 7 días!");
     }
     await sendMessage(env, chatId, lines.join("\n"));
+    return;
+  }
+
+  // /wa_recordar <num> | <nombre> | <fecha> | <hora> | <lugar>
+  // Send appointment_reminder template to patient
+  if (text.startsWith("/wa_recordar ")) {
+    const rest = text.slice("/wa_recordar ".length).trim();
+    const parts = rest.split("|").map((s) => s.trim());
+    if (parts.length < 5) {
+      await sendMessage(env, chatId, "Uso: <code>/wa_recordar &lt;num&gt; | &lt;nombre&gt; | &lt;fecha&gt; | &lt;hora&gt; | &lt;lugar&gt;</code>\n\nEjemplo: <code>/wa_recordar 3001234567 | Juan Pérez | Miércoles 14/05/26 | 9:00 AM | Calle 80 # 10-43, Cons 506</code>");
+      return;
+    }
+    const [num, name, date, time, place] = parts;
+    const r = await sendAppointmentReminder(env, num, name, date, time, place);
+    if (r.ok) {
+      await sendMessage(env, chatId, `✅ Recordatorio enviado a <code>${normalizeColombianPhone(num)}</code>`);
+    } else {
+      const err = r.data?.error?.message ?? r.reason ?? "unknown";
+      await sendMessage(env, chatId, `❌ Error: ${escapeHtmlLocal(err)}`);
+    }
+    return;
+  }
+
+  // /wa_cancelar_aviso <num> | <nombre> | <fecha> | <hora>
+  if (text.startsWith("/wa_cancelar_aviso ")) {
+    const rest = text.slice("/wa_cancelar_aviso ".length).trim();
+    const parts = rest.split("|").map((s) => s.trim());
+    if (parts.length < 4) {
+      await sendMessage(env, chatId, "Uso: <code>/wa_cancelar_aviso &lt;num&gt; | &lt;nombre&gt; | &lt;fecha&gt; | &lt;hora&gt;</code>");
+      return;
+    }
+    const [num, name, date, time] = parts;
+    const r = await sendAppointmentCanceled(env, num, name, date, time);
+    await sendMessage(env, chatId, r.ok ? `✅ Aviso de cancelación enviado a <code>${normalizeColombianPhone(num)}</code>` : `❌ Error: ${escapeHtmlLocal(r.data?.error?.message ?? r.reason ?? "unknown")}`);
+    return;
+  }
+
+  // /wa_followup <num> | <nombre>
+  if (text.startsWith("/wa_followup ")) {
+    const rest = text.slice("/wa_followup ".length).trim();
+    const parts = rest.split("|").map((s) => s.trim());
+    if (parts.length < 2) {
+      await sendMessage(env, chatId, "Uso: <code>/wa_followup &lt;num&gt; | &lt;nombre&gt;</code>");
+      return;
+    }
+    const [num, name] = parts;
+    const r = await sendAppointmentFollowup(env, num, name);
+    await sendMessage(env, chatId, r.ok ? `✅ Follow-up enviado a <code>${normalizeColombianPhone(num)}</code>` : `❌ Error: ${escapeHtmlLocal(r.data?.error?.message ?? r.reason ?? "unknown")}`);
+    return;
+  }
+
+  // /wa_postcirugia <num> | <nombre> | <dias>
+  if (text.startsWith("/wa_postcirugia ")) {
+    const rest = text.slice("/wa_postcirugia ".length).trim();
+    const parts = rest.split("|").map((s) => s.trim());
+    if (parts.length < 3) {
+      await sendMessage(env, chatId, "Uso: <code>/wa_postcirugia &lt;num&gt; | &lt;nombre&gt; | &lt;dias_desde_cirugia&gt;</code>");
+      return;
+    }
+    const [num, name, days] = parts;
+    const r = await sendPostSurgeryCheckin(env, num, name, parseInt(days, 10));
+    await sendMessage(env, chatId, r.ok ? `✅ Check-in post-cirugía enviado a <code>${normalizeColombianPhone(num)}</code>` : `❌ Error: ${escapeHtmlLocal(r.data?.error?.message ?? r.reason ?? "unknown")}`);
     return;
   }
 

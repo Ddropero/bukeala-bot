@@ -209,3 +209,93 @@ export async function sendAppointmentConfirmation(
     { type: "text", text: place },
   ]);
 }
+
+/**
+ * Send a reminder ~24h before the appointment.
+ * Template: appointment_reminder (es_CO)
+ * Body params: {{1}} name, {{2}} date, {{3}} time, {{4}} place
+ */
+export async function sendAppointmentReminder(
+  env: Env,
+  patientPhoneRaw: string,
+  patientName: string,
+  dateText: string,
+  timeText: string,
+  place: string,
+) {
+  const to = normalizeColombianPhone(patientPhoneRaw);
+  if (!to || to.length < 10) {
+    console.log("[whatsapp] reminder skipped: invalid phone", patientPhoneRaw);
+    return { ok: false, reason: "invalid_phone" };
+  }
+  return sendTemplate(env, to, "appointment_reminder", "es_CO", [
+    { type: "text", text: patientName },
+    { type: "text", text: dateText },
+    { type: "text", text: timeText },
+    { type: "text", text: place },
+  ]);
+}
+
+/**
+ * Notify patient when their appointment was canceled.
+ * Template: appointment_canceled (es_CO)
+ * Body params: {{1}} name, {{2}} date, {{3}} time
+ */
+export async function sendAppointmentCanceled(
+  env: Env,
+  patientPhoneRaw: string,
+  patientName: string,
+  dateText: string,
+  timeText: string,
+) {
+  const to = normalizeColombianPhone(patientPhoneRaw);
+  if (!to || to.length < 10) {
+    console.log("[whatsapp] canceled-notice skipped: invalid phone", patientPhoneRaw);
+    return { ok: false, reason: "invalid_phone" };
+  }
+  return sendTemplate(env, to, "appointment_canceled", "es_CO", [
+    { type: "text", text: patientName },
+    { type: "text", text: dateText },
+    { type: "text", text: timeText },
+  ]);
+}
+
+/**
+ * Follow-up message a few days after a consultation appointment.
+ * Template: appointment_followup (es_CO)
+ * Body params: {{1}} name
+ */
+export async function sendAppointmentFollowup(
+  env: Env,
+  patientPhoneRaw: string,
+  patientName: string,
+) {
+  const to = normalizeColombianPhone(patientPhoneRaw);
+  if (!to || to.length < 10) {
+    return { ok: false, reason: "invalid_phone" };
+  }
+  return sendTemplate(env, to, "appointment_followup", "es_CO", [
+    { type: "text", text: patientName },
+  ]);
+}
+
+/**
+ * Post-surgery check-in N days after the procedure.
+ * Template: post_surgery_checkin (es_CO)
+ * Body params: {{1}} name, {{2}} daysSinceSurgery
+ */
+export async function sendPostSurgeryCheckin(
+  env: Env,
+  patientPhoneRaw: string,
+  patientName: string,
+  daysSinceSurgery: number,
+) {
+  const to = normalizeColombianPhone(patientPhoneRaw);
+  if (!to || to.length < 10) {
+    return { ok: false, reason: "invalid_phone" };
+  }
+  return sendTemplate(env, to, "post_surgery_checkin", "es_CO", [
+    { type: "text", text: patientName },
+    { type: "text", text: String(daysSinceSurgery) },
+  ]);
+}

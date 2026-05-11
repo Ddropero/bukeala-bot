@@ -9,6 +9,7 @@ import { Bukeala, SessionExpiredError } from "./bukeala";
 import { loadSession } from "./kv";
 import { dailySummary } from "./cron/dailySummary";
 import { newBookingsCheck } from "./cron/newBookingsWatch";
+import { reminderCron } from "./cron/reminderCron";
 import { getDoctorRecipients } from "./users";
 
 // Re-export the Durable Object class so wrangler can find it.
@@ -111,6 +112,9 @@ export default {
     // Dispatch by cron schedule
     if (event.cron === "0 12 * * *") {
       ctx.waitUntil(dailySummary(env));
+    } else if (event.cron === "0 13 * * *") {
+      // 7am Colombia (Sundays-Saturdays): send appointment reminders for tomorrow
+      ctx.waitUntil(reminderCron(env));
     } else if (event.cron === "*/10 12-23 * * *") {
       ctx.waitUntil(newBookingsCheck(env));
     } else {
