@@ -105,14 +105,44 @@ if (-not $CaptureToken -or $CaptureToken.Trim() -eq "") {
     exit 1
 }
 
+# Optional: 2Captcha API key for fully automated login (no human intervention).
+Write-Host ""
+Write-Host "OPCIONAL: 2Captcha API key" -ForegroundColor Yellow
+Write-Host "  Si la pasas, el login se hara automaticamente cuando expire la sesion."
+Write-Host "  Sin ella, /sesion_renew abre Chromium y el usuario debe loguear a mano."
+Write-Host "  Mas info: https://2captcha.com  (~`$0.001 USD por reCAPTCHA)"
+$twoCaptchaKey = Read-Host "2Captcha API key (Enter para skip)"
+
 # Save config.json (used by index.js for cookie push)
 $config = [PSCustomObject]@{
-    workerUrl    = $WorkerUrl
-    captureToken = $CaptureToken
+    workerUrl        = $WorkerUrl
+    captureToken     = $CaptureToken
+}
+if ($twoCaptchaKey -and $twoCaptchaKey.Trim() -ne "") {
+    $config | Add-Member -NotePropertyName twoCaptchaApiKey -NotePropertyValue $twoCaptchaKey.Trim()
 }
 $configFile = Join-Path $appDir "config.json"
 $config | ConvertTo-Json | Set-Content -Path $configFile -Encoding UTF8 -NoNewline
 Write-Host "[OK] Config guardado en $configFile" -ForegroundColor Green
+
+# -------------------------------------------------------------------
+# 4b. Si configuraste 2Captcha, guardar credenciales encriptadas (DPAPI)
+# -------------------------------------------------------------------
+if ($twoCaptchaKey -and $twoCaptchaKey.Trim() -ne "") {
+    Write-Section "Guardar credenciales CAS (encriptadas con DPAPI)"
+    Write-Host ""
+    Write-Host "Vamos a guardar tu usuario+password CAS Colsanitas." -ForegroundColor Yellow
+    Write-Host "Se encriptan con DPAPI per-user (solo este Windows user puede desencriptar)." -ForegroundColor Yellow
+    Push-Location $scriptDir
+    try {
+        & node index.js --save-credentials
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[!] Save-credentials fallo, sigues sin auto-login." -ForegroundColor Yellow
+        }
+    } finally {
+        Pop-Location
+    }
+}
 
 # -------------------------------------------------------------------
 # 5. Setup inicial — se abre ventana visible, usuario loguea

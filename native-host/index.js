@@ -334,6 +334,29 @@ async function main() {
     process.exit(0);
   }
 
+  if (args.has("--save-credentials")) {
+    const { saveCredentials } = require("./autoLogin");
+    const ok = saveCredentials(APP_DIR);
+    process.exit(ok ? 0 : 1);
+  }
+
+  if (args.has("--auto-login")) {
+    const { runAutoLogin } = require("./autoLogin");
+    const cfg = readConfig();
+    if (!cfg.twoCaptchaApiKey) {
+      log("error", "twoCaptchaApiKey missing in config.json");
+      process.exit(2);
+    }
+    const r = await runAutoLogin({
+      TWO_CAPTCHA_API_KEY: cfg.twoCaptchaApiKey,
+      CAPTURE_TOKEN: cfg.captureToken,
+      WORKER_URL: cfg.workerUrl,
+      APP_DIR,
+      log,
+    });
+    process.exit(r.ok ? 0 : 1);
+  }
+
   if (args.has("--watch")) {
     log("info", "watch mode: refreshing every 4 hours");
     while (true) {

@@ -140,14 +140,30 @@ async function reportComplete(cfg, ok, message) {
 function runSetup() {
   return new Promise((resolve) => {
     const indexPath = path.join(__dirname, "index.js");
-    log("info", "spawning index.js --setup");
-    const child = spawn(process.execPath, [indexPath, "--setup"], {
+    // If credentials exist AND config has 2Captcha key, use --auto-login (zero
+    // human intervention). Otherwise fall back to --setup (visible Chromium,
+    // user logs in manually).
+    const credsPath = path.join(APP_DIR, "creds.dat");
+    let mode = "--setup";
+    try {
+      if (fs.existsSync(credsPath)) {
+        const configPath = path.join(APP_DIR, "config.json");
+        let raw = fs.readFileSync(configPath, "utf8");
+        if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+        const cfg = JSON.parse(raw);
+        if (cfg.twoCaptchaApiKey) mode = "--auto-login";
+      }
+    } catch {
+      // fall back to --setup
+    }
+    log("info", `spawning index.js ${mode}`);
+    const child = spawn(process.execPath, [indexPath, mode], {
       cwd: __dirname,
       env: process.env,
       stdio: "inherit",
     });
     child.on("exit", (code) => {
-      log("info", "index.js --setup exited", { code });
+      log("info", `index.js ${mode} exited`, { code });
       resolve(code === 0);
     });
     child.on("error", (err) => {
