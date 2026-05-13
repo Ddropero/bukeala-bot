@@ -1,0 +1,18 @@
+{
+  "name": "bukeala-native-host-mac",
+  "version": "1.0.0",
+  "description": "Bukeala session keeper para macOS (24/7 vía launchd)",
+  "private": true,
+  "scripts": {
+    "watch": "node watcher.js --auto-login-mode",
+    "setup": "node index.js --setup",
+    "save-creds": "node index.js --save-credentials"
+  },
+  "dependencies": {
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
