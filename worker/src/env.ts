@@ -24,4 +24,9 @@ export type Env = {
 
   // Anthropic API for the WhatsApp AI auto-responder (Claude)
   ANTHROPIC_API_KEY: string;
+
+  // Secretary's WhatsApp numbers (comma-separated, E.164 without `+`).
+  // Receives the daily agenda PDF/HTML at 1 PM Colombia the day before.
+  // Optional — if unset, falls back to the hard-coded default.
+  SECRETARY_WHATSAPP_NUMBERS?: string;
 };
