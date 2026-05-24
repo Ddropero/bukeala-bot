@@ -16,19 +16,16 @@ mode = "smart"
 # nocturna que invalida sesiones automáticamente.
 [triggers]
 # Multiple crons:
-#   "*/5 12-23,0 * * *" → keepAlive (every 5 min, 7am-7:55pm Colombia)
-#   "0 12 * * *"        → dailySummary (7am Colombia exactly)
-#   "*/10 12-23 * * *"  → newBookingsWatch (every 10 min, 7am-6pm Colombia)
-#   "0 13 * * *"        → reminderCron (8am Colombia, manda recordatorios mañana)
-# Multiple crons:
-#   "*/3 * * * *"        → keepAlive (cada 3 min, 24/7 — Mac queda prendido)
+#   "*/3 * * * *"        → keepAlive (cada 3 min, 24/7 — Mac/cloud queda prendido)
 #   "0 12 * * *"         → dailySummary (7am Colombia)
 #   "*/10 12-23 * * *"   → newBookingsWatch (cada 10 min, horario oficina)
-#   "0 13 * * *"         → reminderCron (8am Bogotá)
+#   "0 13 * * *"         → reminderCron (8am Bogotá, recordatorios al día siguiente)
 #   "*/15 * * * *"       → autoReturnToAI (cada 15 min, 24/7)
 #   "0 12 * * 1"         → weeklyReport (Lunes 7am Bogotá)
 #   "0 14 * * *"         → quoteFollowup (9am Bogotá)
-crons = ["*/3 * * * *", "0 12 * * *", "*/10 12-23 * * *", "0 13 * * *", "*/15 * * * *", "0 12 * * 1", "0 14 * * *"]
+#   "0 18 * * *"         → secretaryAgendaCron (1pm Bogotá, agenda HTML al WA+TG de la secretaria)
+#   "0 23 * * 2"         → weeklyWedReminderCron (martes 6pm Bogotá, WA al paciente con cita el miércoles)
+crons = ["*/3 * * * *", "0 12 * * *", "*/10 12-23 * * *", "0 13 * * *", "*/15 * * * *", "0 12 * * 1", "0 14 * * *", "0 18 * * *", "0 23 * * 2"]
 
 # Observabilidad: habilita logs persistentes y sampling 100% (el dashboard
 # muestra warning sin esto, aunque la funcionalidad esté disponible igual).

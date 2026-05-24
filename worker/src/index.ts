@@ -17,6 +17,8 @@ import { reminderCron } from "./cron/reminderCron";
 import { autoReturnToAI } from "./cron/autoReturnToAI";
 import { weeklyReport } from "./cron/weeklyReport";
 import { quoteFollowup } from "./cron/quoteFollowup";
+import { secretaryAgendaCron } from "./cron/secretaryAgenda";
+import { weeklyWedReminderCron } from "./cron/weeklyWedReminder";
 import { getDoctorRecipients } from "./users";
 import { processPendingRequests, loadPendingRequests } from "./claudeBookingAgent";
 import { requestRefresh } from "./handlers/nativeHostEvent";
@@ -458,10 +460,18 @@ export default {
     } else if (event.cron === "0 13 * * *") {
       // 7am Colombia (Sundays-Saturdays): send appointment reminders for tomorrow
       ctx.waitUntil(reminderCron(env));
+    } else if (event.cron === "0 18 * * *") {
+      // 1 PM Colombia: send tomorrow's agenda (HTML doc) to the secretary
+      // via Telegram + WhatsApp.
+      ctx.waitUntil(secretaryAgendaCron(env));
+    } else if (event.cron === "0 23 * * 2") {
+      // Tuesday 6 PM Colombia: WhatsApp reminder to every patient with a
+      // booking on the upcoming Wednesday.
+      ctx.waitUntil(weeklyWedReminderCron(env));
     } else if (event.cron === "*/10 12-23 * * *") {
       ctx.waitUntil(newBookingsCheck(env));
-    } else if (event.cron === "*/15 12-23 * * *") {
-      // Cada 15 min: devolver a IA contactos en manual con 30+ min sin actividad
+    } else if (event.cron === "*/15 * * * *") {
+      // Cada 15 min 24/7: devolver a IA contactos en manual con 30+ min sin actividad
       ctx.waitUntil(autoReturnToAI(env));
     } else if (event.cron === "0 12 * * 1") {
       // Lunes 7am Bogotá: reporte semanal

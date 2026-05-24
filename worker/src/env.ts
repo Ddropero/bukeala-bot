@@ -74,4 +74,9 @@ export type Env = {
   IG_ACCESS_TOKEN?: string;
   IG_BUSINESS_ACCOUNT_ID?: string;
   IG_VERIFY_TOKEN?: string;
+
+  // Secretary's WhatsApp numbers (comma-separated, E.164 without `+`).
+  // Receives the daily agenda PDF/HTML at 1 PM Colombia the day before.
+  // Optional — if unset, falls back to the hard-coded default.
+  SECRETARY_WHATSAPP_NUMBERS?: string;
 };

@@ -1,0 +1,137 @@
+/**
+ * Build a self-contained HTML document with tomorrow's agenda for the
+ * secretary. Opens in any browser (mobile or desktop) — works as a
+ * WhatsApp/Telegram attachment.
+ *
+ * Columns: hora, paciente, cédula, teléfono, plan, estado.
+ */
+
+export type AgendaBookingDoc = {
+  id?: number | string;
+  startHourFormatted?: string;
+  endHourFormatted?: string;
+  name?: string;
+  identification?: string;
+  identificationTypeShortCode?: string;
+  stateCode?: string;
+  stateDesc?: string;
+  isCanceled?: boolean;
+  isBusyTime?: boolean;
+  bookingComponentName?: string;
+  planName?: string;
+  phone?: string;
+  cellPhone?: string | { phoneNumber?: string } | null;
+  customerPhone?: string;
+};
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function extractPhone(bk: AgendaBookingDoc): string {
+  if (typeof bk.cellPhone === "string" && bk.cellPhone.trim()) return bk.cellPhone.trim();
+  if (
+    bk.cellPhone &&
+    typeof bk.cellPhone === "object" &&
+    typeof (bk.cellPhone as { phoneNumber?: string }).phoneNumber === "string"
+  ) {
+    return ((bk.cellPhone as { phoneNumber?: string }).phoneNumber ?? "").trim();
+  }
+  if (typeof bk.phone === "string" && bk.phone.trim()) return bk.phone.trim();
+  if (typeof bk.customerPhone === "string" && bk.customerPhone.trim()) return bk.customerPhone.trim();
+  return "";
+}
+
+function timeKey(formatted: string): number {
+  const m = formatted.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (!m) return 0;
+  let h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  if (h === 12) h = 0;
+  if (m[3].toUpperCase() === "PM") h += 12;
+  return h * 60 + min;
+}
+
+export function buildAgendaHtml(
+  bookings: AgendaBookingDoc[],
+  friendlyDate: string,
+): string {
+  const active = bookings
+    .filter((bk) => !bk.isCanceled && bk.stateCode !== "CANCELED" && !bk.isBusyTime)
+    .sort((a, b) => timeKey(a.startHourFormatted ?? "") - timeKey(b.startHourFormatted ?? ""));
+
+  const rows = active
+    .map((bk, i) => {
+      const time = escapeHtml(bk.startHourFormatted ?? "—");
+      const name = escapeHtml(bk.name ?? "—");
+      const idType = bk.identificationTypeShortCode ?? "C";
+      const idNum = escapeHtml(bk.identification ?? "—");
+      const phone = escapeHtml(extractPhone(bk) || "—");
+      const plan = escapeHtml(bk.planName ?? "—");
+      const state = escapeHtml(bk.stateDesc ?? bk.stateCode ?? "—");
+      return `
+      <tr>
+        <td class="num">${i + 1}</td>
+        <td class="time">${time}</td>
+        <td class="name">${name}</td>
+        <td class="id">${idType} ${idNum}</td>
+        <td class="phone">${phone}</td>
+        <td class="plan">${plan}</td>
+        <td class="state">${state}</td>
+      </tr>`;
+    })
+    .join("");
+
+  const bodyContent = active.length === 0
+    ? `<p class="empty">Sin citas agendadas para esta fecha.</p>`
+    : `
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Hora</th>
+          <th>Paciente</th>
+          <th>Identificación</th>
+          <th>Teléfono</th>
+          <th>Plan</th>
+          <th>Estado</th>
+        </tr>
+      </thead>
+      <tbody>${rows}
+      </tbody>
+    </table>`;
+
+  return `<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agenda ${escapeHtml(friendlyDate)}</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 16px; color: #1a1a1a; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #666; margin: 0 0 16px; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 8px 6px; border-bottom: 1px solid #eee; text-align: left; vertical-align: top; }
+  th { background: #f5f7fa; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; color: #555; }
+  tr:nth-child(even) td { background: #fafafa; }
+  td.num { color: #999; width: 28px; }
+  td.time { font-variant-numeric: tabular-nums; white-space: nowrap; font-weight: 600; }
+  td.name { font-weight: 500; }
+  td.phone { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .empty { padding: 24px; text-align: center; color: #888; border: 1px dashed #ddd; border-radius: 8px; }
+  .foot { color: #999; font-size: 11px; margin-top: 24px; }
+</style>
+</head>
+<body>
+  <h1>Agenda · ${escapeHtml(friendlyDate)}</h1>
+  <p class="sub">${active.length} ${active.length === 1 ? "cita" : "citas"} confirmadas</p>
+  ${bodyContent}
+  <p class="foot">Generado automáticamente por el bot — Dr. Duque.</p>
+</body>
+</html>`;
+}
