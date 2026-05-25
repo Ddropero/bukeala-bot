@@ -17,7 +17,9 @@ mode = "smart"
 #   "0 12 * * *"       → dailySummary (7am Colombia exactly)
 #   "*/10 12-23 * * *" → newBookingsWatch (every 10 min, 7am-6pm Colombia)
 #   "0 13 * * *"       → reminderCron (8am Colombia, manda recordatorios mañana)
-crons = ["*/5 12-23 * * *", "0 12 * * *", "*/10 12-23 * * *", "0 13 * * *"]
+#   "0 18 * * *"       → secretaryAgendaCron (1pm Colombia, agenda HTML al WA+TG de la secretaria)
+#   "0 23 * * 2"       → weeklyWedReminderCron (martes 6pm Colombia, WA al paciente con cita el miércoles)
+crons = ["*/5 12-23 * * *", "0 12 * * *", "*/10 12-23 * * *", "0 13 * * *", "0 18 * * *", "0 23 * * 2"]
 
 [vars]
 BUKEALA_BASE = "https://appoint.tuscitasmedicas.com/keraltyadscritos"

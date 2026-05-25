@@ -280,6 +280,60 @@ export async function sendAppointmentFollowup(
 }
 
 /**
+ * Upload a binary file to the WhatsApp Cloud API Media endpoint.
+ * Returns the media_id you can then attach to a `document`/`image`/etc message.
+ * https://developers.facebook.com/docs/whatsapp/cloud-api/reference/media
+ */
+export async function uploadMedia(
+  env: Env,
+  bytes: Uint8Array,
+  mimeType: string,
+  filename: string,
+): Promise<{ ok: boolean; id?: string; error?: string }> {
+  const url = `https://graph.facebook.com/${API_VERSION}/${env.WA_PHONE_ID}/media`;
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  form.append("type", mimeType);
+  form.append("file", new Blob([bytes], { type: mimeType }), filename);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.WA_TOKEN}` },
+    body: form,
+  });
+  const data = await res.json().catch(() => ({}) as any);
+  console.log(`[whatsapp] uploadMedia → ${res.status}`, JSON.stringify(data).slice(0, 200));
+  if (res.ok && (data as any)?.id) {
+    return { ok: true, id: String((data as any).id) };
+  }
+  return { ok: false, error: (data as any)?.error?.message ?? `HTTP ${res.status}` };
+}
+
+/**
+ * Send a document attachment by media_id (uploaded via uploadMedia()).
+ * Free-form messages only work within the 24h customer service window —
+ * if the recipient hasn't messaged us recently, this will return error
+ * 131047 ("Message failed to send because more than 24 hours have passed").
+ */
+export async function sendDocumentByMediaId(
+  env: Env,
+  to: string,
+  mediaId: string,
+  filename: string,
+  caption?: string,
+) {
+  return postWA(env, {
+    messaging_product: "whatsapp",
+    to,
+    type: "document",
+    document: {
+      id: mediaId,
+      filename,
+      ...(caption ? { caption } : {}),
+    },
+  });
+}
+
+/**
  * Post-surgery check-in N days after the procedure.
  * Template: post_surgery_checkin (es_CO)
  * Body params: {{1}} name, {{2}} daysSinceSurgery

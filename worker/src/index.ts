@@ -10,6 +10,8 @@ import { loadSession } from "./kv";
 import { dailySummary } from "./cron/dailySummary";
 import { newBookingsCheck } from "./cron/newBookingsWatch";
 import { reminderCron } from "./cron/reminderCron";
+import { secretaryAgendaCron } from "./cron/secretaryAgenda";
+import { weeklyWedReminderCron } from "./cron/weeklyWedReminder";
 import { getDoctorRecipients } from "./users";
 
 // Re-export the Durable Object class so wrangler can find it.
@@ -115,6 +117,14 @@ export default {
     } else if (event.cron === "0 13 * * *") {
       // 7am Colombia (Sundays-Saturdays): send appointment reminders for tomorrow
       ctx.waitUntil(reminderCron(env));
+    } else if (event.cron === "0 18 * * *") {
+      // 1 PM Colombia: send tomorrow's agenda (HTML doc) to the secretary
+      // via Telegram + WhatsApp.
+      ctx.waitUntil(secretaryAgendaCron(env));
+    } else if (event.cron === "0 23 * * 2") {
+      // Tuesday 6 PM Colombia: WhatsApp reminder to every patient with a
+      // booking on the upcoming Wednesday.
+      ctx.waitUntil(weeklyWedReminderCron(env));
     } else if (event.cron === "*/10 12-23 * * *") {
       ctx.waitUntil(newBookingsCheck(env));
     } else {
