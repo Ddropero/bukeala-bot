@@ -15,26 +15,43 @@ import { Bukeala, SessionExpiredError } from "../bukeala";
 import { loadSession } from "../kv";
 import { sendAppointmentReminder, normalizeColombianPhone } from "../whatsapp";
 import { getAllRecipients } from "../users";
+import type { AgendaBookingDoc } from "../agendaDoc";
 
 const AREA_ID = 1074;
 const COLOMBIA_OFFSET_MINUTES = -5 * 60;
 
-function tomorrowInBogotaDDMMYYYY(): string {
+function tomorrowInBogota(): Date {
   const now = new Date();
   const bogota = new Date(now.getTime() + COLOMBIA_OFFSET_MINUTES * 60 * 1000);
   bogota.setUTCDate(bogota.getUTCDate() + 1);
-  const dd = String(bogota.getUTCDate()).padStart(2, "0");
-  const mm = String(bogota.getUTCMonth() + 1).padStart(2, "0");
-  const yyyy = bogota.getUTCFullYear();
-  return `${dd}/${mm}/${yyyy}`;
+  return bogota;
 }
 
-function ddmmyyyyToFriendly(date: string): string {
-  // "14/05/2026" → "Miércoles 14/05/26"
-  const [dd, mm, yyyy] = date.split("/");
-  const d = new Date(Date.UTC(parseInt(yyyy), parseInt(mm) - 1, parseInt(dd)));
+function pad2(n: number): string { return String(n).padStart(2, "0"); }
+
+/** Bukeala /admin/daily expects DD-MM-YYYY (dashes). Slashes break the URL. */
+function dateToDdMmYyyyDashed(d: Date): string {
+  return `${pad2(d.getUTCDate())}-${pad2(d.getUTCMonth() + 1)}-${d.getUTCFullYear()}`;
+}
+
+function dateToFriendly(d: Date): string {
   const day = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"][d.getUTCDay()];
-  return `${day} ${dd}/${mm}/${yyyy.slice(-2)}`;
+  const yy = String(d.getUTCFullYear()).slice(2);
+  return `${day} ${pad2(d.getUTCDate())}/${pad2(d.getUTCMonth() + 1)}/${yy}`;
+}
+
+function extractPhone(bk: AgendaBookingDoc): string {
+  if (typeof bk.cellPhone === "string" && bk.cellPhone.trim()) return bk.cellPhone.trim();
+  if (
+    bk.cellPhone &&
+    typeof bk.cellPhone === "object" &&
+    typeof (bk.cellPhone as { phoneNumber?: string }).phoneNumber === "string"
+  ) {
+    return ((bk.cellPhone as { phoneNumber?: string }).phoneNumber ?? "").trim();
+  }
+  if (typeof bk.phone === "string" && bk.phone.trim()) return bk.phone.trim();
+  if (typeof bk.customerPhone === "string" && bk.customerPhone.trim()) return bk.customerPhone.trim();
+  return "";
 }
 
 export async function reminderCron(env: Env): Promise<void> {
@@ -44,15 +61,16 @@ export async function reminderCron(env: Env): Promise<void> {
     return;
   }
   const b = new Bukeala(env);
-  const tomorrow = tomorrowInBogotaDDMMYYYY();
-  const friendlyDate = ddmmyyyyToFriendly(tomorrow);
-  console.log(`[reminderCron] fetching agenda for ${tomorrow}`);
+  const tomorrow = tomorrowInBogota();
+  const dashed = dateToDdMmYyyyDashed(tomorrow);
+  const friendly = dateToFriendly(tomorrow);
+  console.log(`[reminderCron] fetching agenda for ${dashed}`);
 
-  let bookings: any[];
+  let bookings: AgendaBookingDoc[] = [];
   try {
-    const res = await b.getAgenda(tomorrow, AREA_ID);
-    const j = await res.json<any>();
-    bookings = Array.isArray(j?.result) ? j.result : [];
+    const res = await b.getAgenda(dashed, AREA_ID, /* includeCanceled */ false);
+    const j = await res.json<any>().catch(() => null);
+    bookings = (j?.areas?.[0]?.bookings ?? []) as AgendaBookingDoc[];
   } catch (e) {
     if (e instanceof SessionExpiredError) {
       console.log("[reminderCron] session expired");
@@ -62,18 +80,18 @@ export async function reminderCron(env: Env): Promise<void> {
     return;
   }
 
-  console.log(`[reminderCron] found ${bookings.length} bookings for ${tomorrow}`);
+  const active = bookings.filter((bk) => !bk.isCanceled && bk.stateCode !== "CANCELED" && !bk.isBusyTime);
+  console.log(`[reminderCron] found ${active.length} active bookings for ${dashed}`);
 
   let sentCount = 0;
   let skippedCount = 0;
   const errors: string[] = [];
 
-  for (const bk of bookings) {
-    if (bk.stateCode && bk.stateCode !== "1") continue; // skip canceled
-    const reservationCode = bk.reservationCode ?? bk.id;
-    const name = bk.customerName ?? bk.name ?? "Paciente";
-    const rawPhone = bk.customerPhone ?? bk.phone ?? "";
-    const time12h = bk.time ?? bk.startTime ?? "";
+  for (const bk of active) {
+    const reservationCode = String(bk.id ?? "");
+    const name = bk.name ?? "Paciente";
+    const time12h = bk.startHourFormatted ?? "";
+    const rawPhone = extractPhone(bk);
 
     if (!rawPhone) { skippedCount++; continue; }
     const phone = normalizeColombianPhone(rawPhone);
@@ -89,13 +107,13 @@ export async function reminderCron(env: Env): Promise<void> {
     if (consent === "human") { skippedCount++; continue; }
 
     const r = await sendAppointmentReminder(
-      env, phone, name, friendlyDate, time12h, "Calle 80 # 10-43, Cons 506",
+      env, phone, name, friendly, time12h, "Calle 80 # 10-43, Cons 506",
     );
     if (r.ok) {
       sentCount++;
       await env.STATE.put(sentKey, "1", { expirationTtl: 60 * 60 * 24 * 3 });
     } else {
-      const err = r.data?.error?.message ?? r.reason ?? "unknown";
+      const err = (r as any).data?.error?.message ?? (r as any).reason ?? "unknown";
       errors.push(`${name} (${phone}): ${err}`);
     }
   }
@@ -103,8 +121,8 @@ export async function reminderCron(env: Env): Promise<void> {
   // Notify all authorized users with the daily summary
   const recipients = await getAllRecipients(env);
   const summary =
-    `📲 <b>Recordatorios WhatsApp enviados</b> para ${friendlyDate}\n\n` +
-    `Total citas: ${bookings.length}\n` +
+    `📲 <b>Recordatorios WhatsApp enviados</b> para ${friendly}\n\n` +
+    `Total citas: ${active.length}\n` +
     `✅ Enviados: ${sentCount}\n` +
     `⏭️ Saltados (sin tel, ya enviado, o consent=human): ${skippedCount}\n` +
     (errors.length > 0 ? `❌ Errores: ${errors.length}\n${errors.slice(0, 5).map((e) => "• " + e).join("\n")}` : "");
