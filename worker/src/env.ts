@@ -24,4 +24,54 @@ export type Env = {
 
   // Anthropic API for the WhatsApp AI auto-responder (Claude)
   ANTHROPIC_API_KEY: string;
+
+  // Cloudflare Workers AI (binding configurado en wrangler.toml)
+  // Usado para transcribir voice notes con Whisper.
+  AI: Ai;
+
+  // ============================================================
+  // POP CUC — Agenda Cirugías Clínica Colombia (Google Calendar)
+  // ============================================================
+  // Si están configuradas, el bot crea eventos en Google Calendar
+  // cuando alguien (cualquier WA o Telegram) escribe "pop cuc".
+  //
+  // Setup:
+  //   1) En Google Cloud Console: crear proyecto + habilitar "Google Calendar API"
+  //   2) Crear Service Account, descargar JSON de credenciales
+  //   3) En Google Calendar: crear calendario "Cirugías Clínica Colombia"
+  //   4) Compartirlo con el client_email del service account ("Hacer cambios en eventos")
+  //   5) Copiar el Calendar ID (Configuración → Integrar calendario)
+  //   6) wrangler secret put GCAL_SERVICE_ACCOUNT_JSON  (pegar JSON completo)
+  //   7) wrangler secret put GCAL_CALENDAR_ID          (pegar el ID, ej: abc123@group.calendar.google.com)
+  //
+  // Si NO están configuradas, pop cuc cae a modo legacy (solo KV).
+  GCAL_SERVICE_ACCOUNT_JSON?: string;
+  GCAL_CALENDAR_ID?: string;
+
+  // OPCIONAL: bot dedicado para handoff humano (cuando AI escala).
+  // Si no está seteado, los escalations siguen llegando al bot principal.
+  // Setup: 1) crea bot en @BotFather  2) wrangler secret put TELEGRAM_HANDOFF_BOT_TOKEN
+  //        3) curl https://<worker>/tg/handoff-setup?token=<CAPTURE_TOKEN>
+  TELEGRAM_HANDOFF_BOT_TOKEN?: string;
+
+  // OPCIONAL: bot dedicado a Andrea (encargada de cotizaciones).
+  // Si no está seteado, las solicitudes de cotización van al bot principal.
+  // Setup: 1) crea bot en @BotFather  2) wrangler secret put TELEGRAM_QUOTES_BOT_TOKEN
+  //        3) curl https://<worker>/tg/quotes-setup?token=<CAPTURE_TOKEN>
+  TELEGRAM_QUOTES_BOT_TOKEN?: string;
+
+  // OPCIONAL: Instagram Messaging API (Meta Graph).
+  // Permite que la AI atienda DMs de Instagram igual que WhatsApp.
+  // Setup:
+  //   1) Cuenta IG convertida a Business/Profesional
+  //   2) Conectada a Página de Facebook
+  //   3) Meta App con permisos instagram_basic + instagram_manage_messages
+  //   4) Generar System User token con scope a la página
+  //   5) wrangler secret put IG_ACCESS_TOKEN
+  //   6) wrangler secret put IG_BUSINESS_ACCOUNT_ID (ID numérico de tu cuenta IG)
+  //   7) wrangler secret put IG_VERIFY_TOKEN (cualquier string random)
+  //   8) Configurar webhook URL en Meta App: https://<worker>/ig/webhook
+  IG_ACCESS_TOKEN?: string;
+  IG_BUSINESS_ACCOUNT_ID?: string;
+  IG_VERIFY_TOKEN?: string;
 };

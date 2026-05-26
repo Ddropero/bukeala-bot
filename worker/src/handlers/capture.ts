@@ -1,6 +1,7 @@
 import type { Context } from "hono";
 import type { Env } from "../env";
 import { saveSession, type Cookie } from "../kv";
+import { processPendingRequests } from "../claudeBookingAgent";
 
 export async function handleCapture(c: Context<{ Bindings: Env }>) {
   const token = c.req.header("X-Capture-Token");
@@ -43,6 +44,14 @@ export async function handleCapture(c: Context<{ Bindings: Env }>) {
     cookies: cleaned,
     capturedAt: body.capturedAt ?? new Date().toISOString(),
   });
+
+  // Session is fresh now → auto-process any pending WhatsApp requests
+  // (the patient's request that got "queued" while Bukeala was down).
+  c.executionCtx.waitUntil(
+    processPendingRequests(c.env).catch((err) => {
+      console.log("[capture] processPendingRequests failed:", err.message);
+    }),
+  );
 
   const expirations = cleaned.map((c) => c.expires).filter((x): x is number => typeof x === "number");
   const minExp = expirations.length ? Math.min(...expirations) : null;

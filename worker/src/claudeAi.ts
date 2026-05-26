@@ -69,11 +69,14 @@ export async function suggestReply(
   const history = await loadHistory(env, fromPhone);
   history.push({ role: "user", content: inboundText });
 
+  // OPTIMIZACIÓN: prompt caching (system block cacheado 5 min) + history truncado a 8
   const body = {
-    model: "claude-sonnet-4-5-20250929",
-    max_tokens: 250,
-    system: SYSTEM_PROMPT,
-    messages: history.slice(-10), // last 10 turns
+    model: "claude-sonnet-4-6",
+    max_tokens: 250, // respuestas WhatsApp cortas
+    system: [
+      { type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
+    ],
+    messages: history.slice(-8), // 8 turnos suficiente para context inmediato
   };
 
   let res: Response;
@@ -111,24 +114,26 @@ export async function suggestReply(
 
 /**
  * Append a turn to the persisted conversation history (for both directions).
- * History is rolling (last 20 turns).
+ * History is rolling (last 20 turns). El kvPrefix permite separar historiales
+ * por canal (WhatsApp vs Instagram), default "wa" para compatibilidad.
  */
 export async function appendHistory(
   env: Env,
   fromPhone: string,
   role: "user" | "assistant",
   content: string,
+  kvPrefix: "wa" | "ig" = "wa",
 ): Promise<void> {
-  const history = await loadHistory(env, fromPhone);
+  const history = await loadHistory(env, fromPhone, kvPrefix);
   history.push({ role, content });
   const trimmed = history.slice(-20);
-  await env.STATE.put(`wa:history:${fromPhone}`, JSON.stringify(trimmed), {
+  await env.STATE.put(`${kvPrefix}:history:${fromPhone}`, JSON.stringify(trimmed), {
     expirationTtl: 60 * 60 * 24 * 7, // 7 days
   });
 }
 
-async function loadHistory(env: Env, fromPhone: string): Promise<ClaudeMessage[]> {
-  const raw = await env.STATE.get(`wa:history:${fromPhone}`);
+async function loadHistory(env: Env, fromPhone: string, kvPrefix: "wa" | "ig" = "wa"): Promise<ClaudeMessage[]> {
+  const raw = await env.STATE.get(`${kvPrefix}:history:${fromPhone}`);
   if (!raw) return [];
   try {
     const arr = JSON.parse(raw);

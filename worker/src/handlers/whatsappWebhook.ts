@@ -23,6 +23,16 @@ import { sendText, sendInteractiveButtons } from "../whatsapp";
 import { suggestReply, appendHistory, getMode, setMode, type WaMode } from "../claudeAi";
 import { runBookingAgent } from "../claudeBookingAgent";
 import { getAllRecipients } from "../users";
+import { sendHandoffNotification, sendHandoffPatientMessage } from "../handoffBot";
+import { sendQuotePatientMessage, getAssignee } from "../quotesBot";
+import {
+  downloadWAMedia,
+  sendTelegramPhoto,
+  sendTelegramDocument,
+  sendTelegramVoice,
+  sendTelegramVideo,
+} from "../whatsappMedia";
+import { transcribeAudio } from "../whisper";
 
 const TG = (token: string) => `https://api.telegram.org/bot${token}`;
 
@@ -45,6 +55,11 @@ interface WAWebhookEntry {
           button_reply?: { id?: string; title?: string };
           list_reply?: { id?: string; title?: string };
         };
+        image?: { id?: string; mime_type?: string; sha256?: string; caption?: string };
+        document?: { id?: string; mime_type?: string; filename?: string; caption?: string };
+        audio?: { id?: string; mime_type?: string; voice?: boolean };
+        video?: { id?: string; mime_type?: string; caption?: string };
+        sticker?: { id?: string; mime_type?: string; animated?: boolean };
       }>;
       statuses?: Array<{
         id?: string;
@@ -166,8 +181,83 @@ async function handleInboundMessage(
     }
   }
 
-  const text = extractText(msg);
+  // ---- AUDIO/VOICE: transcribir con Whisper y procesar como texto ----
+  // Esto permite que la AI siga manejando la conversación aunque el paciente
+  // mande nota de voz. Mucho más útil que forzar manual mode.
+  let injectedText = "";
+  let isTranscribedAudio = false;
+  if ((msg.type === "audio" && msg.audio?.id) && from) {
+    const audioId = msg.audio.id;
+    console.log(`[wa-webhook] inbound audio id=${audioId} from=${from} → transcribing`);
+    const media = await downloadWAMedia(env, audioId);
+    if (media) {
+      const transcript = await transcribeAudio(env, media.buffer);
+      if (transcript) {
+        injectedText = transcript;
+        isTranscribedAudio = true;
+
+        // Push original audio + transcript a Telegram para visibilidad humana
+        const handoffToken = env.TELEGRAM_HANDOFF_BOT_TOKEN;
+        const targetToken = handoffToken || env.TELEGRAM_BOT_TOKEN;
+        const escName = escapeHtml(senderName);
+        const escTranscript = escapeHtml(transcript);
+        const audioCaption =
+          `🎙️ <b>${escName}</b> (<code>${from}</code>)\n\n📝 <i>${escTranscript}</i>`;
+        const recipients = await getAllRecipients(env);
+        for (const chatId of recipients) {
+          try {
+            await sendTelegramVoice(targetToken, chatId, media.buffer, audioCaption);
+          } catch (e) {
+            console.log(`[wa-webhook] tg push audio failed:`, (e as Error).message);
+          }
+        }
+      } else {
+        console.log("[wa-webhook] transcription failed, falling back to manual handoff");
+        await handleInboundMedia(env, msg, ctx, from, senderName);
+        return;
+      }
+    } else {
+      await notifyMediaFailure(env, from, senderName, "audio", "");
+      return;
+    }
+  }
+
+  // ---- VISUAL MEDIA (image/video/document/sticker) ----
+  // Forzar manual: la AI no interpreta fotos médicas.
+  if (
+    !isTranscribedAudio && (
+      (msg.type === "image" && msg.image?.id) ||
+      (msg.type === "document" && msg.document?.id) ||
+      (msg.type === "video" && msg.video?.id) ||
+      (msg.type === "sticker" && msg.sticker?.id)
+    )
+  ) {
+    if (!from) return;
+    await handleInboundMedia(env, msg, ctx, from, senderName);
+    return;
+  }
+
+  // Texto: del mensaje normal o transcrito desde audio
+  const text = isTranscribedAudio ? injectedText : extractText(msg);
   if (!from || !text) return;
+
+  // ---- POP CUC desde WhatsApp (cualquier número) ----
+  // Agenda de cirugías Clínica Colombia. Si alguien escribe "pop cuc" desde
+  // cualquier WhatsApp, lo llevamos al flujo de agendamiento con Google Calendar.
+  // Toma prioridad sobre la IA: si hay state activo, todos los mensajes son del
+  // flujo hasta que se complete o se cancele.
+  {
+    const { isPopCucTrigger, handlePopCuc } = await import("../popCuc");
+    const userId = `wa:${from}`;
+    const hasState = await env.STATE.get(`popcuc:state:${userId}`);
+    if (isPopCucTrigger(text) || hasState) {
+      const popResult = await handlePopCuc(env, userId, text);
+      if (popResult) {
+        try { await sendText(env, from, popResult.reply); } catch { /* ignore */ }
+        return;
+      }
+    }
+  }
 
   // Save mapping (wa_id → name)
   try {
@@ -180,41 +270,72 @@ async function handleInboundMessage(
     console.log("[wa-webhook] kv put failed:", (e as Error).message);
   }
 
-  // ---- Consent gate: if no consent yet, send welcome with buttons ----
-  // Skip if doctor manually overrode the mode (then mode != "manual" or contact already set)
+  // ---- New contact: AI auto by default (no consent buttons) ----
+  // The patient gets a brief greeting + the AI booking agent answers immediately.
+  // They can opt out at any time by writing "humano".
   const consent = await env.STATE.get(`wa:consent:${from}`);
-  const mode: WaMode = await getMode(env, from);
-  const explicitMode = mode !== "manual"; // doctor pre-set this contact
+  let mode: WaMode = await getMode(env, from);
 
-  if (!consent && !explicitMode) {
-    console.log(`[wa-webhook] no consent yet for ${from} → sending welcome buttons`);
+  if (!consent) {
+    console.log(`[wa-webhook] new contact ${from} → defaulting to AI auto`);
+    await env.STATE.put(`wa:consent:${from}`, "ai", { expirationTtl: 60 * 60 * 24 * 365 });
+    await setMode(env, from, "auto");
+    mode = "auto";
+
+    // One-time greeting — short, surgeon-tone, no long disclaimers
     try {
-      await env.STATE.put(`wa:consent:${from}`, "pending", { expirationTtl: 60 * 60 * 24 * 7 });
-      await sendInteractiveButtons(
+      await sendText(
         env,
         from,
-        `¡Hola${senderName !== "Desconocido" ? " " + senderName : ""}! 👋\n\nSoy el asistente del Dr. David Duque, cirujano plástico.\n\n¿Cómo prefieres ser atendido?`,
-        [
-          { id: "consent_ai", title: "🤖 Asistente AI" },
-          { id: "consent_human", title: "👤 Humano" },
-        ],
-        undefined,
-        "Puedes cambiar de opción más adelante.",
+        `Hola${senderName !== "Desconocido" ? " " + senderName.split(" ")[0] : ""} 👋 Soy el Dr. David Duque. Cuéntame, ¿en qué te ayudo? (Si quieres hablar con mi equipo directamente, escribe "humano".)`,
       );
-      // Also forward the message to Telegram so doctor sees the first contact
-      const escapedName = escapeHtml(senderName);
-      const escapedText = escapeHtml(text);
+    } catch { /* ignore */ }
+
+    const escapedNameNew = escapeHtml(senderName);
+    const escapedTextNew = escapeHtml(text);
+    await sendTelegram(
+      env,
+      `🆕🤖 <b>Nuevo paciente WhatsApp</b> <b>${escapedNameNew}</b> (<code>${from}</code>) — modo <b>AI auto</b>:\n\n📥 ${escapedTextNew}\n\n<i>El asistente AI le va a responder. Para tomar control: /wa_mode ${from} manual</i>`,
+      [[
+        { text: "✏️ Tomar control", callback_data: `wa_takeover:${from}` },
+        { text: "🛑 Detener AI", callback_data: `wa_off:${from}` },
+      ]],
+    );
+    // Fall through: process this same message with the AI agent below
+  }
+
+  // ---- "Humano" override: if patient asks for a human at any point, switch to manual ----
+  if (/\b(humano|operador|persona real|asistente real|hablar (con )?(una )?persona|hablar con alguien)\b/i.test(text)) {
+    console.log(`[wa-webhook] patient ${from} requested human`);
+    await setMode(env, from, "manual");
+    await env.STATE.put(`wa:consent:${from}`, "human", { expirationTtl: 60 * 60 * 24 * 365 });
+    try {
+      await sendText(env, from, "👤 Claro, te paso con un humano del equipo. En breve te responde.");
+    } catch { /* ignore */ }
+
+    // Preferimos handoff bot dedicado
+    const cedula = await (async () => {
+      const raw = await env.STATE.get(`wa:patientCtx:${from}`);
+      if (!raw) return undefined;
+      try { return JSON.parse(raw).cedula as string; } catch { return undefined; }
+    })();
+    const deliveredToHandoff = await sendHandoffNotification(env, {
+      fromPhone: from,
+      patientName: senderName,
+      message: text,
+      reason: "Paciente pidió hablar con humano",
+      cedula,
+    });
+
+    if (!deliveredToHandoff) {
+      const escapedHName = escapeHtml(senderName);
+      const escapedHText = escapeHtml(text);
       await sendTelegram(
         env,
-        `🆕 <b>Primer mensaje WhatsApp</b> de <b>${escapedName}</b> (<code>${from}</code>):\n\n${escapedText}\n\n<i>Le envié botones para que elija AI o humano.</i>`,
+        `🚨 <b>Paciente pidió humano</b>\n\n<b>De:</b> ${escapedHName} (<code>${from}</code>)\n\n📥 ${escapedHText}\n\n<i>Modo manual. /wa_reply ${from} TEXTO para responder.</i>`,
         modeKeyboardManual(from),
       );
-    } catch (e) {
-      console.log("[wa-webhook] welcome send failed:", (e as Error).message);
-      // Fallback: process as manual
-      await handleManualMode(env, from, senderName, text);
     }
-    // Persist for Claude memory either way
     try { await appendHistory(env, from, "user", text); } catch { /* ignore */ }
     return;
   }
@@ -226,7 +347,7 @@ async function handleInboundMessage(
     console.log("[wa-webhook] appendHistory failed:", (e as Error).message);
   }
 
-  console.log(`[wa-webhook] inbound from=${from} consent=${consent} mode=${mode} text="${text.slice(0, 80)}"`);
+  console.log(`[wa-webhook] inbound from=${from} consent=${consent ?? "ai-default"} mode=${mode} text="${text.slice(0, 80)}"`);
 
   if (mode === "auto") {
     await handleAutoMode(env, from, senderName, text);
@@ -239,12 +360,37 @@ async function handleInboundMessage(
 
 // ---- mode: manual (default) ----
 async function handleManualMode(env: Env, from: string, senderName: string, text: string) {
+  // ROUTING UNIFICADO según assignee del contacto:
+  //   - assignee="andrea"  → mensajes van al bot de cotizaciones (consultorioandrea_bot)
+  //   - assignee="doctor"  → mensajes van al handoff bot (consultadavid_bot)
+  //   - assignee=null      → fallback a handoff bot (default cuando entra en manual)
+  // Así la conversación QUEDA UNIFICADA en el bot del responsable actual.
+  const assignee = await getAssignee(env, from);
+
+  if (assignee === "andrea") {
+    const ok = await sendQuotePatientMessage(env, {
+      fromPhone: from,
+      patientName: senderName,
+      text,
+    });
+    if (ok) return;
+    // Fallback si quotes bot no configurado: ir al handoff
+  }
+
+  // Default y caso doctor: handoff bot
+  const delivered = await sendHandoffPatientMessage(env, {
+    fromPhone: from,
+    patientName: senderName,
+    text,
+  });
+  if (delivered) return;
+
+  // Último fallback: bot principal (si no hay ni handoff ni quotes configurados)
   const escaped = escapeHtml(text);
   const escapedName = escapeHtml(senderName);
   const tgText =
     `💬 <b>WhatsApp</b> de <b>${escapedName}</b> (<code>${from}</code>):\n\n` +
     `${escaped}`;
-
   await sendTelegram(env, tgText, modeKeyboardManual(from));
 }
 
@@ -303,18 +449,40 @@ async function handleAutoMode(env: Env, from: string, senderName: string, text: 
   }
 
   if (result.shouldEscalate) {
-    // Switch this contact to manual mode + notify Telegram
+    // Switch this contact to manual mode
     await setMode(env, from, "manual");
-    await sendTelegram(
-      env,
-      `🚨 <b>Claude escaló a humano</b>\n` +
-        `De: <b>${escapedName}</b> (<code>${from}</code>)\n` +
-        `Razón: ${escapeHtml(result.escalateReason ?? "n/a")}\n\n` +
-        `📥 ${escapedIn}\n\n` +
-        `📤 Claude respondió: <i>${escapeHtml(result.finalText)}</i>\n\n` +
-        `<i>Modo cambió a manual. Usa /wa_reply para responder o /wa_mode ${from} auto para volver a Claude.</i>`,
-      modeKeyboardManual(from),
-    );
+
+    // Preferimos mandar al bot de handoff dedicado si está configurado.
+    const cedula = await (async () => {
+      const raw = await env.STATE.get(`wa:patientCtx:${from}`);
+      if (!raw) return undefined;
+      try { return JSON.parse(raw).cedula as string; } catch { return undefined; }
+    })();
+    const deliveredToHandoff = await sendHandoffNotification(env, {
+      fromPhone: from,
+      patientName: senderName,
+      message: text,
+      reason: result.escalateReason ?? "n/a",
+      cedula,
+      aiReply: result.finalText,
+      intent: result.escalateIntent,
+      urgency: result.escalateUrgency as "alta" | "media" | "baja" | undefined,
+      suggestion: result.escalateSuggestion,
+    });
+
+    // Fallback: si el handoff bot no está configurado o falló, mandar al bot principal
+    if (!deliveredToHandoff) {
+      await sendTelegram(
+        env,
+        `🚨 <b>AI escaló a humano</b>\n` +
+          `De: <b>${escapedName}</b> (<code>${from}</code>)\n` +
+          `Razón: ${escapeHtml(result.escalateReason ?? "n/a")}\n\n` +
+          `📥 ${escapedIn}\n\n` +
+          `📤 AI respondió: <i>${escapeHtml(result.finalText)}</i>\n\n` +
+          `<i>Modo manual. /wa_reply para responder, /wa_mode ${from} auto para devolver a AI.</i>`,
+        modeKeyboardManual(from),
+      );
+    }
   } else {
     const escapedReply = escapeHtml(result.finalText);
     await sendTelegram(
@@ -399,4 +567,155 @@ function escapeHtml(s: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+// ====================================================================
+// Inbound media handler: WA media → Telegram (handoff bot or main fallback)
+// ====================================================================
+async function handleInboundMedia(
+  env: Env,
+  msg: NonNullable<NonNullable<NonNullable<WAWebhookEntry["changes"]>[number]["value"]>["messages"]>[number],
+  _ctx: NonNullable<WAWebhookEntry["changes"]>[number]["value"],
+  from: string,
+  senderName: string,
+): Promise<void> {
+  // Save mapping
+  try {
+    await env.STATE.put(
+      `wa:contact:${from}`,
+      JSON.stringify({ name: senderName, lastSeenAt: Date.now() }),
+      { expirationTtl: 60 * 60 * 24 * 30 },
+    );
+  } catch {/* ignore */}
+
+  // Always switch to manual: AI shouldn't interpret medical media
+  await setMode(env, from, "manual");
+
+  // Identify media + download
+  let mediaId = "";
+  let kind: "image" | "document" | "audio" | "video" | "sticker" = "image";
+  let caption = "";
+  let filename = "";
+
+  if (msg.type === "image" && msg.image?.id) {
+    mediaId = msg.image.id;
+    kind = "image";
+    caption = msg.image.caption ?? "";
+  } else if (msg.type === "document" && msg.document?.id) {
+    mediaId = msg.document.id;
+    kind = "document";
+    caption = msg.document.caption ?? "";
+    filename = msg.document.filename ?? "documento";
+  } else if (msg.type === "audio" && msg.audio?.id) {
+    mediaId = msg.audio.id;
+    kind = "audio";
+  } else if (msg.type === "video" && msg.video?.id) {
+    mediaId = msg.video.id;
+    kind = "video";
+    caption = msg.video.caption ?? "";
+  } else if (msg.type === "sticker" && msg.sticker?.id) {
+    mediaId = msg.sticker.id;
+    kind = "sticker";
+  } else {
+    return;
+  }
+
+  console.log(`[wa-webhook] inbound ${kind} id=${mediaId} from=${from}`);
+
+  // Append text marker to history (so AI/Telegram has context)
+  const marker = `[${iconFor(kind)} ${kind}${caption ? `: ${caption.slice(0, 200)}` : ""}]`;
+  try { await appendHistory(env, from, "user", marker); } catch {/* ignore */}
+
+  // Download bytes from WA
+  const media = await downloadWAMedia(env, mediaId);
+  if (!media) {
+    // Fallback: solo notificación de texto
+    await notifyMediaFailure(env, from, senderName, kind, caption);
+    return;
+  }
+
+  // Push to Telegram. Prefer handoff bot if configured.
+  const handoffToken = env.TELEGRAM_HANDOFF_BOT_TOKEN;
+  const targetToken = handoffToken || env.TELEGRAM_BOT_TOKEN;
+  const escName = escapeHtml(senderName);
+  const escCaption = caption ? escapeHtml(caption) : "";
+
+  const headerHtml =
+    `${iconFor(kind)} <b>${escName}</b> (<code>${from}</code>)` +
+    (escCaption ? `\n\n<i>${escCaption}</i>` : "");
+
+  const recipients = await getAllRecipients(env);
+  for (const chatId of recipients) {
+    try {
+      let ok = false;
+      if (kind === "image" || kind === "sticker") {
+        ok = await sendTelegramPhoto(targetToken, chatId, media.buffer, headerHtml);
+      } else if (kind === "document") {
+        ok = await sendTelegramDocument(targetToken, chatId, media.buffer, filename || "documento", media.mimeType, headerHtml);
+      } else if (kind === "audio") {
+        ok = await sendTelegramVoice(targetToken, chatId, media.buffer, headerHtml);
+      } else if (kind === "video") {
+        // Reproducible inline (Telegram sendVideo). Si falla por tamaño/codec, fallback a documento.
+        ok = await sendTelegramVideo(targetToken, chatId, media.buffer, headerHtml);
+        if (!ok) {
+          console.log(`[wa-webhook] sendVideo falló, fallback a sendDocument`);
+          ok = await sendTelegramDocument(targetToken, chatId, media.buffer, "video.mp4", media.mimeType, headerHtml);
+        }
+      }
+      if (!ok) {
+        console.log(`[wa-webhook] tg send to ${chatId} failed for ${kind}`);
+      }
+    } catch (e) {
+      console.log(`[wa-webhook] tg push failed:`, (e as Error).message);
+    }
+  }
+
+  // También un mensaje de texto al handoff bot con los botones [📤 Responder] [🔚 Devolver IA]
+  // para que el doctor sepa que es escalación y pueda responder rápido.
+  if (handoffToken) {
+    const cedula = await (async () => {
+      const raw = await env.STATE.get(`wa:patientCtx:${from}`);
+      if (!raw) return undefined;
+      try { return JSON.parse(raw).cedula as string; } catch { return undefined; }
+    })();
+    await sendHandoffNotification(env, {
+      fromPhone: from,
+      patientName: senderName,
+      message: marker + (caption ? ` "${caption}"` : ""),
+      reason: `Paciente envió ${kind}`,
+      cedula,
+    });
+  } else {
+    // Si no hay handoff bot, mandar solo texto al main bot con los keyboards
+    await sendTelegram(
+      env,
+      `🚨 <b>Paciente envió ${kind}</b>\nDe: <b>${escName}</b> (<code>${from}</code>)\n${escCaption ? `\n<i>${escCaption}</i>\n` : ""}\n<i>Modo manual. /wa_reply ${from} TEXTO o /wa_mode ${from} auto.</i>`,
+      modeKeyboardManual(from),
+    );
+  }
+}
+
+function iconFor(kind: string): string {
+  switch (kind) {
+    case "image": return "📷";
+    case "document": return "📄";
+    case "audio": return "🎙️";
+    case "video": return "🎥";
+    case "sticker": return "🌟";
+    default: return "📎";
+  }
+}
+
+async function notifyMediaFailure(
+  env: Env,
+  from: string,
+  senderName: string,
+  kind: string,
+  caption: string,
+): Promise<void> {
+  const text =
+    `⚠️ <b>${escapeHtml(senderName)}</b> envió un <b>${kind}</b> pero no pudimos descargarlo.\n` +
+    `<code>${from}</code>` +
+    (caption ? `\n\n<i>${escapeHtml(caption)}</i>` : "");
+  await sendTelegram(env, text, modeKeyboardManual(from));
 }

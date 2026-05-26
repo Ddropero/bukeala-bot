@@ -9,15 +9,37 @@ compatibility_flags = ["nodejs_compat"]
 [placement]
 mode = "smart"
 
-# Keep-alive cron: ping Bukeala every 5 min during business hours so the
-# Java session doesn't expire. Reduces how often the user has to re-capture.
+# Keep-alive cron: cada 5 min en horario de oficina (7am-7pm Colombia).
+# Fuera de horario, la sesión muere — si llega un WhatsApp en la noche, el
+# auto-trigger on-demand (claudeBookingAgent.queuePendingRequest) dispara
+# refresh inmediato. Razón: Bukeala parece tener mantenimiento/limpieza
+# nocturna que invalida sesiones automáticamente.
 [triggers]
 # Multiple crons:
-#   "*/5 12-23 * * *"  → keepAlive (every 5 min, 7am-6pm Colombia)
-#   "0 12 * * *"       → dailySummary (7am Colombia exactly)
-#   "*/10 12-23 * * *" → newBookingsWatch (every 10 min, 7am-6pm Colombia)
-#   "0 13 * * *"       → reminderCron (8am Colombia, manda recordatorios mañana)
-crons = ["*/5 12-23 * * *", "0 12 * * *", "*/10 12-23 * * *", "0 13 * * *"]
+#   "*/5 12-23,0 * * *" → keepAlive (every 5 min, 7am-7:55pm Colombia)
+#   "0 12 * * *"        → dailySummary (7am Colombia exactly)
+#   "*/10 12-23 * * *"  → newBookingsWatch (every 10 min, 7am-6pm Colombia)
+#   "0 13 * * *"        → reminderCron (8am Colombia, manda recordatorios mañana)
+# Multiple crons:
+#   "*/3 * * * *"        → keepAlive (cada 3 min, 24/7 — Mac queda prendido)
+#   "0 12 * * *"         → dailySummary (7am Colombia)
+#   "*/10 12-23 * * *"   → newBookingsWatch (cada 10 min, horario oficina)
+#   "0 13 * * *"         → reminderCron (8am Bogotá)
+#   "*/15 * * * *"       → autoReturnToAI (cada 15 min, 24/7)
+#   "0 12 * * 1"         → weeklyReport (Lunes 7am Bogotá)
+#   "0 14 * * *"         → quoteFollowup (9am Bogotá)
+crons = ["*/3 * * * *", "0 12 * * *", "*/10 12-23 * * *", "0 13 * * *", "*/15 * * * *", "0 12 * * 1", "0 14 * * *"]
+
+# Observabilidad: habilita logs persistentes y sampling 100% (el dashboard
+# muestra warning sin esto, aunque la funcionalidad esté disponible igual).
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
 
 [vars]
 BUKEALA_BASE = "https://appoint.tuscitasmedicas.com/keraltyadscritos"
@@ -30,6 +52,11 @@ id = "854907b4b344415abe9d46b9d62fa744"
 [[kv_namespaces]]
 binding = "STATE"
 id = "372dbe91417340d995ac6aa831344898"
+
+# Cloudflare Workers AI — usado para transcribir voice notes con Whisper.
+# Modelo: @cf/openai/whisper-large-v3-turbo (mejor para español + médico).
+[ai]
+binding = "AI"
 
 # Durable Object: geographic relay pinned to us-east. See src/proxy.ts.
 [[durable_objects.bindings]]

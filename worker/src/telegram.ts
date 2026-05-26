@@ -42,6 +42,7 @@ import {
 import { showWeeklyStats } from "./commands/stats";
 import { searchByName } from "./commands/searchByName";
 import { startBloquear } from "./commands/bloquear";
+import { showInbox } from "./commands/inbox";
 import {
   buildAgendaDetailKeyboard,
   showAgendaBookingDetail,
@@ -69,6 +70,7 @@ import {
   sendText as sendWaText,
 } from "./whatsapp";
 import { suggestReply, appendHistory, getMode, setMode, type WaMode } from "./claudeAi";
+import { loadPendingRequests, clearPendingRequests, processPendingRequests } from "./claudeBookingAgent";
 import { getNativeHostEvents, requestRefresh } from "./handlers/nativeHostEvent";
 import { isAllowed, isDoctor, getRole, getUserName, listUsers, addUser, removeUser, type Role } from "./users";
 
@@ -155,6 +157,59 @@ export async function handleUpdate(env: Env, update: any): Promise<void> {
 }
 
 async function onText(env: Env, chatId: string, text: string): Promise<void> {
+  // POP CUC — agenda interna Clínica Colombia (cualquier usuario autorizado en TG)
+  {
+    const { handlePopCuc, loadPopCucList, clearPopCucList } = await import("./popCuc");
+
+    // /cuc_list — ver entradas
+    if (text === "/cuc_list" || text === "/cuc-list") {
+      const list = await loadPopCucList(env);
+      if (list.length === 0) {
+        await sendMessage(env, chatId, "📋 Lista pop cuc vacía.");
+        return;
+      }
+      const lines = [`📋 <b>Pop cuc — ${list.length} entradas</b>`, ""];
+      for (const e of list.slice(-30).reverse()) {
+        const when = new Date(e.createdAt).toLocaleString("es-CO", {
+          timeZone: "America/Bogota",
+          hour12: false,
+        });
+        const cita = e.scheduledForLabel
+          ? `\n  📅 <b>${escapeHtml(e.scheduledForLabel)}</b>${e.gcalEventId ? " ✅" : ""}`
+          : "";
+        lines.push(`• <b>${escapeHtml(e.name)}</b> · CC <code>${escapeHtml(e.cedula)}</code>${cita}\n  <i>registrado: ${when}</i>`);
+      }
+      await sendMessage(env, chatId, lines.join("\n"));
+      return;
+    }
+
+    // /cuc_status — diagnóstico de configuración GCal
+    if (text === "/cuc_status") {
+      const { getPopCucStatus } = await import("./popCuc");
+      await sendMessage(env, chatId, getPopCucStatus(env));
+      return;
+    }
+
+    // /cuc_clear — limpiar lista (solo doctor)
+    if (text === "/cuc_clear") {
+      if (!(await isDoctor(env, chatId))) {
+        await sendMessage(env, chatId, "❌ Solo doctores.");
+        return;
+      }
+      const n = await clearPopCucList(env);
+      await sendMessage(env, chatId, `🗑️ Lista pop cuc vaciada (${n} entradas borradas).`);
+      return;
+    }
+
+    // Trigger o flujo activo
+    const userId = `tg:${chatId}`;
+    const popResult = await handlePopCuc(env, userId, text);
+    if (popResult) {
+      await sendMessage(env, chatId, popResult.reply);
+      return;
+    }
+  }
+
   if (text === "/start") {
     await clearState(env, chatId);
     const role = await getRole(env, chatId);
@@ -177,17 +232,34 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
       "/stats — estadísticas semanales",
       "/bloquear DD/MM/YYYY HH:MM HH:MM motivo",
       "",
+      "<b>👥 Pacientes</b>",
+      "/p &lt;cédula&gt; — lookup directo del paciente",
+      "/recientes — últimos 15 pacientes (botones agendar / citas / WA)",
+      "",
       "<b>💬 WhatsApp pacientes</b>",
+      "/inbox — vista unificada: TODAS las conversaciones por modo (🤖/✋/👁️)",
+      "/contactos — lista todos los contactos WA con botones",
+      "/jhon &lt;mensaje&gt; — reenviar alerta a Jhon Morales por WA",
       "/wa_reply &lt;num&gt; &lt;mensaje&gt;",
       "/wa_mode &lt;num&gt; &lt;manual|review|auto&gt;",
       "/wa_status &lt;num&gt;",
+      "/wa_pending — solicitudes en cola (Bukeala caído)",
+      "/wa_process_pending — re-intentar la cola ahora",
+      "/wa_clear_pending — vaciar la cola",
       "/wa_recordar &lt;num&gt; | &lt;nombre&gt; | &lt;fecha&gt; | &lt;hora&gt; | &lt;lugar&gt;",
       "/wa_cancelar_aviso &lt;num&gt; | &lt;nombre&gt; | &lt;fecha&gt; | &lt;hora&gt;",
       "/wa_followup &lt;num&gt; | &lt;nombre&gt;",
       "/wa_postcirugia &lt;num&gt; | &lt;nombre&gt; | &lt;días&gt;",
       "",
+      "<b>🏥 Pop cuc (agenda Cirugías Clínica Colombia)</b>",
+      "<code>pop cuc</code> — agendar cirugía (muestra lunes 7am-12:40 + Google Calendar)",
+      "/cuc_list — ver últimos registros con fecha de cita",
+      "/cuc_status — diagnóstico de configuración GCal",
+      "/cuc_clear — vaciar lista (solo doctor)",
+      "",
       "<b>🔄 Sesión Bukeala</b>",
       "/sesion_renew — pedir nuevo login (cualquiera, abre ventana en PC)",
+      "/sesion_blackout — heatmap disponibilidad por hora (detecta mantenimientos)",
       "",
       "<b>👤 Cuenta</b>",
       "/whoami — quién soy",
@@ -469,6 +541,79 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     return;
   }
 
+  // /sesion_blackout — heatmap éxito/fallo por hora Bogotá
+  // Útil para detectar ventana de mantenimiento nocturna de Bukeala.
+  if (text === "/sesion_blackout") {
+    type HourStat = { hour: number; ok: number; fail: number };
+    const stats: HourStat[] = [];
+    for (let h = 0; h < 24; h++) {
+      const okRaw = await env.STATE.get(`bukeala:hourOk:${h}`);
+      const failRaw = await env.STATE.get(`bukeala:hourFail:${h}`);
+      stats.push({
+        hour: h,
+        ok: okRaw ? parseInt(okRaw, 10) || 0 : 0,
+        fail: failRaw ? parseInt(failRaw, 10) || 0 : 0,
+      });
+    }
+    const totalSamples = stats.reduce((s, x) => s + x.ok + x.fail, 0);
+    if (totalSamples === 0) {
+      await sendMessage(env, chatId, "📊 Aún sin datos. El tracking inicia cuando el Native Host empieza a reportar eventos.");
+      return;
+    }
+    const lines: string[] = [
+      "📊 <b>Disponibilidad Bukeala por hora (Bogotá)</b>",
+      `<i>Total muestras: ${totalSamples}</i>`,
+      "",
+      "<code>Hora  ✅  ❌  Tasa éxito  Barra</code>",
+    ];
+    for (const s of stats) {
+      const total = s.ok + s.fail;
+      const rate = total === 0 ? null : (s.ok / total) * 100;
+      const rateStr = rate === null ? "—" : `${rate.toFixed(0)}%`;
+      const barLen = rate === null ? 0 : Math.round(rate / 10);
+      const bar = "█".repeat(barLen) + "·".repeat(10 - barLen);
+      const flag = rate !== null && rate < 50 && total >= 3 ? " 🚨" : "";
+      const hourStr = `${String(s.hour).padStart(2, "0")}h`;
+      const okStr = String(s.ok).padStart(3);
+      const failStr = String(s.fail).padStart(3);
+      const rateP = rateStr.padStart(4);
+      lines.push(`<code>${hourStr} ${okStr} ${failStr}  ${rateP}     ${bar}</code>${flag}`);
+    }
+    const suspect = stats.filter((s) => {
+      const total = s.ok + s.fail;
+      return total >= 3 && s.ok / total < 0.5;
+    });
+    if (suspect.length > 0) {
+      lines.push("");
+      lines.push("🚨 <b>Horas sospechosas de mantenimiento:</b>");
+      lines.push(suspect.map((s) => `${String(s.hour).padStart(2, "0")}:00`).join(", "));
+      lines.push("");
+      lines.push("<i>Si el patrón se mantiene, ajustamos el cron para evitar esas horas y ahorrar en 2Captcha.</i>");
+    } else if (totalSamples >= 20) {
+      lines.push("");
+      lines.push("💚 No se detectan horas problemáticas — Bukeala parece estable 24/7.");
+    } else {
+      lines.push("");
+      lines.push("<i>Aún pocos datos. Vuelve a chequear en 2-3 días.</i>");
+    }
+    await sendMessage(env, chatId, lines.join("\n"));
+    return;
+  }
+
+  // /sesion_blackout_reset — borra contadores (para empezar tracking desde cero)
+  if (text === "/sesion_blackout_reset") {
+    if (!(await isDoctor(env, chatId))) {
+      await sendMessage(env, chatId, "❌ Solo doctores.");
+      return;
+    }
+    for (let h = 0; h < 24; h++) {
+      await env.STATE.delete(`bukeala:hourOk:${h}`);
+      await env.STATE.delete(`bukeala:hourFail:${h}`);
+    }
+    await sendMessage(env, chatId, "🔄 Contadores reseteados. El tracking empieza de nuevo.");
+    return;
+  }
+
   // /wa_recordar <num> | <nombre> | <fecha> | <hora> | <lugar>
   // Send appointment_reminder template to patient
   if (text.startsWith("/wa_recordar ")) {
@@ -552,6 +697,10 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
       return;
     }
     await setMode(env, e164, newMode);
+    // Si vuelve a auto, libera el assignee para que la IA tome el control limpio
+    if (newMode === "auto") {
+      await env.STATE.delete(`wa:assignee:${e164}`);
+    }
     await sendMessage(env, chatId, `✅ Modo de <code>${e164}</code> → <b>${newMode}</b>`);
     return;
   }
@@ -573,6 +722,98 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     return;
   }
 
+  // /wa_pending  →  list of patients whose request is queued (Bukeala was down)
+  if (text === "/wa_pending") {
+    const pending = await loadPendingRequests(env);
+    if (pending.length === 0) {
+      await sendMessage(env, chatId, "✅ Sin solicitudes pendientes en cola.");
+      return;
+    }
+    const lines = [`⏳ <b>${pending.length} solicitud(es) pendiente(s)</b>`, ""];
+    for (const p of pending) {
+      const when = new Date(p.queuedAt).toLocaleString("es-CO", { timeZone: "America/Bogota", hour12: false });
+      lines.push(
+        `• <b>${escapeHtml(p.patientName ?? "(sin nombre)")}</b> (CC ${escapeHtml(p.cedula ?? "?")})\n` +
+        `   📞 <code>${escapeHtml(p.fromPhone)}</code>\n` +
+        `   📋 ${escapeHtml(p.details)}` +
+        (p.requestedDate ? `\n   📅 ${escapeHtml(p.requestedDate)}` : "") +
+        `\n   🕐 ${escapeHtml(when)}`,
+      );
+    }
+    lines.push("", "<i>Usa /wa_clear_pending para vaciar la cola después de procesarlas.</i>");
+    await sendMessage(env, chatId, lines.join("\n"));
+    return;
+  }
+
+  // /wa_clear_pending  →  empty the queue
+  if (text === "/wa_clear_pending") {
+    await clearPendingRequests(env);
+    await sendMessage(env, chatId, "🗑️ Cola de pendientes vaciada.");
+    return;
+  }
+
+  // /contactos  →  lista todos los WhatsApp contactos que han escrito al bot
+  // (los va guardando whatsappWebhook.ts en wa:contact:{phone}). Cada uno con
+  // botones: 📱 Escribir / 📋 Historial / 🤖 Activar IA.
+  if (text === "/contactos" || text === "/contacts") {
+    return showWaContacts(env, chatId);
+  }
+
+  // /inbox  →  vista unificada de TODAS las conversaciones WA agrupadas por modo
+  if (text === "/inbox") {
+    return showInbox(env, chatId);
+  }
+
+  // /jhon <texto>  →  reenvía un mensaje al WhatsApp de Jhon Morales
+  // Útil para alertas de descripciones quirúrgicas u otras urgencias.
+  if (text.startsWith("/jhon ") || text === "/jhon") {
+    if (text === "/jhon") {
+      await sendMessage(env, chatId, "Uso: <code>/jhon &lt;mensaje&gt;</code>\nEjemplo: <code>/jhon 🚨 Alerta paciente X requiere descripción quirúrgica</code>");
+      return;
+    }
+    const body = text.slice("/jhon ".length).trim();
+    if (!body) {
+      await sendMessage(env, chatId, "Mensaje vacío.");
+      return;
+    }
+    const r = await sendWaText(env, "573208336978", body);
+    if (r.ok) {
+      await sendMessage(env, chatId, `✅ Enviado a Jhon Morales (<code>573208336978</code>)`);
+    } else {
+      const err = r.data?.error?.message ?? "error desconocido";
+      await sendMessage(env, chatId, `❌ No se pudo enviar a Jhon: ${escapeHtml(String(err))}\n<i>Probable que esté fuera de ventana 24h. Pídele que te mande "Hola" al WA.</i>`);
+    }
+    return;
+  }
+
+  // /recientes  →  últimos 15 pacientes que agendaste por el bot
+  if (text === "/recientes" || text === "/recent") {
+    return showRecentPatients(env, chatId);
+  }
+
+  // /p <cedula>  →  lookup directo de paciente sin pasar por el flujo de teclado
+  if (text.startsWith("/p ") || text === "/p") {
+    const cedula = text.slice(2).trim().replace(/\D/g, "");
+    if (!cedula) {
+      await sendMessage(env, chatId, "Uso: <code>/p &lt;cédula&gt;</code> (ej: <code>/p 80040718</code>)");
+      return;
+    }
+    return quickLookupPatient(env, chatId, cedula);
+  }
+
+  // /wa_process_pending  →  manually re-run the queue against current Bukeala session
+  if (text === "/wa_process_pending") {
+    await sendMessage(env, chatId, "⏳ Procesando cola de pendientes…");
+    const r = await processPendingRequests(env);
+    const msg =
+      `🔄 <b>Resultado</b>\n` +
+      `✅ Notificados: ${r.processed}\n` +
+      `⏳ Aún pendientes: ${r.remaining}` +
+      (r.details.length > 0 ? `\n\n${r.details.slice(0, 8).map((d) => "• " + escapeHtml(d)).join("\n")}` : "");
+    await sendMessage(env, chatId, msg);
+    return;
+  }
+
   if (text === "/doctor") {
     const active = await getActiveDoctor(env);
     if (DOCTORS.length <= 1) {
@@ -582,6 +823,28 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     await sendMessage(env, chatId, `<b>Doctor activo:</b> ${active.name}\n\nElige uno:`, {
       reply_markup: buildDoctorSelectorKeyboard(),
     });
+    return;
+  }
+
+  // Modo "respuesta WhatsApp" — el doctor tocó "📱 Escribir" en /contactos
+  // y el siguiente mensaje se reenvía al WhatsApp del paciente.
+  const writingTo = await env.STATE.get(`mainbot:waReplyTo:${chatId}`);
+  if (writingTo) {
+    if (text === "/cancelar" || text === "/cancel") {
+      await env.STATE.delete(`mainbot:waReplyTo:${chatId}`);
+      await sendMessage(env, chatId, "❌ Modo escritura cancelado.");
+      return;
+    }
+    const r = await sendWaText(env, writingTo, text);
+    if (r.ok) {
+      // Guardar la respuesta del doctor en el historial para context cuando
+      // se devuelva el contacto a IA.
+      try { await appendHistory(env, writingTo, "assistant", text); } catch { /* ignore */ }
+      await sendMessage(env, chatId, `✅ Enviado a <code>${writingTo}</code>\n<i>(modo escritura sigue activo · /cancelar para salir)</i>`);
+    } else {
+      const err = r.data?.error?.message ?? "error desconocido";
+      await sendMessage(env, chatId, `❌ No se pudo enviar: ${escapeHtml(String(err))}\n<i>Probable que esté fuera de la ventana 24h. Usa una plantilla con /wa_recordar.</i>`);
+    }
     return;
   }
 
@@ -598,6 +861,247 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
   }
 
   await sendMessage(env, chatId, "Comando no reconocido. /start para ayuda.");
+}
+
+// ====================================================================
+// /contactos — lista de todos los WhatsApp que han escrito al bot
+// ====================================================================
+async function showWaContacts(env: Env, chatId: string): Promise<void> {
+  // Listar todas las keys wa:contact:{phone}
+  const list = await env.STATE.list({ prefix: "wa:contact:" });
+  if (list.keys.length === 0) {
+    await sendMessage(env, chatId, "📭 Sin contactos WhatsApp registrados todavía.");
+    return;
+  }
+
+  // Cargar cada contacto con su info
+  type C = { phone: string; name: string; lastSeen: number; mode: string };
+  const contacts: C[] = [];
+  for (const k of list.keys) {
+    const phone = k.name.slice("wa:contact:".length);
+    const raw = await env.STATE.get(k.name);
+    if (!raw) continue;
+    let info: any = {};
+    try { info = JSON.parse(raw); } catch { /* ignore */ }
+    const mode = (await env.STATE.get(`wa:mode:${phone}`)) ?? "manual";
+    contacts.push({
+      phone,
+      name: info.name ?? "(sin nombre)",
+      lastSeen: typeof info.lastSeenAt === "number" ? info.lastSeenAt : 0,
+      mode,
+    });
+  }
+
+  // Sort por lastSeen desc, top 30
+  contacts.sort((a, b) => b.lastSeen - a.lastSeen);
+  const top = contacts.slice(0, 30);
+
+  const lines: string[] = [
+    `💬 <b>Contactos WhatsApp</b> (${contacts.length} total, mostrando ${top.length})`,
+    "",
+  ];
+  const buttons: Array<Array<{ text: string; callback_data: string }>> = [];
+  for (const c of top) {
+    const ago = c.lastSeen ? relativeTime(c.lastSeen) : "?";
+    const modeIcon = c.mode === "auto" ? "🤖" : c.mode === "review" ? "👁️" : "✋";
+    lines.push(
+      `${modeIcon} <b>${escapeHtml(c.name)}</b> <code>${escapeHtml(c.phone)}</code>\n   <i>${ago}</i>`,
+    );
+    buttons.push([
+      { text: `📱 ${c.name.split(/[, ]/)[0]}`, callback_data: `waw:${c.phone}` },
+      { text: "📋", callback_data: `wah:${c.phone}` },
+      { text: c.mode === "auto" ? "✋" : "🤖", callback_data: `wam:${c.phone}` },
+    ]);
+  }
+  lines.push("", "<i>Toca 📱 para escribir · 📋 historial · 🤖/✋ alternar IA/manual</i>");
+
+  await sendMessage(env, chatId, lines.join("\n"), {
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
+function relativeTime(ms: number): string {
+  const diffSec = Math.floor((Date.now() - ms) / 1000);
+  if (diffSec < 60) return "hace segundos";
+  if (diffSec < 3600) return `hace ${Math.floor(diffSec / 60)} min`;
+  if (diffSec < 86400) return `hace ${Math.floor(diffSec / 3600)} h`;
+  return `hace ${Math.floor(diffSec / 86400)} días`;
+}
+
+// ====================================================================
+// /recientes — últimos 15 pacientes agendados por el bot
+// ====================================================================
+async function showRecentPatients(env: Env, chatId: string): Promise<void> {
+  const list = await loadRecentPatients(env);
+  if (list.length === 0) {
+    await sendMessage(env, chatId, "📭 Sin pacientes recientes. Usa /buscar para empezar.");
+    return;
+  }
+  const lines: string[] = [`👥 <b>Pacientes recientes</b> (${list.length})`, ""];
+  const buttons: Array<Array<{ text: string; callback_data: string }>> = [];
+  for (const p of list) {
+    const ago = p.lastSeen ? relativeTime(new Date(p.lastSeen).getTime()) : "?";
+    lines.push(
+      `<b>${escapeHtml(p.name)}</b>\n   ${p.identificationType} <code>${escapeHtml(p.identification)}</code>${p.phone ? ` · 📞 <code>${escapeHtml(p.phone)}</code>` : ""}\n   <i>${ago}</i>`,
+    );
+    const row: Array<{ text: string; callback_data: string }> = [
+      { text: "📅 Agendar", callback_data: `r_book:${p.identification}` },
+      { text: "📋 Citas", callback_data: `r_citas:${p.identification}` },
+    ];
+    if (p.phone) {
+      row.push({ text: "📱 WA", callback_data: `waw:${normalizeColombianPhone(p.phone)}` });
+    }
+    buttons.push(row);
+  }
+  await sendMessage(env, chatId, lines.join("\n\n"), {
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
+// ====================================================================
+// /p <cedula> — lookup directo
+// ====================================================================
+async function quickLookupPatient(env: Env, chatId: string, cedula: string): Promise<void> {
+  await sendMessage(env, chatId, `🔍 Buscando <code>${escapeHtml(cedula)}</code>...`);
+  const b = new Bukeala(env);
+  // Intentar varios tipos de documento
+  const tries: Array<{ idType: string; letter: string }> = [
+    { idType: "1", letter: "C" },
+    { idType: "8", letter: "T" },
+    { idType: "9", letter: "R" },
+    { idType: "2", letter: "E" },
+    { idType: "5", letter: "P" },
+  ];
+  let found: any = null;
+  let foundIdType = "1";
+  let foundLetter = "C";
+  try {
+    for (const t of tries) {
+      try {
+        const res = await b.findCustomer(t.idType, cedula);
+        const j = await res.json<any>().catch(() => null);
+        if (j?.result?.code === "EXISTS") {
+          found = j?.result?.beanCustomer ?? j?.result ?? {};
+          foundIdType = t.idType;
+          foundLetter = t.letter;
+          break;
+        }
+      } catch (e) {
+        if (e instanceof SessionExpiredError) throw e;
+      }
+    }
+  } catch (e) {
+    if (e instanceof SessionExpiredError) {
+      await sendMessage(env, chatId, "🔴 Sesión Bukeala expirada. /sesion_renew para renovar.");
+      return;
+    }
+    await sendMessage(env, chatId, `❌ Error: ${escapeHtml((e as Error).message)}`);
+    return;
+  }
+  if (!found) {
+    await sendMessage(env, chatId, `❌ Paciente con cédula <code>${escapeHtml(cedula)}</code> no encontrado en Bukeala.`);
+    return;
+  }
+  const name: string = found.name ?? found.fullName ?? "(sin nombre)";
+  const phone: string = found.phone ?? found.cellPhone ?? "";
+  const email: string = found.email ?? "";
+  const gender: string = (found.gender ?? found.sex ?? "F").toString().toUpperCase().startsWith("M") ? "M" : "F";
+
+  // Guardar en recientes para próximas búsquedas
+  try {
+    await addRecentPatient(env, {
+      name,
+      identification: cedula,
+      identificationType: foundLetter,
+      gender,
+      email: email || undefined,
+      phone: phone || undefined,
+    });
+  } catch {/* ignore */}
+
+  const lines = [
+    `✅ <b>${escapeHtml(name)}</b>`,
+    `Doc: ${foundLetter} <code>${escapeHtml(cedula)}</code>`,
+    `Sexo: ${gender}`,
+  ];
+  if (phone) lines.push(`📞 <code>${escapeHtml(phone)}</code>`);
+  if (email) lines.push(`📧 ${escapeHtml(email)}`);
+
+  // ===== Enriquecimiento WhatsApp + cotizaciones (solo si el paciente tiene teléfono) =====
+  if (phone) {
+    const normPhone = normalizeColombianPhone(phone);
+
+    // Section 1: WA mode + last seen
+    const wmRaw = await env.STATE.get(`wa:mode:${normPhone}`);
+    const mode = (wmRaw as "auto" | "manual" | "review" | null) ?? "manual";
+    const modeIcon = mode === "auto" ? "🤖 IA" : mode === "review" ? "👁️ Review" : "✋ Manual";
+    const contactRaw = await env.STATE.get(`wa:contact:${normPhone}`);
+    let lastSeen = "";
+    if (contactRaw) {
+      try {
+        const c = JSON.parse(contactRaw);
+        if (c.lastSeenAt) lastSeen = ` · última actividad ${relativeTime(c.lastSeenAt)}`;
+      } catch {}
+    }
+    lines.push(`💬 WhatsApp: ${modeIcon}${lastSeen}`);
+
+    // Section 2: Recent WA history (max 5 turnos)
+    const historyRaw = await env.STATE.get(`wa:history:${normPhone}`);
+    if (historyRaw) {
+      try {
+        const arr: Array<{ role: string; content: string }> = JSON.parse(historyRaw);
+        if (arr.length > 0) {
+          const tail = arr.slice(-5);
+          lines.push("");
+          lines.push(`📋 <b>Últimos ${tail.length} turnos WA:</b>`);
+          for (const t of tail) {
+            const icon = t.role === "user" ? "👤" : "🤖";
+            const txt = (t.content ?? "").toString();
+            const trunc = txt.length > 120 ? txt.slice(0, 120) + "…" : txt;
+            lines.push(`${icon} <i>${escapeHtml(trunc)}</i>`);
+          }
+          if (arr.length > 5) lines.push(`<i>+ ${arr.length - 5} turnos previos</i>`);
+        }
+      } catch {}
+    }
+
+    // Section 3: Quote history
+    const quoteHistRaw = await env.STATE.get(`quote:history:${normPhone}`);
+    if (quoteHistRaw) {
+      try {
+        const arr: Array<{ ticketId: string; source: string; procedure?: string; amount?: string; status: string; at: number }> = JSON.parse(quoteHistRaw);
+        if (arr.length > 0) {
+          lines.push("");
+          lines.push(`💰 <b>Cotizaciones (${arr.length}):</b>`);
+          const recent = arr.slice(-3).reverse();
+          for (const q of recent) {
+            const date = new Date(q.at).toLocaleDateString("es-CO", { timeZone: "America/Bogota" });
+            const proc = q.procedure ? escapeHtml(q.procedure) : "";
+            const amt = q.amount ? ` — ${escapeHtml(q.amount.slice(0, 60))}` : "";
+            lines.push(`• ${date} · ${q.source} · ${proc}${amt}`);
+          }
+        }
+      } catch {}
+    }
+  }
+
+  const buttons: Array<Array<{ text: string; callback_data: string }>> = [
+    [
+      { text: "📅 Agendar", callback_data: `r_book:${cedula}` },
+      { text: "📋 Citas", callback_data: `r_citas:${cedula}` },
+    ],
+  ];
+  if (phone) {
+    const normPhone = normalizeColombianPhone(phone);
+    buttons.push([
+      { text: "📱 Escribir WA", callback_data: `waw:${normPhone}` },
+      { text: "📤 Recordar", callback_data: `wrem:${cedula}` },
+    ]);
+  }
+
+  await sendMessage(env, chatId, lines.join("\n"), {
+    reply_markup: { inline_keyboard: buttons },
+  });
 }
 
 async function onCallback(env: Env, chatId: string, callback: any): Promise<void> {
@@ -650,6 +1154,37 @@ async function onCallback(env: Env, chatId: string, callback: any): Promise<void
     const identification = data.slice("recent:".length);
     return onRecentPatientSelected(env, chatId, identification);
   }
+
+  // Callbacks de /recientes y /p:
+  //   r_book:<cedula>  → arranca flujo /buscar (agendar) con ese paciente
+  //   r_citas:<cedula> → muestra citas activas
+  //   wrem:<cedula>    → enviar recordatorio (template) al paciente
+  if (data.startsWith("r_book:")) {
+    const id = data.slice("r_book:".length);
+    await clearState(env, chatId);
+    await saveState(env, chatId, { step: "awaiting_doc_type", mode: "buscar" });
+    return onRecentPatientSelected(env, chatId, id);
+  }
+  if (data.startsWith("r_citas:")) {
+    const id = data.slice("r_citas:".length);
+    await clearState(env, chatId);
+    await saveState(env, chatId, { step: "awaiting_doc_type", mode: "citas" });
+    return onRecentPatientSelected(env, chatId, id);
+  }
+  if (data.startsWith("wrem:")) {
+    const id = data.slice("wrem:".length);
+    const rp = await findRecentPatient(env, id);
+    if (!rp || !rp.phone) {
+      await sendMessage(env, chatId, "❌ Sin teléfono en cache. Busca primero con /p o agenda una vez.");
+      return;
+    }
+    await sendMessage(
+      env,
+      chatId,
+      `📤 Para mandar el recordatorio, copia y completa:\n\n<code>/wa_recordar ${normalizeColombianPhone(rp.phone)} | ${rp.name} | Mié DD/MM/AA | HH:MM | Calle 80 # 10-43 cons 506</code>`,
+    );
+    return;
+  }
   if (data.startsWith("doctor:")) {
     const id = data.slice("doctor:".length);
     try {
@@ -659,6 +1194,56 @@ async function onCallback(env: Env, chatId: string, callback: any): Promise<void
     } catch (e) {
       await sendMessage(env, chatId, `❌ Error: ${(e as Error).message}`);
     }
+    return;
+  }
+
+  // /contactos buttons:
+  //   waw:<phone>  → activa modo escritura: el siguiente texto se envía al WA
+  //   wah:<phone>  → muestra historial guardado por la AI
+  //   wam:<phone>  → toggle modo manual ↔ auto
+  if (data.startsWith("waw:")) {
+    const phone = data.slice("waw:".length);
+    await env.STATE.put(`mainbot:waReplyTo:${chatId}`, phone, { expirationTtl: 60 * 30 });
+    await sendMessage(
+      env,
+      chatId,
+      `✏️ Modo escritura activo para <code>${phone}</code>.\nEl siguiente mensaje que escribas se envía por WhatsApp.\n\n/cancelar para salir sin enviar.`,
+    );
+    return;
+  }
+  if (data.startsWith("wah:")) {
+    const phone = data.slice("wah:".length);
+    const histRaw = await env.STATE.get(`wa:history:${phone}`);
+    if (!histRaw) {
+      await sendMessage(env, chatId, `📋 Sin historial para <code>${phone}</code>.`);
+      return;
+    }
+    let hist: any[] = [];
+    try { hist = JSON.parse(histRaw); } catch { hist = []; }
+    if (hist.length === 0) {
+      await sendMessage(env, chatId, `📋 Historial vacío para <code>${phone}</code>.`);
+      return;
+    }
+    const lines: string[] = [`📋 <b>Historial WhatsApp ${phone}</b> (${hist.length} turnos)`, ""];
+    const tail = hist.slice(-12);
+    for (const t of tail) {
+      const role = t.role === "user" ? "👤" : "🤖";
+      const txt = typeof t.content === "string" ? t.content : "[multimedia/herramienta]";
+      lines.push(`${role} ${escapeHtml(txt.slice(0, 200))}`);
+    }
+    await sendMessage(env, chatId, lines.join("\n\n"));
+    return;
+  }
+  if (data.startsWith("wam:")) {
+    const phone = data.slice("wam:".length);
+    const cur = (await getMode(env, phone)) ?? "manual";
+    const next: WaMode = cur === "auto" ? "manual" : "auto";
+    await setMode(env, phone, next);
+    await sendMessage(
+      env,
+      chatId,
+      `${next === "auto" ? "🤖 IA activada" : "✋ Modo manual"} para <code>${phone}</code>.`,
+    );
     return;
   }
 
@@ -690,6 +1275,7 @@ async function onCallback(env: Env, chatId: string, callback: any): Promise<void
     }
     const phone = data.slice("wa_auto:".length);
     await setMode(env, phone, "auto");
+    await env.STATE.delete(`wa:assignee:${phone}`); // libera assignee al volver a IA
     await sendMessage(env, chatId, `🟢 <b>Auto-modo ON</b> para <code>${phone}</code>. Claude responderá automáticamente. <code>/wa_mode ${phone} manual</code> para apagar.`);
     return;
   }
@@ -702,9 +1288,73 @@ async function onCallback(env: Env, chatId: string, callback: any): Promise<void
   if (data.startsWith("wa_takeover:")) {
     const phone = data.slice("wa_takeover:".length);
     await setMode(env, phone, "manual");
-    await sendMessage(env, chatId, `✏️ Tomaste el control de <code>${phone}</code>. Usa <code>/wa_reply ${phone} ...</code> para responder.`);
+    // ASSIGNEE: doctor toma control. Próximos mensajes del paciente se ruteen al
+    // bot de handoff (consultadavid_bot), unificando la conversación allí.
+    await env.STATE.put(`wa:assignee:${phone}`, "doctor", { expirationTtl: 60 * 60 * 24 });
+    // Activar modo escritura: el siguiente mensaje en este chat se reenvía al WA
+    await env.STATE.put(`mainbot:waReplyTo:${chatId}`, phone, { expirationTtl: 60 * 30 });
+    // Dump historial completo para tener contexto
+    await dumpHistoryToTgChat(env, chatId, phone);
+    await sendMessage(
+      env,
+      chatId,
+      `✏️ Tomaste el control de <code>${phone}</code>.\n\n` +
+        `📝 Modo escritura activo: el siguiente mensaje se reenvía al WhatsApp.\n` +
+        `Para devolver a la IA: <code>/wa_mode ${phone} auto</code>\n` +
+        `Para cancelar el modo escritura: /cancelar`,
+    );
     return;
   }
+}
+
+/**
+ * Dump del historial WA al chat de Telegram donde está el doctor.
+ * Versión adaptada del handoffBot.dumpHistoryToChat pero usando el bot principal.
+ */
+async function dumpHistoryToTgChat(env: Env, chatId: string, phone: string): Promise<void> {
+  const raw = await env.STATE.get(`wa:history:${phone}`);
+  let hist: Array<{ role: string; content: string }> = [];
+  if (raw) {
+    try { hist = JSON.parse(raw); } catch { /* ignore */ }
+  }
+  if (hist.length === 0) {
+    await sendMessage(env, chatId, `📜 Sin historial guardado para <code>${phone}</code>.`);
+    return;
+  }
+  const contactRaw = await env.STATE.get(`wa:contact:${phone}`);
+  let name = "(sin nombre)";
+  if (contactRaw) {
+    try { name = JSON.parse(contactRaw).name ?? name; } catch { /* ignore */ }
+  }
+  const lines: string[] = [
+    `📜 <b>Historial conversación con ${escapeHtml(name)}</b>`,
+    `📞 <code>${escapeHtml(phone)}</code> · ${hist.length} turnos`,
+    "━━━━━━━━━━━━━",
+    "",
+  ];
+  for (const t of hist) {
+    const role = t.role === "user" ? "👤" : "🤖";
+    const content = (t.content ?? "").toString();
+    const trunc = content.length > 400 ? content.slice(0, 400) + "…" : content;
+    lines.push(`${role} ${escapeHtml(trunc)}`);
+  }
+  const fullText = lines.join("\n\n");
+  const MAX = 3800;
+  if (fullText.length <= MAX) {
+    await sendMessage(env, chatId, fullText);
+    return;
+  }
+  let buffer = lines.slice(0, 4).join("\n");
+  for (let i = 4; i < lines.length; i++) {
+    const next = lines[i];
+    if ((buffer + "\n\n" + next).length > MAX) {
+      await sendMessage(env, chatId, buffer);
+      buffer = next;
+    } else {
+      buffer = buffer ? buffer + "\n\n" + next : next;
+    }
+  }
+  if (buffer) await sendMessage(env, chatId, buffer);
 }
 
 // ====================================================================

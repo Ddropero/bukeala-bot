@@ -12,6 +12,7 @@
 import type { Context } from "hono";
 import type { Env } from "../env";
 import { getDoctorRecipients } from "../users";
+import { processPendingRequests } from "../claudeBookingAgent";
 
 const TG = (token: string) => `https://api.telegram.org/bot${token}`;
 const KV_KEY = "nativeHost:events";
@@ -61,6 +62,33 @@ export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
     events = events.slice(-MAX_EVENTS);
   }
   await c.env.STATE.put(KV_KEY, JSON.stringify(events));
+
+  // Trackear éxito/fallo por hora de Bogotá para detectar ventana de
+  // mantenimiento nocturna de Bukeala. Si vemos consistentemente fallos
+  // a la misma hora durante varios días, esa es la ventana.
+  try {
+    const evDate = new Date(event.at);
+    // Bogotá = UTC-5
+    const bogotaHour = (evDate.getUTCHours() - 5 + 24) % 24;
+    const isOk = event.type === "ok";
+    const key = isOk ? `bukeala:hourOk:${bogotaHour}` : `bukeala:hourFail:${bogotaHour}`;
+    const prevRaw = await c.env.STATE.get(key);
+    const prev = prevRaw ? parseInt(prevRaw, 10) || 0 : 0;
+    await c.env.STATE.put(key, String(prev + 1), {
+      expirationTtl: 60 * 60 * 24 * 30, // 30 días de ventana de datos
+    });
+  } catch (e) {
+    console.log("[native-host-event] hourly tracking failed:", (e as Error).message);
+  }
+
+  // On a successful refresh, kick off pending-queue processing in the background
+  if (event.type === "ok") {
+    c.executionCtx.waitUntil(
+      processPendingRequests(c.env).catch((err) => {
+        console.log("[native-host-event] processPendingRequests failed:", err.message);
+      }),
+    );
+  }
 
   // On TGC expired, send a throttled Telegram alert
   if (event.type === "tgc_expired") {
@@ -219,5 +247,15 @@ export async function handleRefreshComplete(c: Context<{ Bindings: Env }>) {
   }
 
   await c.env.STATE.delete(KV_REFRESH_REQUEST);
+
+  // After a successful manual refresh, also process the pending queue
+  if (body.ok) {
+    c.executionCtx.waitUntil(
+      processPendingRequests(c.env).catch((err) => {
+        console.log("[refresh-complete] processPendingRequests failed:", err.message);
+      }),
+    );
+  }
+
   return c.json({ ok: true });
 }
