@@ -250,6 +250,43 @@ export async function sendAppointmentReminder(
 }
 
 /**
+ * Pide al paciente que CONFIRME su cita con botones (Quick Reply).
+ *
+ * Usa el template `confirmar_cita` (es_CO) que debe crearse en Meta Business
+ * Manager con 2 botones de respuesta rápida:
+ *    "✅ Sí, confirmo"   y   "❌ No podré"
+ * Body params: {{1}} name, {{2}} date, {{3}} time, {{4}} place
+ *
+ * FALLBACK: si el template todavía no está aprobado (o falla), cae al
+ * `appointment_reminder` normal para que el paciente igual reciba el aviso.
+ * El campo `mode` indica qué se envió: "confirm" | "reminder_fallback".
+ */
+export async function sendAppointmentConfirmRequest(
+  env: Env,
+  patientPhoneRaw: string,
+  patientName: string,
+  dateText: string,
+  timeText: string,
+  place: string,
+) {
+  const to = normalizeColombianPhone(patientPhoneRaw);
+  if (!to || to.length < 10) {
+    return { ok: false as const, reason: "invalid_phone", mode: "none" };
+  }
+  const params: Array<{ type: "text"; text: string }> = [
+    { type: "text", text: patientName },
+    { type: "text", text: dateText },
+    { type: "text", text: timeText },
+    { type: "text", text: place },
+  ];
+  const r = await sendTemplate(env, to, "confirmar_cita", "es_CO", params);
+  if (r.ok) return { ...r, mode: "confirm" };
+  // Template aún no aprobado → recordatorio normal como respaldo
+  const fb = await sendTemplate(env, to, "appointment_reminder", "es_CO", params);
+  return { ...fb, mode: "reminder_fallback" };
+}
+
+/**
  * Notify patient when their appointment was canceled.
  * Template: appointment_canceled (es_CO)
  * Body params: {{1}} name, {{2}} date, {{3}} time
