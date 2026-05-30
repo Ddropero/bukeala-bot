@@ -70,7 +70,11 @@ export function buildAgendaHtml(
       const name = escapeHtml(bk.name ?? "—");
       const idType = bk.identificationTypeShortCode ?? "C";
       const idNum = escapeHtml(bk.identification ?? "—");
-      const phone = escapeHtml(extractPhone(bk) || "—");
+      const rawPhone = extractPhone(bk);
+      // Teléfono como link tel: → tap-to-call desde el móvil de la asistente.
+      const phoneCell = rawPhone
+        ? `<a href="tel:${escapeHtml(rawPhone.replace(/[^\d+]/g, ""))}">${escapeHtml(rawPhone)}</a>`
+        : "—";
       const plan = escapeHtml(bk.planName ?? "—");
       const state = escapeHtml(bk.stateDesc ?? bk.stateCode ?? "—");
       return `
@@ -79,9 +83,10 @@ export function buildAgendaHtml(
         <td class="time">${time}</td>
         <td class="name">${name}</td>
         <td class="id">${idType} ${idNum}</td>
-        <td class="phone">${phone}</td>
+        <td class="phone">${phoneCell}</td>
         <td class="plan">${plan}</td>
         <td class="state">${state}</td>
+        <td class="check">☐</td>
       </tr>`;
     })
     .join("");
@@ -99,6 +104,7 @@ export function buildAgendaHtml(
           <th>Teléfono</th>
           <th>Plan</th>
           <th>Estado</th>
+          <th>✓ Confirmó</th>
         </tr>
       </thead>
       <tbody>${rows}
@@ -123,13 +129,18 @@ export function buildAgendaHtml(
   td.time { font-variant-numeric: tabular-nums; white-space: nowrap; font-weight: 600; }
   td.name { font-weight: 500; }
   td.phone { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.phone a { color: #1565c0; text-decoration: none; font-weight: 600; }
+  td.check { text-align: center; font-size: 18px; color: #bbb; }
   .empty { padding: 24px; text-align: center; color: #888; border: 1px dashed #ddd; border-radius: 8px; }
+  .banner { background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px; padding: 12px 14px; margin: 0 0 16px; font-size: 13px; color: #5d4037; }
+  .banner b { color: #e65100; }
   .foot { color: #999; font-size: 11px; margin-top: 24px; }
 </style>
 </head>
 <body>
   <h1>Agenda · ${escapeHtml(friendlyDate)}</h1>
-  <p class="sub">${active.length} ${active.length === 1 ? "cita" : "citas"} confirmadas</p>
+  <p class="sub">${active.length} ${active.length === 1 ? "cita" : "citas"} para mañana</p>
+  ${active.length > 0 ? `<div class="banner">📞 <b>Por favor confirmar cada paciente llamando.</b> Toca el teléfono para llamar directo. Marca ✓ a quien confirme. Si alguien cancela o no contesta, avísale al Dr.</div>` : ""}
   ${bodyContent}
   <p class="foot">Generado automáticamente por el bot — Dr. Duque.</p>
 </body>

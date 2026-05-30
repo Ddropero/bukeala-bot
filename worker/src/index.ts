@@ -18,7 +18,7 @@ import { autoReturnToAI } from "./cron/autoReturnToAI";
 import { weeklyReport } from "./cron/weeklyReport";
 import { quoteFollowup } from "./cron/quoteFollowup";
 import { secretaryAgendaCron } from "./cron/secretaryAgenda";
-import { weeklyWedReminderCron } from "./cron/weeklyWedReminder";
+import { eveningReminderCron } from "./cron/eveningReminder";
 import { getDoctorRecipients } from "./users";
 import { processPendingRequests, loadPendingRequests } from "./claudeBookingAgent";
 import { requestRefresh } from "./handlers/nativeHostEvent";
@@ -149,7 +149,7 @@ const handleRelay = async (c: any) => {
   // Si viene body JSON, override query params
   if (c.req.method === "POST") {
     try {
-      const body = await c.req.json<any>();
+      const body = (await c.req.json()) as any;
       if (body.to) to = String(body.to);
       if (body.text) text = String(body.text);
       if (body.mediaUrl) mediaUrl = String(body.mediaUrl);
@@ -464,10 +464,10 @@ export default {
       // 1 PM Colombia: send tomorrow's agenda (HTML doc) to the secretary
       // via Telegram + WhatsApp.
       ctx.waitUntil(secretaryAgendaCron(env));
-    } else if (event.cron === "0 23 * * 2") {
-      // Tuesday 6 PM Colombia: WhatsApp reminder to every patient with a
-      // booking on the upcoming Wednesday.
-      ctx.waitUntil(weeklyWedReminderCron(env));
+    } else if (event.cron === "0 23 * * *") {
+      // 6 PM Colombia (todos los días): SEGUNDO recordatorio del día a cada
+      // paciente con cita mañana (el primero salió a las 8am vía reminderCron).
+      ctx.waitUntil(eveningReminderCron(env));
     } else if (event.cron === "*/10 12-23 * * *") {
       ctx.waitUntil(newBookingsCheck(env));
     } else if (event.cron === "*/15 * * * *") {

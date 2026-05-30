@@ -128,7 +128,10 @@ export async function secretaryAgendaCron(env: Env): Promise<void> {
   const html = buildAgendaHtml(bookings, friendly);
   const bytes = new TextEncoder().encode(html);
   const filename = `Agenda_${dashed}.html`;
-  const caption = `📅 Agenda · ${friendly}\n${active.length} ${active.length === 1 ? "cita" : "citas"}`;
+  const caption =
+    `📅 Agenda de mañana · ${friendly}\n` +
+    `${active.length} ${active.length === 1 ? "cita" : "citas"}\n\n` +
+    `📞 Por favor confirmar cada paciente llamando. Abre el archivo y toca el teléfono para llamar directo.`;
 
   // 3. Telegram — send to every secretary
   const users = await listUsers(env);

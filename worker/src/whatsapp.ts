@@ -12,6 +12,19 @@
  */
 import type { Env } from "./env";
 
+/**
+ * Result of a WhatsApp send helper. On a successful (or failed) API call it
+ * carries `status` + `data` from Meta; on a pre-flight bail-out (e.g. invalid
+ * phone) it carries `reason` instead. All optional so callers can read either
+ * `data` or `reason` without narrowing.
+ */
+export type WaSendResult = {
+  ok: boolean;
+  status?: number;
+  data?: any;
+  reason?: string;
+};
+
 const API_VERSION = "v21.0";
 
 function apiUrl(env: Env): string {
@@ -196,7 +209,7 @@ export async function sendAppointmentConfirmation(
   dateText: string,    // "Miércoles 06/05/26"
   timeText: string,    // "12:40 PM"
   place: string,       // "calle 80 # 10 43 cons 506"
-) {
+): Promise<WaSendResult> {
   const to = normalizeColombianPhone(patientPhoneRaw);
   if (!to || to.length < 10) {
     console.log("[whatsapp] confirmation skipped: invalid phone", patientPhoneRaw);
@@ -222,7 +235,7 @@ export async function sendAppointmentReminder(
   dateText: string,
   timeText: string,
   place: string,
-) {
+): Promise<WaSendResult> {
   const to = normalizeColombianPhone(patientPhoneRaw);
   if (!to || to.length < 10) {
     console.log("[whatsapp] reminder skipped: invalid phone", patientPhoneRaw);
@@ -247,7 +260,7 @@ export async function sendAppointmentCanceled(
   patientName: string,
   dateText: string,
   timeText: string,
-) {
+): Promise<WaSendResult> {
   const to = normalizeColombianPhone(patientPhoneRaw);
   if (!to || to.length < 10) {
     console.log("[whatsapp] canceled-notice skipped: invalid phone", patientPhoneRaw);
@@ -269,7 +282,7 @@ export async function sendAppointmentFollowup(
   env: Env,
   patientPhoneRaw: string,
   patientName: string,
-) {
+): Promise<WaSendResult> {
   const to = normalizeColombianPhone(patientPhoneRaw);
   if (!to || to.length < 10) {
     return { ok: false, reason: "invalid_phone" };
@@ -343,7 +356,7 @@ export async function sendPostSurgeryCheckin(
   patientPhoneRaw: string,
   patientName: string,
   daysSinceSurgery: number,
-) {
+): Promise<WaSendResult> {
   const to = normalizeColombianPhone(patientPhoneRaw);
   if (!to || to.length < 10) {
     return { ok: false, reason: "invalid_phone" };

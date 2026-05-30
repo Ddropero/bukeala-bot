@@ -23,9 +23,9 @@ mode = "smart"
 #   "*/15 * * * *"       → autoReturnToAI (cada 15 min, 24/7)
 #   "0 12 * * 1"         → weeklyReport (Lunes 7am Bogotá)
 #   "0 14 * * *"         → quoteFollowup (9am Bogotá)
-#   "0 18 * * *"         → secretaryAgendaCron (1pm Bogotá, agenda HTML al WA+TG de la secretaria)
-#   "0 23 * * 2"         → weeklyWedReminderCron (martes 6pm Bogotá, WA al paciente con cita el miércoles)
-crons = ["*/3 * * * *", "0 12 * * *", "*/10 12-23 * * *", "0 13 * * *", "*/15 * * * *", "0 12 * * 1", "0 14 * * *", "0 18 * * *", "0 23 * * 2"]
+#   "0 18 * * *"         → secretaryAgendaCron (1pm Bogotá, agenda HTML al WA+TG de la secretaria — confirmar llamando)
+#   "0 23 * * *"         → eveningReminderCron (6pm Bogotá, 2º recordatorio del día al paciente con cita mañana)
+crons = ["*/3 * * * *", "0 12 * * *", "*/10 12-23 * * *", "0 13 * * *", "*/15 * * * *", "0 12 * * 1", "0 14 * * *", "0 18 * * *", "0 23 * * *"]
 
 # Observabilidad: habilita logs persistentes y sampling 100% (el dashboard
 # muestra warning sin esto, aunque la funcionalidad esté disponible igual).

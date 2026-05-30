@@ -1,55 +1,32 @@
 # Dependencies
 node_modules/
-.npm
-.pnpm-store/
 
-# Build artifacts
+# Build output
 dist/
 build/
 out/
-.next/
-*.tsbuildinfo
-
-# Cloudflare Wrangler
 .wrangler/
 .dev.vars
-.dev.vars.*
 
-# Local env files
+# Secrets — NUNCA commitear
 .env
 .env.local
 .env.*.local
-
-# Sensitive
 *.key
 *.pem
-*.p12
-*.pfx
-secrets.json
-credentials.*
+popcuc-key*.json
+*-service-account*.json
+service-account*.json
 
-# Native Host runtime data (machine-specific)
-# Note: %APPDATA%\BukealaBot\ is outside repo, but defensively block any
-# accidental local copy.
-state.json
-config.json
-creds.dat
-chromium-profile/
-last-error.png
-last-run.log
-watcher.log
-
-# IDE / OS
+# Editor / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Logs
+# Logs / temp
 *.log
-
-# Temporary
 *.tmp
 *.bak
 .cache/
