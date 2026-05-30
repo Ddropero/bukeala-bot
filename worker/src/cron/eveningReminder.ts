@@ -21,7 +21,7 @@
 import type { Env } from "../env";
 import { Bukeala, SessionExpiredError } from "../bukeala";
 import { loadSession } from "../kv";
-import { sendAppointmentReminder, normalizeColombianPhone } from "../whatsapp";
+import { sendAppointmentConfirmRequest, normalizeColombianPhone } from "../whatsapp";
 import { getAllRecipients } from "../users";
 import type { AgendaBookingDoc } from "../agendaDoc";
 
@@ -111,14 +111,23 @@ export async function eveningReminderCron(env: Env): Promise<void> {
     const already = await env.STATE.get(sentKey);
     if (already) { skippedCount++; continue; }
 
+    // Si YA confirmó en la mañana (tocó el botón ✅), no lo molestamos de tarde
+    const alreadyConfirmed = await env.STATE.get(`wa:citaConfirm:${reservationCode}`);
+    if (alreadyConfirmed === "si") { skippedCount++; continue; }
+
     // Respeta consent: si pidió humano, no auto-recordatorio
     const consent = await env.STATE.get(`wa:consent:${phone}`);
     if (consent === "human") { skippedCount++; continue; }
 
-    const r = await sendAppointmentReminder(env, phone, name, friendly, time12h, PLACE);
+    const r = await sendAppointmentConfirmRequest(env, phone, name, friendly, time12h, PLACE);
     if (r.ok) {
       sentCount++;
       await env.STATE.put(sentKey, "1", { expirationTtl: 60 * 60 * 24 * 2 });
+      await env.STATE.put(
+        `wa:pendingConfirm:${phone}`,
+        JSON.stringify({ reservationCode, name, dateFriendly: friendly, time: time12h }),
+        { expirationTtl: 60 * 60 * 24 * 2 },
+      );
     } else {
       const err = (r as any).data?.error?.message ?? (r as any).reason ?? "unknown";
       errors.push(`${name} (${phone}): ${err}`);

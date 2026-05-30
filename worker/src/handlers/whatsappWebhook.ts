@@ -169,6 +169,7 @@ async function handleInboundMessage(
           "👤 Perfecto. Un asistente humano te responderá en breve. Por favor escribe tu consulta.",
         );
       } catch { /* ignore */ }
+      // (continúa abajo)
       // Notify Telegram so doctor/secretary knows there's an active human-mode contact
       const escapedName = escapeHtml(senderName);
       await sendTelegram(
@@ -177,6 +178,19 @@ async function handleInboundMessage(
         modeKeyboardManual(from),
       );
       console.log(`[wa-webhook] consent=human from=${from}`);
+      return;
+    }
+  }
+
+  // ---- Confirmación de cita: botón Quick Reply del template `confirmar_cita` ----
+  // Los botones de respuesta rápida de un TEMPLATE llegan como type="button"
+  // con button.text / button.payload (NO como interactive.button_reply).
+  if (msg.type === "button" && msg.button) {
+    const btn = `${msg.button.payload ?? ""} ${msg.button.text ?? ""}`.toLowerCase();
+    const saysNo = /no\s*pod|no\s*asist|no\s*puedo|cancel/.test(btn);
+    const saysYes = !saysNo && /confirm|s[ií]\b|asist|s[ií],|de acuerdo|ok/.test(btn);
+    if (saysYes || saysNo) {
+      await handleConfirmReply(env, from, senderName, saysYes);
       return;
     }
   }
@@ -506,6 +520,58 @@ function modeKeyboardManual(from: string) {
       { text: "🟢 Activar auto", callback_data: `wa_auto:${from}` },
     ],
   ];
+}
+
+/**
+ * Procesa la respuesta del paciente al botón de confirmación de cita.
+ * `confirmed=true` → tocó "✅ Sí, confirmo"; false → "❌ No podré".
+ *
+ * Guarda el estado por reservationCode (para que la agenda de la asistente
+ * muestre ✅/❌) y notifica al equipo por Telegram. No pasa el mensaje a la IA.
+ */
+async function handleConfirmReply(
+  env: Env,
+  from: string,
+  senderName: string,
+  confirmed: boolean,
+): Promise<void> {
+  let info: { reservationCode?: string; name?: string; dateFriendly?: string; time?: string } | null = null;
+  try {
+    const raw = await env.STATE.get(`wa:pendingConfirm:${from}`);
+    info = raw ? JSON.parse(raw) : null;
+  } catch { /* ignore */ }
+
+  const value = confirmed ? "si" : "no";
+  if (info?.reservationCode) {
+    await env.STATE.put(`wa:citaConfirm:${info.reservationCode}`, value, {
+      expirationTtl: 60 * 60 * 24 * 3,
+    });
+  }
+  // Flag por teléfono (respaldo si no hubo reservationCode)
+  await env.STATE.put(`wa:confirmFlag:${from}`, value, { expirationTtl: 60 * 60 * 24 * 2 });
+
+  // Acuse al paciente
+  try {
+    await sendText(
+      env,
+      from,
+      confirmed
+        ? "¡Gracias! Su cita queda confirmada. Lo/la esperamos. 🙏"
+        : "Entendido, gracias por avisar. El equipo lo/la contactará para reagendar.",
+    );
+  } catch { /* ignore */ }
+
+  // Aviso al equipo (doctor + asistente) por Telegram
+  const detalle = info
+    ? `${escapeHtml(info.name ?? senderName)} · ${escapeHtml(info.dateFriendly ?? "")} ${escapeHtml(info.time ?? "")}`
+    : escapeHtml(senderName);
+  const header = confirmed ? "✅ <b>Paciente CONFIRMÓ</b>" : "❌ <b>Paciente NO podrá asistir</b>";
+  await sendTelegram(
+    env,
+    `${header}\n${detalle}\n<code>${from}</code>` +
+      (confirmed ? "" : "\n\n<i>Reagendar / liberar el cupo.</i>"),
+  );
+  console.log(`[wa-webhook] cita ${value} from=${from} code=${info?.reservationCode ?? "?"}`);
 }
 
 async function sendTelegram(

@@ -13,7 +13,7 @@
 import type { Env } from "../env";
 import { Bukeala, SessionExpiredError } from "../bukeala";
 import { loadSession } from "../kv";
-import { sendAppointmentReminder, normalizeColombianPhone } from "../whatsapp";
+import { sendAppointmentConfirmRequest, normalizeColombianPhone } from "../whatsapp";
 import { getAllRecipients } from "../users";
 import type { AgendaBookingDoc } from "../agendaDoc";
 
@@ -106,12 +106,18 @@ export async function reminderCron(env: Env): Promise<void> {
     const consent = await env.STATE.get(`wa:consent:${phone}`);
     if (consent === "human") { skippedCount++; continue; }
 
-    const r = await sendAppointmentReminder(
+    const r = await sendAppointmentConfirmRequest(
       env, phone, name, friendly, time12h, "Calle 80 # 10-43, Cons 506",
     );
     if (r.ok) {
       sentCount++;
       await env.STATE.put(sentKey, "1", { expirationTtl: 60 * 60 * 24 * 3 });
+      // Guarda el mapeo tel→cita para resolver el botón de confirmación
+      await env.STATE.put(
+        `wa:pendingConfirm:${phone}`,
+        JSON.stringify({ reservationCode, name, dateFriendly: friendly, time: time12h }),
+        { expirationTtl: 60 * 60 * 24 * 2 },
+      );
     } else {
       const err = (r as any).data?.error?.message ?? (r as any).reason ?? "unknown";
       errors.push(`${name} (${phone}): ${err}`);

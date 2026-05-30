@@ -124,14 +124,29 @@ export async function secretaryAgendaCron(env: Env): Promise<void> {
   const active = bookings.filter((bk) => !bk.isCanceled && bk.stateCode !== "CANCELED" && !bk.isBusyTime);
   console.log(`[secretaryAgenda] ${active.length} active bookings for ${friendly}`);
 
+  // 1b. Cargar el estado de confirmación por WhatsApp de cada cita
+  //     (el paciente toca ✅/❌ en el botón del recordatorio → wa:citaConfirm:{id})
+  const confirmMap: Record<string, "si" | "no"> = {};
+  let confirmedCount = 0;
+  for (const bk of active) {
+    const id = String(bk.id ?? "");
+    if (!id) continue;
+    const v = await env.STATE.get(`wa:citaConfirm:${id}`);
+    if (v === "si" || v === "no") {
+      confirmMap[id] = v;
+      if (v === "si") confirmedCount++;
+    }
+  }
+
   // 2. Build the HTML document
-  const html = buildAgendaHtml(bookings, friendly);
+  const html = buildAgendaHtml(bookings, friendly, confirmMap);
   const bytes = new TextEncoder().encode(html);
   const filename = `Agenda_${dashed}.html`;
+  const pending = active.length - confirmedCount;
   const caption =
     `📅 Agenda de mañana · ${friendly}\n` +
-    `${active.length} ${active.length === 1 ? "cita" : "citas"}\n\n` +
-    `📞 Por favor confirmar cada paciente llamando. Abre el archivo y toca el teléfono para llamar directo.`;
+    `${active.length} ${active.length === 1 ? "cita" : "citas"} · ✅ ${confirmedCount} ya confirmaron por WhatsApp\n\n` +
+    `📞 Falta llamar a ${pending}. Abre el archivo: los "☐ llamar" son los que hay que confirmar (toca el teléfono para llamar directo).`;
 
   // 3. Telegram — send to every secretary
   const users = await listUsers(env);

@@ -59,6 +59,7 @@ function timeKey(formatted: string): number {
 export function buildAgendaHtml(
   bookings: AgendaBookingDoc[],
   friendlyDate: string,
+  confirmMap: Record<string, "si" | "no"> = {},
 ): string {
   const active = bookings
     .filter((bk) => !bk.isCanceled && bk.stateCode !== "CANCELED" && !bk.isBusyTime)
@@ -77,8 +78,15 @@ export function buildAgendaHtml(
         : "—";
       const plan = escapeHtml(bk.planName ?? "—");
       const state = escapeHtml(bk.stateDesc ?? bk.stateCode ?? "—");
+      // Estado de confirmación por WhatsApp (botón del paciente)
+      const cf = confirmMap[String(bk.id ?? "")];
+      const confirmCell =
+        cf === "si" ? `<span class="ok">✅ Sí (WA)</span>`
+        : cf === "no" ? `<span class="bad">❌ No (WA)</span>`
+        : `<span class="pend">☐ llamar</span>`;
+      const rowClass = cf === "si" ? ' class="r-ok"' : cf === "no" ? ' class="r-bad"' : "";
       return `
-      <tr>
+      <tr${rowClass}>
         <td class="num">${i + 1}</td>
         <td class="time">${time}</td>
         <td class="name">${name}</td>
@@ -86,7 +94,7 @@ export function buildAgendaHtml(
         <td class="phone">${phoneCell}</td>
         <td class="plan">${plan}</td>
         <td class="state">${state}</td>
-        <td class="check">☐</td>
+        <td class="check">${confirmCell}</td>
       </tr>`;
     })
     .join("");
@@ -130,7 +138,12 @@ export function buildAgendaHtml(
   td.name { font-weight: 500; }
   td.phone { font-variant-numeric: tabular-nums; white-space: nowrap; }
   td.phone a { color: #1565c0; text-decoration: none; font-weight: 600; }
-  td.check { text-align: center; font-size: 18px; color: #bbb; }
+  td.check { text-align: center; white-space: nowrap; font-size: 12px; }
+  td.check .ok { color: #2e7d32; font-weight: 600; }
+  td.check .bad { color: #c62828; font-weight: 600; }
+  td.check .pend { color: #999; }
+  tr.r-ok td { background: #f1f8e9 !important; }
+  tr.r-bad td { background: #ffebee !important; }
   .empty { padding: 24px; text-align: center; color: #888; border: 1px dashed #ddd; border-radius: 8px; }
   .banner { background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px; padding: 12px 14px; margin: 0 0 16px; font-size: 13px; color: #5d4037; }
   .banner b { color: #e65100; }
@@ -140,7 +153,7 @@ export function buildAgendaHtml(
 <body>
   <h1>Agenda · ${escapeHtml(friendlyDate)}</h1>
   <p class="sub">${active.length} ${active.length === 1 ? "cita" : "citas"} para mañana</p>
-  ${active.length > 0 ? `<div class="banner">📞 <b>Por favor confirmar cada paciente llamando.</b> Toca el teléfono para llamar directo. Marca ✓ a quien confirme. Si alguien cancela o no contesta, avísale al Dr.</div>` : ""}
+  ${active.length > 0 ? `<div class="banner">📞 <b>Llamar a los que dicen "☐ llamar".</b> Los marcados <b>✅ Sí (WA)</b> ya confirmaron por WhatsApp — no hace falta llamarlos. Los <b>❌ No (WA)</b> avisaron que no pueden: reagendar. Toca el teléfono para llamar directo.</div>` : ""}
   ${bodyContent}
   <p class="foot">Generado automáticamente por el bot — Dr. Duque.</p>
 </body>
