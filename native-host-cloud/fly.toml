@@ -1,0 +1,27 @@
+# Fly.io config — Bukeala session keeper (worker de fondo, sin HTTP).
+#
+# Región: bog (Bogotá) — lo más cerca del usuario y de Bukeala.
+# Si bog no tiene capacidad, mia (Miami) es el siguiente mejor (us-east,
+# donde está el backend de Bukeala en AWS).
+#
+# 1 sola máquina, siempre prendida (no auto-stop): debe renovar 24/7.
+app = "bukeala-session-keeper"
+primary_region = "bog"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  POLL_INTERVAL_MS = "30000"
+  PROACTIVE_INTERVAL_MS = "600000"
+  WORKER_URL = "https://bukeala-bot.ddropero.workers.dev/capture"
+
+# Worker de fondo: no expone servicios HTTP, así que NO queremos que Fly
+# lo apague por falta de tráfico. Una sola máquina, siempre encendida.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"   # Chromium headless necesita >512mb para no morir por OOM
+  cpus = 1
+
+# Sin [[services]] / [http_service]: este proceso no escucha puertos.
+# Fly mantiene la máquina viva por el proceso, no por health checks HTTP.

@@ -1,0 +1,16 @@
+{
+  "name": "bukeala-native-host-cloud",
+  "version": "1.0.0",
+  "description": "Bukeala session keeper 24/7 en Fly.io (sin PC/Mac prendido)",
+  "private": true,
+  "scripts": {
+    "start": "node watcher.js"
+  },
+  "dependencies": {
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
