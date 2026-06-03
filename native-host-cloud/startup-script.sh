@@ -37,6 +37,7 @@ cat > $APP/package.json <<'PKGEOF'
     "start": "node watcher.js"
   },
   "dependencies": {
+    "playwright": "^1.59.1",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
@@ -464,7 +465,11 @@ cd "$APP"
 echo "npm install..."
 npm install --omit=dev --no-audit --no-fund
 
-# Chromium + dependencias del SO via playwright
+# Chromium + dependencias del SO via playwright.
+# CRÍTICO: PLAYWRIGHT_BROWSERS_PATH debe coincidir con el del systemd unit
+# (/root/.cache/ms-playwright) y correr DESPUÉS de npm install para que use
+# la versión de playwright fijada en package.json (no una efímera de npx).
+export PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
 echo "Instalando Chromium + deps del SO..."
 npx playwright install --with-deps chromium
 
