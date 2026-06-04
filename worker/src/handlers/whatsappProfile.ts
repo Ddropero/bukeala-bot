@@ -93,20 +93,35 @@ export async function handleUpdateProfilePicture(c: Context<{ Bindings: Env }>) 
   }
 
   try {
-    // ── 1) Bajar la imagen de la URL ────────────────────────────────────
-    console.log(`[wa-profile] GET ${imageUrl}`);
-    const imgRes = await fetch(imageUrl);
-    if (!imgRes.ok) {
-      return c.json({ error: `failed to fetch image (${imgRes.status})` }, 400);
+    // ── 1) Obtener la imagen ────────────────────────────────────────────
+    // Caso especial: si la URL apunta a /wa/asset/<name> de ESTE worker, la
+    // leemos directo de KV. Un Worker no puede hacer fetch a sí mismo
+    // (subrequest loop → 404), así que evitamos el round-trip.
+    let imgBuffer: ArrayBuffer;
+    let contentType: string;
+    const assetMatch = imageUrl.match(/\/wa\/asset\/([a-z0-9_-]+)/i);
+    if (assetMatch) {
+      const raw = await c.env.STATE.get(`asset:${assetMatch[1]}`);
+      if (!raw) return c.json({ error: `asset '${assetMatch[1]}' not found in KV` }, 404);
+      const obj = JSON.parse(raw);
+      contentType = obj.ct || "image/png";
+      imgBuffer = Uint8Array.from(atob(obj.b64), (ch) => ch.charCodeAt(0)).buffer;
+      console.log(`[wa-profile] asset from KV: ${assetMatch[1]} (${imgBuffer.byteLength}B)`);
+    } else {
+      console.log(`[wa-profile] GET ${imageUrl}`);
+      const imgRes = await fetch(imageUrl);
+      if (!imgRes.ok) {
+        return c.json({ error: `failed to fetch image (${imgRes.status})` }, 400);
+      }
+      contentType = imgRes.headers.get("content-type") || "image/jpeg";
+      imgBuffer = await imgRes.arrayBuffer();
     }
-    let contentType = imgRes.headers.get("content-type") || "image/jpeg";
-    // Si el servidor no manda un content-type aceptable, asumir jpeg
+    // Si el content-type no es aceptable, asumir jpeg
     if (!/image\/(jpeg|jpg|png)/i.test(contentType)) {
       contentType = "image/jpeg";
     }
-    const imgBuffer = await imgRes.arrayBuffer();
     const fileLength = imgBuffer.byteLength;
-    console.log(`[wa-profile] downloaded ${fileLength}B as ${contentType}`);
+    console.log(`[wa-profile] image ready ${fileLength}B as ${contentType}`);
 
     if (fileLength === 0) {
       return c.json({ error: "downloaded image is empty" }, 400);

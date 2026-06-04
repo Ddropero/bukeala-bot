@@ -81,6 +81,41 @@ app.get("/wa/profile", handleGetProfile);
 app.post("/wa/profile-picture", handleUpdateProfilePicture);
 app.get("/wa/phone-info", handlePhoneInfo);
 
+// Asset hosting mínimo: guardar/servir una imagen (ej. avatar) desde KV.
+// Permite subir la foto de perfil sin depender de un host externo.
+//   POST /wa/asset?token=<CAPTURE_TOKEN>&name=avatar  body: PNG/JPEG binario
+//   GET  /wa/asset/avatar                              → sirve la imagen (público)
+app.post("/wa/asset", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const name = (c.req.query("name") || "avatar").replace(/[^a-z0-9_-]/gi, "");
+  const ct = c.req.header("content-type") || "image/png";
+  const buf = await c.req.arrayBuffer();
+  if (!buf || buf.byteLength === 0) return c.json({ error: "empty body" }, 400);
+  if (buf.byteLength > 5 * 1024 * 1024) return c.json({ error: "too large (>5MB)" }, 400);
+  // base64 por chunks (spread completo sobre 100KB+ revienta el call stack)
+  const u8 = new Uint8Array(buf);
+  let bin = "";
+  const CHUNK = 8192;
+  for (let i = 0; i < u8.length; i += CHUNK) {
+    bin += String.fromCharCode(...u8.subarray(i, i + CHUNK));
+  }
+  const b64 = btoa(bin);
+  await c.env.STATE.put(`asset:${name}`, JSON.stringify({ ct, b64 }), {
+    expirationTtl: 60 * 60 * 24 * 7, // 7 días: suficiente para que Meta lo descargue
+  });
+  return c.json({ ok: true, name, bytes: buf.byteLength, url: `/wa/asset/${name}` });
+});
+app.get("/wa/asset/:name", async (c) => {
+  const name = c.req.param("name").replace(/[^a-z0-9_-]/gi, "");
+  const raw = await c.env.STATE.get(`asset:${name}`);
+  if (!raw) return c.text("not found", 404);
+  const { ct, b64 } = JSON.parse(raw);
+  const bytes = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
+  return new Response(bytes, { headers: { "content-type": ct, "cache-control": "public, max-age=3600" } });
+});
+
 // Instagram Messaging webhook (Meta Graph API → Worker)
 //   GET  → verificación handshake (hub.verify_token debe coincidir con IG_VERIFY_TOKEN)
 //   POST → DMs entrantes + delivery statuses
