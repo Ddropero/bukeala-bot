@@ -13,7 +13,7 @@ primary_region = "bog"
 
 [env]
   POLL_INTERVAL_MS = "30000"
-  PROACTIVE_INTERVAL_MS = "600000"
+  PROACTIVE_INTERVAL_MS = "780000"
   WORKER_URL = "https://bukeala-bot.ddropero.workers.dev/capture"
 
 # Worker de fondo: no expone servicios HTTP, así que NO queremos que Fly

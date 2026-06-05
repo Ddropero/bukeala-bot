@@ -138,8 +138,13 @@ async function main() {
         await reportComplete(c, ok, ok ? "cloud login OK" : "cloud login failed");
       }
 
-      // 2. ¿Toca keep-alive proactivo?
-      if (Date.now() - lastProactive >= PROACTIVE_INTERVAL_MS) {
+      // 2. ¿Toca keep-alive proactivo? Solo en horario laboral Bogotá
+      //    (6am-9pm) para ahorrar saldo de 2Captcha. Fuera de ese rango,
+      //    la sesión se deja expirar; si llega un WhatsApp de noche, el
+      //    refresh on-demand (paso 1) la revive al instante.
+      const bogotaHour = (new Date().getUTCHours() - 5 + 24) % 24;
+      const inBusinessHours = bogotaHour >= 6 && bogotaHour < 21;
+      if (inBusinessHours && Date.now() - lastProactive >= PROACTIVE_INTERVAL_MS) {
         await doLogin(c, "proactive");
         lastProactive = Date.now();
       }
