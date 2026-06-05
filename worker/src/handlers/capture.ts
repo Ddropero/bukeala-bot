@@ -21,7 +21,7 @@ export async function handleCapture(c: Context<{ Bindings: Env }>) {
   }
 
   // Sanity: keep only relevant cookies and trim absurd values.
-  const cleaned = body.cookies
+  const relevant = body.cookies
     .filter((c) => typeof c.name === "string" && typeof c.value === "string")
     .filter((c) =>
       c.domain.includes("tuscitasmedicas.com") ||
@@ -36,9 +36,28 @@ export async function handleCapture(c: Context<{ Bindings: Env }>) {
       httpOnly: c.httpOnly,
     }));
 
+  // DEDUP por nombre: Bukeala/Reblaze emiten la MISMA cookie (XB-TRANSACTION,
+  // rdwr_s_*, etc.) con distintos path/domain, y guardar todas las copias
+  // infla la sesión y rompe el routing. Para JSESSIONID preferimos el ligado
+  // a /keraltyadscritos. Para el resto, la última gana (la más reciente).
+  const byName = new Map<string, typeof relevant[number]>();
+  for (const ck of relevant) {
+    const ex = byName.get(ck.name);
+    if (!ex) { byName.set(ck.name, ck); continue; }
+    if (ck.name === "JSESSIONID") {
+      const ckK = (ck.path || "").includes("keraltyadscritos");
+      const exK = (ex.path || "").includes("keraltyadscritos");
+      if (ckK && !exK) byName.set(ck.name, ck);
+    } else {
+      byName.set(ck.name, ck); // última gana
+    }
+  }
+  const cleaned = [...byName.values()];
+
   if (cleaned.length === 0) {
     return c.json({ error: "no relevant cookies" }, 400);
   }
+  console.log(`[capture] ${relevant.length} cookies → ${cleaned.length} tras dedup`);
 
   await saveSession(c.env, {
     cookies: cleaned,

@@ -103,6 +103,14 @@ export async function updateCookiesFromResponse(env: Env, res: Response): Promis
   // captured the cookies that point to the right backend; we keep those.
   const STICKY_BLOCKLIST = new Set(["AWSALB", "AWSALBCORS", "AWSALBTG", "AWSALBTGCORS"]);
 
+  // CRÍTICO: NO agregar como cookie NUEVA estos nombres si llegan por
+  // Set-Cookie en una respuesta. El JSESSIONID correcto lo fija el login
+  // fresco (vía /capture). Si Bukeala/Reblaze emite un JSESSIONID nuevo en
+  // una ruta cualquiera y lo AGREGAMOS, terminamos con 2+ JSESSIONID y el
+  // cookieHeader manda el equivocado → 302 intermitente. Solo ACTUALIZAMOS
+  // el valor de uno que ya exista; nunca duplicamos.
+  const UPDATE_ONLY = new Set(["JSESSIONID"]);
+
   let changed = false;
   for (const raw of setCookies) {
     // raw e.g. "JSESSIONID=abc; Path=/; HttpOnly; Secure"
@@ -120,6 +128,18 @@ export async function updateCookiesFromResponse(env: Env, res: Response): Promis
       /Max-Age=0/i.test(raw) ||
       /Expires=Thu, 01 Jan 1970/i.test(raw);
     if (isDeletion) continue;
+
+    // Para JSESSIONID: actualizar TODAS las instancias existentes al mismo
+    // valor (mantiene una sola sesión Java coherente), pero nunca crear una
+    // nueva entrada si no existía.
+    if (UPDATE_ONLY.has(name)) {
+      let touched = false;
+      for (const c of session.cookies) {
+        if (c.name === name && c.value !== value) { c.value = value; touched = true; }
+      }
+      if (touched) changed = true;
+      continue;
+    }
 
     const existing = session.cookies.find((c) => c.name === name);
     if (existing) {
@@ -140,8 +160,23 @@ export async function updateCookiesFromResponse(env: Env, res: Response): Promis
     }
   }
 
+  // Cap de seguridad: si por la razón que sea acumulamos demasiadas cookies
+  // (Reblaze rota __uzm* sin parar), nos quedamos con las relevantes y las
+  // últimas. Evita el inflado a 140 que rompía el routing.
+  if (session.cookies.length > 60) {
+    const essential = session.cookies.filter((c) =>
+      /^(JSESSIONID|XB-TRANSACTION|SERVERID|TS[0-9a-f]+)/i.test(c.name));
+    const rest = session.cookies.filter((c) =>
+      !/^(JSESSIONID|XB-TRANSACTION|SERVERID|TS[0-9a-f]+)/i.test(c.name));
+    session.cookies = [...essential, ...rest.slice(-40)];
+    changed = true;
+  }
+
   if (changed) {
-    session.capturedAt = new Date().toISOString();
+    // NO tocar capturedAt aquí: marca cuándo se hizo el LOGIN fresco (lo fija
+    // /capture). Si lo reseteáramos en cada rotación de cookie, la "edad" de
+    // la sesión nunca crecería y el refresh preventivo (age>12min) jamás
+    // dispararía. Solo persistimos los valores de cookie actualizados.
     await saveSession(env, session);
   }
 }
@@ -183,6 +218,14 @@ export async function cookieHeader(
     const existing = byName.get(c.name);
     if (!existing) {
       byName.set(c.name, c);
+      continue;
+    }
+    // Para JSESSIONID: preferir el ligado a /keraltyadscritos (el servlet que
+    // usan las consultas). Un JSESSIONID de /admin rompe findCustomer.
+    if (c.name === "JSESSIONID") {
+      const cIsKeralty = (c.path || "").includes("keraltyadscritos");
+      const exIsKeralty = (existing.path || "").includes("keraltyadscritos");
+      if (cIsKeralty && !exIsKeralty) byName.set(c.name, c);
       continue;
     }
     const newer =

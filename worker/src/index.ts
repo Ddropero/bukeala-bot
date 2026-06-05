@@ -107,6 +107,55 @@ app.post("/wa/asset", async (c) => {
   });
   return c.json({ ok: true, name, bytes: buf.byteLength, url: `/wa/asset/${name}` });
 });
+// Medición de duración del token: set/clear del flag + sonda de estado.
+//   GET /debug/measure?token=..&action=start  → activa flag, marca inicio
+//   GET /debug/measure?token=..&action=stop   → limpia flag
+//   GET /debug/measure?token=..&action=probe  → hace 1 ping read-only a Bukeala
+//        y devuelve {ageMin, status, alive} SIN renovar.
+app.get("/debug/measure", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) return c.json({ error: "unauthorized" }, 401);
+  const action = c.req.query("action") || "probe";
+  if (action === "start") {
+    await c.env.STATE.put("debug:measureToken", String(Date.now()), { expirationTtl: 60 * 60 });
+    return c.json({ ok: true, measureMode: "ON", note: "preventive refresh pausado 60min" });
+  }
+  if (action === "stop") {
+    await c.env.STATE.delete("debug:measureToken");
+    return c.json({ ok: true, measureMode: "OFF" });
+  }
+  if (action === "cookies") {
+    const s = await loadSession(c.env);
+    if (!s) return c.json({ note: "no session" });
+    // contar por nombre + listar para ver acumulacion
+    const counts: Record<string, number> = {};
+    for (const ck of s.cookies) counts[ck.name] = (counts[ck.name] || 0) + 1;
+    const jsess = s.cookies.filter((ck) => ck.name === "JSESSIONID")
+      .map((ck) => ({ path: ck.path, domain: ck.domain, val: ck.value.slice(0, 12) }));
+    return c.json({
+      total: s.cookies.length,
+      capturedAt: s.capturedAt,
+      uniqueNames: Object.keys(counts).length,
+      duplicates: Object.entries(counts).filter(([, n]) => n > 1),
+      jsessionids: jsess,
+      allNames: s.cookies.map((ck) => ck.name),
+    });
+  }
+  // probe: medir edad + estado sin renovar
+  const s = await loadSession(c.env);
+  if (!s) return c.json({ alive: false, ageMin: null, note: "no session" });
+  const ageMin = (Date.now() - new Date(s.capturedAt).getTime()) / 60000;
+  let status = 0;
+  try {
+    const b = new Bukeala(c.env);
+    const r = await b.findCustomerPage();
+    status = r.status;
+    await r.text();
+  } catch (e) {
+    return c.json({ alive: false, ageMin: +ageMin.toFixed(2), status: "expired", err: (e as Error).message.slice(0, 60) });
+  }
+  return c.json({ alive: status === 200, ageMin: +ageMin.toFixed(2), status, cookies: s.cookies.length });
+});
+
 app.get("/wa/asset/:name", async (c) => {
   const name = c.req.param("name").replace(/[^a-z0-9_-]/gi, "");
   const raw = await c.env.STATE.get(`asset:${name}`);
@@ -384,7 +433,10 @@ async function keepAlive(env: Env): Promise<void> {
   // Disparamos refresh a los 12 min para tener buffer de seguridad.
   // Throttle 8 min para no spam al watcher (la auto-login toma ~50-90s, así
   // que con throttle 8min nos aseguramos de no dispararla dos veces).
-  if (ageMin > 12) {
+  // MODO MEDICIÓN: si existe el flag, NO renovar (dejar morir la sesión para
+  // medir la duración real del token). Se limpia solo a los 60 min.
+  const measureMode = await env.STATE.get("debug:measureToken");
+  if (ageMin > 12 && !measureMode) {
     const lastAt = await env.STATE.get("keepalive:autoRefreshAt");
     const now = Date.now();
     const shouldRefresh = !lastAt || now - parseInt(lastAt, 10) > 8 * 60 * 1000;
