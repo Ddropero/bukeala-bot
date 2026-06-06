@@ -434,20 +434,33 @@ async function main() {
 
   while (true) {
     try {
-      // 1. ¿Refresh on-demand pedido por Telegram?
+      const bogotaHour = (new Date().getUTCHours() - 5 + 24) % 24;
+      const inBusinessHours = bogotaHour >= 7 && bogotaHour < 19;
+
+      // 1. ¿Refresh on-demand pedido (por Telegram o por un WhatsApp entrante)?
       const req = await checkForRefreshRequest(c);
       if (req) {
-        log("info", "refresh requested", { by: req.requestedBy, at: req.requestedAt });
-        const ok = await doLogin(c, "on-demand");
-        await reportComplete(c, ok, ok ? "cloud login OK" : "cloud login failed");
+        // De NOCHE (fuera de 7am-7pm): solo atendemos refrescos MANUALES del
+        // doctor (/sesion_renew). Las solicitudes disparadas por un paciente
+        // que escribió de madrugada se dejan en la cola — la VM no se despierta
+        // por ellas; se procesarán a las 7am. Así ahorramos captcha de noche.
+        const by = String(req.requestedBy || "");
+        const isPatientTriggered = by.includes("wa-incoming") || by.includes("queue");
+        const allow = inBusinessHours || !isPatientTriggered;
+        if (allow) {
+          log("info", "refresh requested", { by, at: req.requestedAt, inBusinessHours });
+          const ok = await doLogin(c, "on-demand");
+          await reportComplete(c, ok, ok ? "cloud login OK" : "cloud login failed");
+        } else {
+          log("info", "refresh diferido (nocturno, paciente) — queda pendiente hasta 7am", { by });
+        }
       }
 
       // 2. ¿Toca keep-alive proactivo? Solo en horario laboral Bogotá
-      //    (6am-9pm) para ahorrar saldo de 2Captcha. Fuera de ese rango,
-      //    la sesión se deja expirar; si llega un WhatsApp de noche, el
-      //    refresh on-demand (paso 1) la revive al instante.
-      const bogotaHour = (new Date().getUTCHours() - 5 + 24) % 24;
-      const inBusinessHours = bogotaHour >= 6 && bogotaHour < 21;
+      //    (7am-7pm) para ahorrar saldo de 2Captcha. Fuera de ese rango,
+      //    la sesión se deja expirar. Los pacientes que escriban de noche
+      //    quedan en la cola de pendientes y se procesan a las 7am cuando
+      //    arranca el keep-alive (el login proactivo dispara processPending).
       if (inBusinessHours && Date.now() - lastProactive >= PROACTIVE_INTERVAL_MS) {
         await doLogin(c, "proactive");
         lastProactive = Date.now();
@@ -494,7 +507,7 @@ Environment=TWO_CAPTCHA_API_KEY=$TWO_CAPTCHA_API_KEY
 Environment=CAPTURE_TOKEN=$CAPTURE_TOKEN
 Environment=WORKER_URL=$WORKER_URL
 Environment=POLL_INTERVAL_MS=30000
-Environment=PROACTIVE_INTERVAL_MS=780000
+Environment=PROACTIVE_INTERVAL_MS=900000
 Environment=PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
 ExecStart=/usr/bin/node $APP/watcher.js
 Restart=always

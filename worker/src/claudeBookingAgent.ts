@@ -640,7 +640,7 @@ async function toolFindPatient(env: Env, fromPhone: string, cedulaRaw: string, c
       return {
         output: {
           queued: true,
-          message: "Sistema Bukeala caído. Tu solicitud quedó registrada — el equipo te confirma apenas se habilite.",
+          message: queuedPatientMessage(),
         },
         escalated: true,
         escalateReason: "Bukeala session expired — request queued",
@@ -879,7 +879,7 @@ async function toolFindSlots(
       return {
         output: {
           queued: true,
-          message: "Sistema Bukeala caído — solicitud quedó registrada. Avisaré al equipo para que te confirmen apenas se habilite.",
+          message: queuedPatientMessage(),
         },
         escalated: true,
         escalateReason: "Bukeala session expired — request queued",
@@ -1156,7 +1156,7 @@ async function toolBookAppointment(
       return {
         output: {
           queued: true,
-          message: "Sistema Bukeala caído justo al confirmar — solicitud quedó registrada. El equipo te confirma apenas se habilite.",
+          message: queuedPatientMessage(),
         },
         escalated: true,
         escalateReason: "Bukeala session expired — booking queued",
@@ -1358,6 +1358,20 @@ interface PendingRequest {
   channel?: "wa" | "ig"; // canal de origen — default "wa" (legacy)
   queuedAt: number;
   queuedAtISO: string;
+}
+
+/**
+ * Mensaje para el paciente cuando su solicitud queda en cola. Depende de la
+ * hora Bogotá: en horario de atención (7am-7pm) la VM renueva en ~1-2 min, así
+ * que "en unos minutos"; de noche la VM duerme y la cola se procesa a las 7am.
+ */
+export function queuedPatientMessage(): string {
+  const bogotaHour = (new Date().getUTCHours() - 5 + 24) % 24;
+  const inBusinessHours = bogotaHour >= 7 && bogotaHour < 19;
+  if (inBusinessHours) {
+    return "Tu solicitud quedó registrada ✅. En unos minutos te confirmo la disponibilidad por aquí.";
+  }
+  return "Tu solicitud quedó registrada ✅. Nuestro horario de agendamiento es de 7:00 a.m. a 7:00 p.m.; mañana temprano te confirmo la disponibilidad por aquí. 🌙";
 }
 
 /**

@@ -88,7 +88,7 @@ Environment=TWO_CAPTCHA_API_KEY=$TWO_CAPTCHA_API_KEY
 Environment=CAPTURE_TOKEN=$CAPTURE_TOKEN
 Environment=WORKER_URL=$WORKER_URL
 Environment=POLL_INTERVAL_MS=30000
-Environment=PROACTIVE_INTERVAL_MS=780000
+Environment=PROACTIVE_INTERVAL_MS=900000
 Environment=PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
 ExecStart=/usr/bin/node $APP/watcher.js
 Restart=always
