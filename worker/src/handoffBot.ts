@@ -253,6 +253,24 @@ export async function handleHandoffWebhook(c: Context<{ Bindings: Env }>): Promi
     return c.json({ ok: true });
   }
 
+  // ---- Captura del ID de grupo (setup de Forum Topics) ----
+  // Cuando alguien escribe en un grupo/supergrupo donde está este bot,
+  // guardamos el chat.id en KV para que el doctor pueda configurarlo como
+  // TELEGRAM_HANDOFF_GROUP_ID. Se sobreescribe con cada mensaje de grupo.
+  {
+    const ct = update.message?.chat?.type || update.my_chat_member?.chat?.type;
+    const cid = update.message?.chat?.id ?? update.my_chat_member?.chat?.id;
+    const ctitle = update.message?.chat?.title ?? update.my_chat_member?.chat?.title ?? "";
+    if ((ct === "group" || ct === "supergroup") && cid) {
+      await c.env.STATE.put(
+        "forum:lastGroupSeen",
+        JSON.stringify({ id: cid, title: ctitle, at: new Date().toISOString() }),
+        { expirationTtl: 60 * 30 },
+      );
+      console.log(`[handoff] grupo visto: ${cid} "${ctitle}"`);
+    }
+  }
+
   // ---- Callback button press ----
   if (update.callback_query) {
     const cb = update.callback_query;

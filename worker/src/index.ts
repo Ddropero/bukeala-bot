@@ -58,6 +58,13 @@ app.get("/tg/setup", setupWebhook);
 //   3) curl https://<worker>/tg/handoff-setup?token=<CAPTURE_TOKEN>
 app.post("/tg/handoff-webhook", handleHandoffWebhook);
 app.get("/tg/handoff-setup", setupHandoffWebhook);
+// Helper de setup Forum Topics: devuelve el último grupo donde el handoff bot
+// vio un mensaje (para configurar TELEGRAM_HANDOFF_GROUP_ID).
+app.get("/tg/last-group", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) return c.json({ error: "unauthorized" }, 401);
+  const raw = await c.env.STATE.get("forum:lastGroupSeen");
+  return c.json(raw ? JSON.parse(raw) : { note: "Aún no he visto ningún grupo. Escribe algo en el grupo con el bot dentro." });
+});
 
 // Bot de COTIZACIONES — Andrea, encargada de ventas/cotizaciones.
 // Setup:
