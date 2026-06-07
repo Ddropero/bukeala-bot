@@ -54,6 +54,14 @@ export type Env = {
   //        3) curl https://<worker>/tg/handoff-setup?token=<CAPTURE_TOKEN>
   TELEGRAM_HANDOFF_BOT_TOKEN?: string;
 
+  // OPCIONAL: grupo de Telegram con "Temas" (forum) activados, donde cada
+  // paciente escalado tiene su propio HILO. Si está seteado, el handoff usa
+  // Forum Topics (un chat por paciente) en vez de DMs sueltos. El bot de
+  // handoff debe ser ADMIN del grupo con permiso "Administrar temas".
+  // Setup: 1) crea grupo, actívale Temas  2) agrega el handoff bot como admin
+  //        3) wrangler secret put TELEGRAM_HANDOFF_GROUP_ID (ej. -1001234567890)
+  TELEGRAM_HANDOFF_GROUP_ID?: string;
+
   // OPCIONAL: bot dedicado a Andrea (encargada de cotizaciones).
   // Si no está seteado, las solicitudes de cotización van al bot principal.
   // Setup: 1) crea bot en @BotFather  2) wrangler secret put TELEGRAM_QUOTES_BOT_TOKEN

@@ -31,6 +31,7 @@ import { getAllRecipients, isAllowed } from "./users";
 import { downloadTelegramFile, uploadWAMedia, sendWAMedia } from "./whatsappMedia";
 import { createQuoteTicket } from "./quotesBot";
 import { appendHistory } from "./claudeAi";
+import { forumEnabled, sendToTopic, phoneForTopic, closeTopic, reopenTopic } from "./forumTopics";
 
 /**
  * Palabras clave que disparan delegación a Andrea cuando el doctor escribe
@@ -129,6 +130,16 @@ export async function sendHandoffNotification(
     ],
   };
 
+  // MODO FORUM: si hay grupo de temas, mandamos la alerta al HILO del paciente
+  // (un chat propio por paciente). Reabrimos el hilo por si estaba cerrado.
+  if (forumEnabled(env)) {
+    await reopenTopic(env, esc.fromPhone);
+    const ok = await sendToTopic(env, esc.fromPhone, esc.patientName, lines.join("\n"), keyboard);
+    if (ok) return true;
+    // si falló el forum, caemos al modo DM clásico abajo
+    console.log("[handoff] forum send failed, fallback a DMs");
+  }
+
   const recipients = await getAllRecipients(env);
   let anyDelivered = false;
   for (const chatId of recipients) {
@@ -183,6 +194,16 @@ export async function sendHandoffPatientMessage(
     "",
     escapeHtml(opts.text),
   ];
+
+  // MODO FORUM: mensaje al hilo del paciente. En el hilo no hace falta el
+  // botón "Responder" — basta con escribir dentro del hilo (lo maneja el
+  // webhook). Igual dejamos "Devolver a IA" por comodidad.
+  if (forumEnabled(env)) {
+    const kb = { inline_keyboard: [[{ text: "🔚 Devolver a IA", callback_data: `hb:${opts.fromPhone}` }]] };
+    const ok = await sendToTopic(env, opts.fromPhone, opts.patientName, lines.join("\n"), kb);
+    if (ok) return true;
+    console.log("[handoff] forum patient-msg failed, fallback a DMs");
+  }
 
   const recipients = await getAllRecipients(env);
   let anyDelivered = false;
@@ -277,11 +298,17 @@ export async function handleHandoffWebhook(c: Context<{ Bindings: Env }>): Promi
       // ASSIGNEE: liberar — vuelve a IA
       await c.env.STATE.delete(`wa:assignee:${phone}`);
       await answerCallback(c.env, cb.id, "🤖 Devuelto a IA");
-      await sendHandoffMessage(
-        c.env,
-        chatId,
-        `🤖 <code>${phone}</code> vuelve a modo IA. La AI retoma la conversación.`,
-      );
+      // En modo forum, cerrar (archivar) el hilo del paciente + avisar dentro.
+      if (forumEnabled(c.env)) {
+        await sendToTopic(c.env, phone, "", "🤖 Devuelto a la IA. La asistente retoma la conversación.");
+        await closeTopic(c.env, phone);
+      } else {
+        await sendHandoffMessage(
+          c.env,
+          chatId,
+          `🤖 <code>${phone}</code> vuelve a modo IA. La AI retoma la conversación.`,
+        );
+      }
       return c.json({ ok: true });
     }
     return c.json({ ok: true });
@@ -379,7 +406,84 @@ export async function handleHandoffWebhook(c: Context<{ Bindings: Env }>): Promi
     return c.json({ ok: true });
   }
 
-  // ---- Mensajes de texto del doctor ----
+  // ---- FORUM: texto escrito DENTRO de un hilo del grupo de pacientes ----
+  // En un grupo, chat.id es el grupo (no la persona). Validamos al autor con
+  // from.id, ubicamos el paciente por el message_thread_id, y reenviamos a su
+  // WhatsApp. Cero comandos: el doctor solo escribe en el hilo.
+  if (
+    forumEnabled(c.env) &&
+    update.message?.text &&
+    String(update.message.chat?.id) === String((c.env as any).TELEGRAM_HANDOFF_GROUP_ID) &&
+    update.message.message_thread_id
+  ) {
+    const grpChatId = String(update.message.chat.id);
+    const threadId = Number(update.message.message_thread_id);
+    const authorId = String(update.message.from?.id ?? "");
+    const text = String(update.message.text).trim();
+
+    // Ignorar comandos slash y mensajes de servicio dentro del hilo
+    if (text.startsWith("/")) return c.json({ ok: true });
+
+    // ACL por AUTOR (no por chat de grupo)
+    if (!(await isAllowed(c.env, authorId))) {
+      return c.json({ ok: true }); // silencio: no spamear el grupo
+    }
+
+    const phone = await phoneForTopic(c.env, threadId);
+    if (!phone) {
+      // Hilo sin paciente mapeado (ej. "General") — ignorar
+      return c.json({ ok: true });
+    }
+
+    const r = await sendText(c.env, phone, text);
+    if (r.ok) {
+      await appendHistory(c.env, phone, "assistant", text, "wa");
+      // Asegurar modo manual mientras el doctor conversa por el hilo
+      await c.env.STATE.put(`wa:assignee:${phone}`, "doctor", { expirationTtl: 60 * 60 * 24 });
+      await setMode(c.env, phone, "manual");
+      // Acuse discreto: una reacción ✅ en el hilo (vía sendMessage corto)
+      await fetch(`${HANDOFF_API(c.env.TELEGRAM_HANDOFF_BOT_TOKEN!)}/sendMessage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          chat_id: grpChatId,
+          message_thread_id: threadId,
+          text: "✅ enviado",
+          disable_notification: true,
+        }),
+      });
+
+      // Delegar a Andrea si menciona cotización (igual que en DM)
+      if (QUOTE_TRIGGER_RE.test(text)) {
+        try {
+          const contactRaw = await c.env.STATE.get(`wa:contact:${phone}`);
+          let patientName = "(sin nombre)";
+          if (contactRaw) { try { patientName = JSON.parse(contactRaw).name ?? patientName; } catch { /* ignore */ } }
+          const patCtxRaw = await c.env.STATE.get(`wa:patientCtx:${phone}`);
+          let cedula: string | undefined;
+          if (patCtxRaw) { try { cedula = JSON.parse(patCtxRaw).cedula; } catch { /* ignore */ } }
+          await createQuoteTicket(c.env, {
+            fromPhone: phone, patientName, cedula, source: "wa_doctor",
+            patientMessage: text.slice(0, 400),
+            context: `Dr. mencionó cotización en hilo: "${text.slice(0, 200)}"`,
+          });
+        } catch (e) { console.log("[forum] quote-trigger failed:", (e as Error).message); }
+      }
+    } else {
+      const errMsg = r.data?.error?.message ?? "error desconocido";
+      await fetch(`${HANDOFF_API(c.env.TELEGRAM_HANDOFF_BOT_TOKEN!)}/sendMessage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          chat_id: grpChatId, message_thread_id: threadId,
+          text: `❌ No se pudo enviar: ${escapeHtml(String(errMsg))} (¿fuera de ventana 24h?)`,
+        }),
+      });
+    }
+    return c.json({ ok: true });
+  }
+
+  // ---- Mensajes de texto del doctor (DM clásico) ----
   if (update.message?.text) {
     const text: string = String(update.message.text).trim();
     const chatId = String(update.message.chat.id);
