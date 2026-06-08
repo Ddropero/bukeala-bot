@@ -15,6 +15,7 @@ import { dailySummary } from "./cron/dailySummary";
 import { newBookingsCheck } from "./cron/newBookingsWatch";
 import { reminderCron } from "./cron/reminderCron";
 import { autoReturnToAI } from "./cron/autoReturnToAI";
+import { watchdogCron } from "./cron/watchdog";
 import { weeklyReport } from "./cron/weeklyReport";
 import { quoteFollowup } from "./cron/quoteFollowup";
 import { secretaryAgendaCron } from "./cron/secretaryAgenda";
@@ -590,6 +591,8 @@ export default {
     } else if (event.cron === "*/15 * * * *") {
       // Cada 15 min 24/7: devolver a IA contactos en manual con 30+ min sin actividad
       ctx.waitUntil(autoReturnToAI(env));
+      // + Watchdog: vigila salud de la sesión, alerta si lleva 20+ min caída
+      ctx.waitUntil(watchdogCron(env));
     } else if (event.cron === "0 12 * * 1") {
       // Lunes 7am Bogotá: reporte semanal
       ctx.waitUntil(weeklyReport(env));
