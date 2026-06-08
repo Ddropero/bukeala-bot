@@ -476,8 +476,16 @@ async function keepAlive(env: Env): Promise<void> {
       console.log("[keepalive] findAvailability falló (no crítico):", (e2 as Error).message);
     }
 
-    // Reset the "notified" flag so a future expiry triggers a fresh notice
-    await env.STATE.delete("keepalive:notified");
+    // Reset the "notified" flag SOLO si llevábamos un rato realmente caídos
+    // (recuperación genuina), no en cada éxito. La sesión a veces fluctúa
+    // 200/302 entre pings; si borráramos el flag con cada 200, el siguiente
+    // 302 dispararía otro aviso → spam. Solo limpiamos si el último aviso fue
+    // hace > 20 min (señal de que fue una caída real ya resuelta).
+    const notifiedAt = await env.STATE.get("keepalive:notifiedAt");
+    if (notifiedAt && Date.now() - parseInt(notifiedAt, 10) > 20 * 60 * 1000) {
+      await env.STATE.delete("keepalive:notified");
+      await env.STATE.delete("keepalive:notifiedAt");
+    }
 
     // If the pending queue is non-empty AND we just confirmed Bukeala is alive,
     // process the queue: this catches the "session recovered without an explicit
@@ -516,10 +524,24 @@ async function keepAlive(env: Env): Promise<void> {
       }
     }
 
-    // 2) Notify the doctor (once per expiry, until session is restored)
+    // 2) Notify the doctor — pero NO de noche y NO si ya avisamos hace poco.
+    //
+    //    De noche (7pm-7am) la sesión expira A PROPÓSITO (config: la VM solo
+    //    renueva en horario laboral). Avisar "expirada" de madrugada sería
+    //    ruido sobre algo esperado. Solo avisamos en horario laboral.
+    const bogotaHour = (new Date().getUTCHours() - 5 + 24) % 24;
+    const inBusinessHours = bogotaHour >= 7 && bogotaHour < 19;
+    if (!inBusinessHours) {
+      console.log("[keepalive] expiry nocturna esperada — no se notifica");
+      return;
+    }
+
+    // Throttle: máximo 1 aviso cada 30 min (antes borrábamos el flag con cada
+    // éxito, lo que causaba spam si la sesión fluctuaba). 30 min da tiempo a
+    // que el refresh auto se complete antes de un segundo aviso.
     const alreadyNotified = await env.STATE.get("keepalive:notified");
     if (alreadyNotified) {
-      console.log("[keepalive] notice already sent for this expiry, skip");
+      console.log("[keepalive] notice already sent recently, skip");
       return;
     }
     try {
@@ -532,13 +554,14 @@ async function keepAlive(env: Env): Promise<void> {
             chat_id: doctorChatId,
             text:
               "⚠️ <b>Sesión Bukeala expirada</b>\n\n" +
-              "🤖 Auto-disparé un refresh con el Native Host (2Captcha). " +
-              "Si no se resuelve en ~1 min, corre /sesion_renew o <code>node index.js --setup</code>.",
+              "🤖 Auto-disparé un refresh. Si no se resuelve en ~2 min, corre /sesion_renew.",
             parse_mode: "HTML",
           }),
         });
       }
-      await env.STATE.put("keepalive:notified", "1", { expirationTtl: 60 * 60 * 12 });
+      // Flag con TTL 30 min + timestamp para la lógica de limpieza de arriba.
+      await env.STATE.put("keepalive:notified", "1", { expirationTtl: 60 * 30 });
+      await env.STATE.put("keepalive:notifiedAt", String(Date.now()), { expirationTtl: 60 * 60 });
     } catch (notifyErr) {
       console.log("[keepalive] notify failed:", (notifyErr as Error).message);
     }
