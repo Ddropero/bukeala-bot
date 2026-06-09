@@ -443,27 +443,12 @@ async function keepAlive(env: Env): Promise<void> {
   const ageMin = (Date.now() - new Date(s.capturedAt).getTime()) / 60000;
   console.log(`[keepalive] session age=${ageMin.toFixed(1)}min, cookies=${s.cookies.length}`);
 
-  // PROACTIVE REFRESH: Bukeala mata sesiones a los ~20 min (HARD timeout).
-  // Disparamos refresh a los 12 min para tener buffer de seguridad.
-  // Throttle 8 min para no spam al watcher (la auto-login toma ~50-90s, así
-  // que con throttle 8min nos aseguramos de no dispararla dos veces).
-  // MODO MEDICIÓN: si existe el flag, NO renovar (dejar morir la sesión para
-  // medir la duración real del token). Se limpia solo a los 60 min.
-  const measureMode = await env.STATE.get("debug:measureToken");
-  if (ageMin > 12 && !measureMode) {
-    const lastAt = await env.STATE.get("keepalive:autoRefreshAt");
-    const now = Date.now();
-    const shouldRefresh = !lastAt || now - parseInt(lastAt, 10) > 8 * 60 * 1000;
-    if (shouldRefresh) {
-      try {
-        await requestRefresh(env, "auto-keepalive-preventive");
-        await env.STATE.put("keepalive:autoRefreshAt", String(now), { expirationTtl: 60 * 60 });
-        console.log(`[keepalive] PREVENTIVE refresh disparado (age=${ageMin.toFixed(1)}min)`);
-      } catch (e) {
-        console.log("[keepalive] preventive refresh failed:", (e as Error).message);
-      }
-    }
-  }
+  // MODO BAJO DEMANDA (ahorro de 2Captcha): ya NO hacemos refresh preventivo
+  // en vacío. La sesión se renueva solo cuando un paciente real lo necesita
+  // (queuePendingRequest dispara el refresh on-demand) o en el login matutino
+  // de la VM. Si la sesión está caída pero no hay nadie usándola, la dejamos
+  // así — no gastamos captcha por nada. El keepAlive de abajo solo PINGEA
+  // (no renueva) para mantener viva una sesión que YA está buena.
 
   const b = new Bukeala(env);
   try {
@@ -511,24 +496,31 @@ async function keepAlive(env: Env): Promise<void> {
       console.log("[keepalive] unexpected error:", (e as Error).message);
       return;
     }
-    console.log("[keepalive] session expired — auto-triggering refresh");
+    console.log("[keepalive] session expired");
 
-    // 1) Auto-trigger Native Host refresh (it does headless 2Captcha login).
-    //    Throttle to once per 10 min so we don't spam the watcher when login itself fails.
-    const lastAutoRefreshAt = await env.STATE.get("keepalive:autoRefreshAt");
-    const now = Date.now();
-    const shouldAutoRefresh =
-      !lastAutoRefreshAt || now - parseInt(lastAutoRefreshAt, 10) > 10 * 60 * 1000;
-    if (shouldAutoRefresh) {
-      try {
-        await requestRefresh(env, "auto-keepalive");
-        await env.STATE.put("keepalive:autoRefreshAt", String(now), {
-          expirationTtl: 60 * 60,
-        });
-        console.log("[keepalive] auto-refresh queued for Native Host");
-      } catch (e) {
-        console.log("[keepalive] auto-refresh request failed:", (e as Error).message);
+    // MODO BAJO DEMANDA: solo renovamos si HAY pacientes esperando en la cola.
+    // Si la sesión está caída pero nadie la necesita, NO gastamos captcha —
+    // se renovará en cuanto llegue un paciente (queuePendingRequest) o en el
+    // login matutino. Esto es lo que baja el gasto ~75-80%.
+    let pendingCount = 0;
+    try { pendingCount = (await loadPendingRequests(env)).length; } catch { /* ignore */ }
+    if (pendingCount > 0) {
+      const lastAutoRefreshAt = await env.STATE.get("keepalive:autoRefreshAt");
+      const now = Date.now();
+      const shouldAutoRefresh =
+        !lastAutoRefreshAt || now - parseInt(lastAutoRefreshAt, 10) > 10 * 60 * 1000;
+      if (shouldAutoRefresh) {
+        try {
+          await requestRefresh(env, "auto-keepalive-pending");
+          await env.STATE.put("keepalive:autoRefreshAt", String(now), { expirationTtl: 60 * 60 });
+          console.log(`[keepalive] refresh disparado (${pendingCount} pacientes en cola)`);
+        } catch (e) {
+          console.log("[keepalive] auto-refresh request failed:", (e as Error).message);
+        }
       }
+    } else {
+      console.log("[keepalive] sesión caída pero cola vacía — no renovar (ahorro)");
+      return;
     }
 
     // 2) Notify the doctor — pero NO de noche y NO si ya avisamos hace poco.

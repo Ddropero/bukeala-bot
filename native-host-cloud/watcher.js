@@ -126,12 +126,22 @@ async function main() {
   // Login inmediato al arrancar (sesión fresca de una)
   await doLogin(c, "startup");
 
-  let lastProactive = Date.now();
+  // MODO BAJO DEMANDA (ahorro de 2Captcha):
+  // Ya NO renovamos cada X minutos en vacío. La sesión se renueva solo cuando:
+  //   a) llega un paciente / cron pide refresh (on-demand), o
+  //   b) UN único login proactivo al inicio del día (7am Bogotá), para que
+  //      el primer paciente de la mañana no espere los ~90s del login.
+  // Esto baja el gasto ~75-80% sin afectar el servicio (los disparadores
+  // reactivos + el watchdog del worker cubren cualquier hueco).
+  let lastMorningLoginDay = -1; // día del mes en que ya hicimos el login de las 7am
 
   while (true) {
     try {
-      const bogotaHour = (new Date().getUTCHours() - 5 + 24) % 24;
+      const now = new Date();
+      const bogotaHour = (now.getUTCHours() - 5 + 24) % 24;
       const inBusinessHours = bogotaHour >= 7 && bogotaHour < 19;
+      // "día Bogotá" para el throttle del login matutino
+      const bogotaDay = new Date(now.getTime() - 5 * 3600 * 1000).getUTCDate();
 
       // 1. ¿Refresh on-demand pedido (por Telegram o por un WhatsApp entrante)?
       const req = await checkForRefreshRequest(c);
@@ -152,14 +162,12 @@ async function main() {
         }
       }
 
-      // 2. ¿Toca keep-alive proactivo? Solo en horario laboral Bogotá
-      //    (7am-7pm) para ahorrar saldo de 2Captcha. Fuera de ese rango,
-      //    la sesión se deja expirar. Los pacientes que escriban de noche
-      //    quedan en la cola de pendientes y se procesan a las 7am cuando
-      //    arranca el keep-alive (el login proactivo dispara processPending).
-      if (inBusinessHours && Date.now() - lastProactive >= PROACTIVE_INTERVAL_MS) {
-        await doLogin(c, "proactive");
-        lastProactive = Date.now();
+      // 2. UN solo login proactivo al inicio del día (7am Bogotá). Deja la
+      //    sesión lista para el primer paciente. Después, todo es bajo demanda.
+      if (bogotaHour === 7 && lastMorningLoginDay !== bogotaDay) {
+        log("info", "login matutino (7am, 1 vez al día)");
+        await doLogin(c, "morning");
+        lastMorningLoginDay = bogotaDay;
       }
     } catch (e) {
       log("error", "tick failed", { error: e.message });

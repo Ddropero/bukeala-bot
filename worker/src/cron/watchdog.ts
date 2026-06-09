@@ -22,10 +22,9 @@
  *   watchdog:alerted     → "1" si ya avisamos por esta caída (TTL 6h)
  */
 import type { Env } from "../env";
-import { Bukeala, SessionExpiredError } from "../bukeala";
-import { loadSession } from "../kv";
 import { getDoctorRecipients } from "../users";
 import { requestRefresh, getNativeHostEvents } from "../handlers/nativeHostEvent";
+import { loadPendingRequests } from "../claudeBookingAgent";
 
 const TG = (token: string) => `https://api.telegram.org/bot${token}`;
 const GRACE_MIN = 20; // minutos caído antes de alertar
@@ -62,37 +61,31 @@ async function diagnose(env: Env): Promise<string> {
 }
 
 export async function watchdogCron(env: Env): Promise<void> {
-  // 1. Solo en horario laboral (de noche la expiración es esperada)
+  // Solo en horario laboral (de noche no se atienden pacientes).
   const h = bogotaHour();
   if (h < 7 || h >= 19) {
-    // Fuera de horario: limpiar cualquier estado de caída para empezar
-    // fresco mañana.
-    await env.STATE.delete("watchdog:downSince");
+    await env.STATE.delete("watchdog:stuckSince");
     await env.STATE.delete("watchdog:alerted");
     return;
   }
 
-  // 2. Ping real a Bukeala
-  let alive = false;
-  try {
-    const s = await loadSession(env);
-    if (s) {
-      const b = new Bukeala(env);
-      const r = await b.findCustomerPage();
-      await r.text();
-      alive = r.status === 200;
-    }
-  } catch (e) {
-    alive = !(e instanceof SessionExpiredError) ? false : false;
-  }
+  // MODO BAJO DEMANDA: la sesión está caída casi siempre A PROPÓSITO (solo se
+  // renueva cuando llega un paciente). Por eso el watchdog YA NO vigila si la
+  // sesión está viva — eso sería falsa alarma constante. En cambio vigila lo
+  // que de verdad importa: ¿hay PACIENTES EN COLA que llevan rato sin ser
+  // atendidos? Esa es la señal real de que el renovador no está funcionando.
+  let pending: Array<{ queuedAt?: number }> = [];
+  try { pending = (await loadPendingRequests(env)) as any[]; } catch { /* ignore */ }
 
-  // 3a. Sesión viva → todo OK, limpiar estado de alarma
-  if (alive) {
-    const wasDown = await env.STATE.get("watchdog:downSince");
+  const now = Date.now();
+  // Pacientes en cola que llevan más de GRACE_MIN esperando.
+  const stuck = pending.filter((p) => p.queuedAt && (now - p.queuedAt) / 60000 >= GRACE_MIN);
+
+  // Sin pacientes atascados → todo bien. Si veníamos de una alerta, avisar OK.
+  if (stuck.length === 0) {
     const wasAlerted = await env.STATE.get("watchdog:alerted");
-    await env.STATE.delete("watchdog:downSince");
+    await env.STATE.delete("watchdog:stuckSince");
     await env.STATE.delete("watchdog:alerted");
-    // Si habíamos alertado una caída y ya se recuperó, avisar la recuperación.
     if (wasAlerted) {
       const doctors = await getDoctorRecipients(env);
       for (const chat of doctors) {
@@ -101,51 +94,26 @@ export async function watchdogCron(env: Env): Promise<void> {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             chat_id: chat,
-            text: "✅ <b>Sesión Bukeala recuperada</b>\n\nEl sistema volvió a la normalidad.",
+            text: "✅ <b>Cola de pacientes procesada</b>\n\nEl sistema volvió a la normalidad.",
             parse_mode: "HTML",
           }),
         }).catch(() => {});
       }
     }
-    void wasDown;
     return;
   }
 
-  // 3b. Sesión caída. ¿Desde cuándo?
-  const downSinceRaw = await env.STATE.get("watchdog:downSince");
-  const now = Date.now();
-  if (!downSinceRaw) {
-    // Primera detección de esta caída → marcar + intentar auto-recuperar
-    await env.STATE.put("watchdog:downSince", new Date(now).toISOString(), {
-      expirationTtl: 60 * 60 * 6,
-    });
-    try {
-      await requestRefresh(env, "watchdog-autorecover");
-      console.log("[watchdog] caída detectada — refresh on-demand disparado");
-    } catch (e) {
-      console.log("[watchdog] requestRefresh falló:", (e as Error).message);
-    }
-    return;
-  }
+  // Hay pacientes atascados. Intentar recuperar (forzar refresh) e informar
+  // una sola vez.
+  try { await requestRefresh(env, "watchdog-pending-stuck"); } catch { /* ignore */ }
 
-  // Ya estaba caído antes. ¿Cuánto tiempo?
-  const downMin = (now - new Date(downSinceRaw).getTime()) / 60000;
-  if (downMin < GRACE_MIN) {
-    // Aún en periodo de gracia: re-disparar refresh, no alertar todavía
-    try { await requestRefresh(env, "watchdog-retry"); } catch { /* ignore */ }
-    console.log(`[watchdog] caído hace ${downMin.toFixed(0)}min (gracia ${GRACE_MIN}min)`);
-    return;
-  }
-
-  // Pasó el periodo de gracia → alertar UNA vez
   const alreadyAlerted = await env.STATE.get("watchdog:alerted");
   if (alreadyAlerted) {
-    console.log("[watchdog] ya se alertó esta caída, skip");
+    console.log(`[watchdog] ${stuck.length} pacientes en cola, ya alertado`);
     return;
   }
 
   const reason = await diagnose(env);
-  const downMinRounded = Math.round(downMin);
   const doctors = await getDoctorRecipients(env);
   for (const chat of doctors) {
     await fetch(`${TG(env.TELEGRAM_BOT_TOKEN)}/sendMessage`, {
@@ -154,18 +122,18 @@ export async function watchdogCron(env: Env): Promise<void> {
       body: JSON.stringify({
         chat_id: chat,
         text:
-          `🔴 <b>Alerta: Bukeala caído hace ${downMinRounded} min</b>\n\n` +
+          `🔴 <b>Alerta: ${stuck.length} paciente(s) sin atender hace ${GRACE_MIN}+ min</b>\n\n` +
+          `Hay solicitudes en cola que el sistema no logró procesar.\n\n` +
           `<b>Diagnóstico:</b> ${reason}\n\n` +
-          `Ya intenté recuperarlo solo varias veces sin éxito.\n\n` +
-          `<b>Qué hacer:</b>\n` +
+          `Ya intenté recuperarlo solo. Si sigue:\n` +
           `• Revisa que la VM de Google esté prendida\n` +
-          `• O prende el PC del consultorio (renueva de respaldo)\n` +
-          `• O corre /sesion_renew\n\n` +
-          `<i>Te aviso cuando se recupere.</i>`,
+          `• O corre /sesion_renew\n` +
+          `• Revisa /wa_pending para ver la cola\n\n` +
+          `<i>Te aviso cuando se procese.</i>`,
         parse_mode: "HTML",
       }),
     }).catch(() => {});
   }
   await env.STATE.put("watchdog:alerted", "1", { expirationTtl: 60 * 60 * 6 });
-  console.log(`[watchdog] ALERTA enviada — caído ${downMinRounded}min: ${reason}`);
+  console.log(`[watchdog] ALERTA — ${stuck.length} pacientes atascados: ${reason}`);
 }
