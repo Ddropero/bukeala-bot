@@ -7,6 +7,7 @@ import { verifyWhatsAppWebhook, handleWhatsAppWebhook } from "./handlers/whatsap
 import { verifyInstagramWebhook, handleInstagramWebhook } from "./handlers/instagramWebhook";
 import { handleIgDiscover } from "./handlers/instagramDiscover";
 import { handleGetProfile, handleUpdateProfilePicture, handlePhoneInfo } from "./handlers/whatsappProfile";
+import { handleListTemplates, handleCreateTemplates } from "./handlers/waTemplates";
 import { handleDashboard } from "./handlers/dashboard";
 import { handleNativeHostEvent, handleCheckRefresh, handleRefreshComplete } from "./handlers/nativeHostEvent";
 import { Bukeala, SessionExpiredError } from "./bukeala";
@@ -87,6 +88,11 @@ app.post("/wa/webhook", handleWhatsAppWebhook);
 //   GET  /wa/phone-info?token=<CAPTURE_TOKEN>                → display_name, quality, status
 app.get("/wa/profile", handleGetProfile);
 app.post("/wa/profile-picture", handleUpdateProfilePicture);
+// Gestión de plantillas vía Graph API (sin navegador):
+//   GET /wa/templates?token=..        → lista plantillas
+//   GET /wa/templates/create?token=.. → crea confirmar_cita + appointment_reminder
+app.get("/wa/templates", handleListTemplates);
+app.get("/wa/templates/create", handleCreateTemplates);
 app.get("/wa/phone-info", handlePhoneInfo);
 
 // Asset hosting mínimo: guardar/servir una imagen (ej. avatar) desde KV.

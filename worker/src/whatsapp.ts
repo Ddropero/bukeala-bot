@@ -166,7 +166,7 @@ export async function sendInteractiveList(
 /**
  * Send a custom template with parameters. Template must be pre-approved by Meta.
  * Example template "appointment_confirmation" with body params {patient_name}, {date}, {time}, {place}:
- *   sendTemplate(env, to, "appointment_confirmation", "es_CO", [{type:"text",text:"Juan"},...])
+ *   sendTemplate(env, to, "appointment_confirmation", "es", [{type:"text",text:"Juan"},...])
  */
 export async function sendTemplate(
   env: Env,
@@ -215,7 +215,7 @@ export async function sendAppointmentConfirmation(
     console.log("[whatsapp] confirmation skipped: invalid phone", patientPhoneRaw);
     return { ok: false, reason: "invalid_phone" };
   }
-  return sendTemplate(env, to, "appointment_confirmation_v2", "es_CO", [
+  return sendTemplate(env, to, "appointment_confirmation_v2", "es", [
     { type: "text", text: patientName },
     { type: "text", text: dateText },
     { type: "text", text: timeText },
@@ -241,7 +241,7 @@ export async function sendAppointmentReminder(
     console.log("[whatsapp] reminder skipped: invalid phone", patientPhoneRaw);
     return { ok: false, reason: "invalid_phone" };
   }
-  return sendTemplate(env, to, "appointment_reminder", "es_CO", [
+  return sendTemplate(env, to, "appointment_reminder", "es", [
     { type: "text", text: patientName },
     { type: "text", text: dateText },
     { type: "text", text: timeText },
@@ -279,10 +279,10 @@ export async function sendAppointmentConfirmRequest(
     { type: "text", text: timeText },
     { type: "text", text: place },
   ];
-  const r = await sendTemplate(env, to, "confirmar_cita", "es_CO", params);
+  const r = await sendTemplate(env, to, "confirmar_cita", "es", params);
   if (r.ok) return { ...r, mode: "confirm" };
   // Template aún no aprobado → recordatorio normal como respaldo
-  const fb = await sendTemplate(env, to, "appointment_reminder", "es_CO", params);
+  const fb = await sendTemplate(env, to, "appointment_reminder", "es", params);
   return { ...fb, mode: "reminder_fallback" };
 }
 
@@ -303,7 +303,7 @@ export async function sendAppointmentCanceled(
     console.log("[whatsapp] canceled-notice skipped: invalid phone", patientPhoneRaw);
     return { ok: false, reason: "invalid_phone" };
   }
-  return sendTemplate(env, to, "appointment_canceled", "es_CO", [
+  return sendTemplate(env, to, "appointment_canceled", "es", [
     { type: "text", text: patientName },
     { type: "text", text: dateText },
     { type: "text", text: timeText },
@@ -324,7 +324,7 @@ export async function sendAppointmentFollowup(
   if (!to || to.length < 10) {
     return { ok: false, reason: "invalid_phone" };
   }
-  return sendTemplate(env, to, "appointment_followup", "es_CO", [
+  return sendTemplate(env, to, "appointment_followup", "es", [
     { type: "text", text: patientName },
   ]);
 }
@@ -398,7 +398,7 @@ export async function sendPostSurgeryCheckin(
   if (!to || to.length < 10) {
     return { ok: false, reason: "invalid_phone" };
   }
-  return sendTemplate(env, to, "post_surgery_checkin", "es_CO", [
+  return sendTemplate(env, to, "post_surgery_checkin", "es", [
     { type: "text", text: patientName },
     { type: "text", text: String(daysSinceSurgery) },
   ]);
