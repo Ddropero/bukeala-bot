@@ -24,16 +24,18 @@ const AREA_ID = "1074";
 const SLOT_SECONDS = 1200; // 20 min
 const DEFAULT_WEEKS = 2;   // si no dan rango, abre 2 semanas
 
-// Mapa día → número Bukeala. En el HAR, jueves = "4".
-// Deducción: lunes=1, martes=2, miércoles=3, jueves=4, viernes=5, sábado=6, domingo=7.
+// Mapa día → número Bukeala. VERIFICADO con prueba real:
+// Bukeala usa Domingo=1, Lunes=2, Martes=3, Miércoles=4, Jueves=5, Viernes=6, Sábado=7.
+// (En el HAR daysSelected="4" con fecha de inicio viernes 19/06/26 era para Miércoles;
+//  y al pedir "6" Bukeala respondió "Viernes" → confirma este mapeo.)
 const DAY_MAP: Record<string, { num: string; label: string }> = {
-  "lunes": { num: "1", label: "Lunes" }, "lun": { num: "1", label: "Lunes" },
-  "martes": { num: "2", label: "Martes" }, "mar": { num: "2", label: "Martes" },
-  "miercoles": { num: "3", label: "Miércoles" }, "mie": { num: "3", label: "Miércoles" }, "mié": { num: "3", label: "Miércoles" },
-  "jueves": { num: "4", label: "Jueves" }, "jue": { num: "4", label: "Jueves" },
-  "viernes": { num: "5", label: "Viernes" }, "vie": { num: "5", label: "Viernes" },
-  "sabado": { num: "6", label: "Sábado" }, "sab": { num: "6", label: "Sábado" }, "sáb": { num: "6", label: "Sábado" },
-  "domingo": { num: "7", label: "Domingo" }, "dom": { num: "7", label: "Domingo" },
+  "domingo": { num: "1", label: "Domingo" }, "dom": { num: "1", label: "Domingo" },
+  "lunes": { num: "2", label: "Lunes" }, "lun": { num: "2", label: "Lunes" },
+  "martes": { num: "3", label: "Martes" }, "mar": { num: "3", label: "Martes" },
+  "miercoles": { num: "4", label: "Miércoles" }, "mie": { num: "4", label: "Miércoles" }, "mié": { num: "4", label: "Miércoles" },
+  "jueves": { num: "5", label: "Jueves" }, "jue": { num: "5", label: "Jueves" },
+  "viernes": { num: "6", label: "Viernes" }, "vie": { num: "6", label: "Viernes" },
+  "sabado": { num: "7", label: "Sábado" }, "sab": { num: "7", label: "Sábado" }, "sáb": { num: "7", label: "Sábado" },
 };
 
 function stripAccents(s: string): string {
