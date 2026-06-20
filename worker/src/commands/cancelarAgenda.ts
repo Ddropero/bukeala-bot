@@ -176,7 +176,9 @@ async function confirmarCancelacion(
         const rc = bk.reservationCode ?? bk.reservationCodeStr ?? null;
         if (rc) {
           try {
-            await b.cancelBooking({ reservationCode: String(rc), cancelReasonId: "2", cancelationComment: "Agenda cancelada por el Dr." });
+            // "12" = "No disponibilidad de profesional" (motivo válido del catálogo
+            // de cancelBooking; NO confundir con el reasonId de saveDenyDate).
+            await b.cancelBooking({ reservationCode: String(rc), cancelReasonId: "12", cancelationComment: "Agenda cancelada por el Dr." });
           } catch { citasNoCanceladas++; }
         } else {
           citasNoCanceladas++;
