@@ -74,6 +74,18 @@ export async function handleDebug(c: Context<{ Bindings: Env }>) {
         });
         break;
       }
+      case "listSchedules": {
+        // Read-only: lista calendarios (agendas) de ambos perfiles. Diagnóstico
+        // para /cancelar_agenda. ?token=<CAPTURE_TOKEN>
+        const out: any[] = [];
+        for (const id of ["1222", "1218"]) {
+          const r = await b.selectBookingComponent(id);
+          const j = await r.json<any>().catch(() => null);
+          const cals = j?.bookingComponent?.bookingCalendars ?? [];
+          out.push({ componentId: id, count: cals.length, calendars: cals.map((cc: any) => ({ id: cc.id, desc: cc.description, start: cc.startDateFormatted, state: cc.stateDescription })) });
+        }
+        return c.json(out);
+      }
       case "warmup": {
         // Hit the static landing pages to let the WAF set its cookies
         // and the ALB set sticky-session cookies. Best-effort.

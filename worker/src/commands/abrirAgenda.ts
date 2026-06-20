@@ -18,11 +18,26 @@ import type { Env } from "../env";
 import { Bukeala, SessionExpiredError } from "../bukeala";
 
 // Config fija (del HAR real del Dr. Duque)
-const COMPONENT_ID = "1222";
-const COMPONENT_CODE = "890239-1";
 const AREA_ID = "1074";
 const SLOT_SECONDS = 1200; // 20 min
 const DEFAULT_WEEKS = 2;   // si no dan rango, abre 2 semanas
+
+// Los DOS perfiles de agenda (verificado en HAR agendas2):
+//   niños/adolescentes → componente 1222, código 890239-1
+//   adultos            → componente 1218, código 890239
+const PROFILES = {
+  ninos:   { id: "1222", code: "890239-1", label: "Niños y adolescentes" },
+  adultos: { id: "1218", code: "890239",   label: "Adultos" },
+} as const;
+type ProfileKey = keyof typeof PROFILES;
+
+// Palabras que el doctor puede usar para elegir perfil
+const PROFILE_ALIASES: Record<string, ProfileKey> = {
+  "ninos": "ninos", "niños": "ninos", "nino": "ninos", "niño": "ninos",
+  "adolescentes": "ninos", "ado": "ninos", "pediatrico": "ninos", "pediátrico": "ninos",
+  "adultos": "adultos", "adulto": "adultos", "adt": "adultos",
+  "ambos": "AMBOS" as any, "dual": "AMBOS" as any, "todos": "AMBOS" as any, "simultaneo": "AMBOS" as any, "simultáneo": "AMBOS" as any,
+};
 
 // Mapa día → número Bukeala. VERIFICADO con prueba real:
 // Bukeala usa Domingo=1, Lunes=2, Martes=3, Miércoles=4, Jueves=5, Viernes=6, Sábado=7.
@@ -62,16 +77,36 @@ function validDate(s: string): boolean {
   return /^\d{2}\/\d{2}\/\d{4}$/.test(s);
 }
 
-export interface AbrirAgendaResult { reply: string; }
+export interface AbrirAgendaResult { reply: string; needsRenew?: boolean; }
 
 /**
  * Parsea y ejecuta /abrir_agenda. Devuelve el mensaje a enviar al doctor.
  * @param argsText  lo que viene después de "/abrir_agenda"
  */
 export async function handleAbrirAgenda(env: Env, argsText: string): Promise<AbrirAgendaResult> {
-  const parts = argsText.trim().split(/\s+/).filter(Boolean);
+  let parts = argsText.trim().split(/\s+/).filter(Boolean);
   if (parts.length < 2) {
     return { reply: helpText() };
+  }
+
+  // 0. Perfil opcional como primer token: ninos | adultos | ambos.
+  //    Si no se especifica, default = AMBOS (niños + adultos simultáneo).
+  let profiles: ProfileKey[] = ["ninos", "adultos"];
+  let profileLabel = "Ambos perfiles (niños + adultos)";
+  const firstKey = stripAccents(parts[0].toLowerCase());
+  if (PROFILE_ALIASES[firstKey]) {
+    const sel = PROFILE_ALIASES[firstKey];
+    if ((sel as string) === "AMBOS") {
+      profiles = ["ninos", "adultos"];
+      profileLabel = "Ambos perfiles (niños + adultos)";
+    } else {
+      profiles = [sel];
+      profileLabel = PROFILES[sel].label;
+    }
+    parts = parts.slice(1); // consumir el token de perfil
+  }
+  if (parts.length < 2) {
+    return { reply: `❌ Falta día y horario.\n\n${helpText()}` };
   }
 
   // 1. Día
@@ -102,7 +137,6 @@ export async function handleAbrirAgenda(env: Env, argsText: string): Promise<Abr
     startDate = parts[2];
     endDate = parts[3];
   } else if (parts.length === 3 && validDate(parts[2])) {
-    // Solo fecha de inicio → 2 semanas desde ahí
     startDate = parts[2];
     const [d, mo, y] = parts[2].split("/").map((n) => parseInt(n, 10));
     const dt = new Date(Date.UTC(y, mo - 1, d) + DEFAULT_WEEKS * 7 * 86400 * 1000);
@@ -110,92 +144,78 @@ export async function handleAbrirAgenda(env: Env, argsText: string): Promise<Abr
   }
 
   const b = new Bukeala(env);
+  const slots = Math.floor((endSeconds - startSeconds) / SLOT_SECONDS);
 
-  // 4. Validar sala libre (no bloqueante si falla la validación misma)
+  // 4. Crear el horario para cada perfil seleccionado
+  const ok: string[] = [];
+  const failed: string[] = [];
   try {
-    const vr = await b.validateRoomAvailability({
-      roomId: 0,
-      areaId: parseInt(AREA_ID, 10),
-      startDateStr: startDate,
-      endDateStr: endDate,
-      startSeconds,
-      endSeconds,
-      daysSelectedStr: `${day.num}-`,
-      repeatWeek: 1,
-    });
-    const vt = await vr.text();
-    let vj: any = null;
-    try { vj = JSON.parse(vt); } catch { /* ignore */ }
-    if (vj?.result?.code && vj.result.code !== "SUCCESS") {
-      const msg = vj.messages?.[0]?.description || vj.result.description || vj.result.code;
-      return { reply: `⚠️ No se puede abrir ese horario: ${escapeHtml(String(msg))}\n\n<i>Puede que ya haya un bloque que se cruza.</i>` };
+    for (const pk of profiles) {
+      const prof = PROFILES[pk];
+      const res = await b.createSchedule({
+        bookingComponentId: prof.id,
+        componentCode: prof.code,
+        daysSelected: [day.num],
+        areaId: AREA_ID,
+        startBookingSeconds: startSeconds,
+        endBookingSeconds: endSeconds,
+        startDate,
+        endDate,
+        intervalSeconds: SLOT_SECONDS,
+        repeatWeek: 1,
+        roomId: 0,
+        allowHolidays: "REGULAR",
+      });
+      const txt = await res.text();
+      let j: any = null;
+      try { j = JSON.parse(txt); } catch { /* ignore */ }
+      if (j?.result?.code === "SUCCESS") {
+        ok.push(prof.label);
+      } else {
+        const errMsg = j?.messages?.[0]?.description ?? j?.result?.description ?? `HTTP ${res.status}`;
+        failed.push(`${prof.label}: ${String(errMsg).replace(/<[^>]+>/g, "").slice(0, 120)}`);
+      }
     }
   } catch (e) {
     if (e instanceof SessionExpiredError) {
-      return { reply: "⚠️ Sesión Bukeala caída. Corre /sesion_renew y reintenta." };
-    }
-    // si la validación falla por otra cosa, seguimos e intentamos crear igual
-    console.log("[abrirAgenda] validate falló (continuo):", (e as Error).message);
-  }
-
-  // 5. Crear el horario
-  try {
-    const res = await b.createSchedule({
-      bookingComponentId: COMPONENT_ID,
-      componentCode: COMPONENT_CODE,
-      daysSelected: [day.num],
-      areaId: AREA_ID,
-      startBookingSeconds: startSeconds,
-      endBookingSeconds: endSeconds,
-      startDate,
-      endDate,
-      intervalSeconds: SLOT_SECONDS,
-      repeatWeek: 1,
-      roomId: 0,
-      allowHolidays: "REGULAR",
-    });
-    const txt = await res.text();
-    let j: any = null;
-    try { j = JSON.parse(txt); } catch { /* ignore */ }
-
-    if (j?.result?.code === "SUCCESS") {
-      const slots = Math.floor((endSeconds - startSeconds) / SLOT_SECONDS);
-      return {
-        reply: [
-          `✅ <b>Agenda abierta</b>`,
-          ``,
-          `📅 ${day.label}s`,
-          `⏰ ${rangeM[1]} – ${rangeM[2]} (slots de 20 min ≈ ${slots} cupos)`,
-          `🗓️ Vigencia: ${startDate} → ${endDate}`,
-          ``,
-          `<i>Los pacientes ya pueden agendar en esos cupos.</i>`,
-        ].join("\n"),
-      };
-    }
-
-    const errMsg = j?.messages?.[0]?.description ?? j?.result?.description ?? `HTTP ${res.status}`;
-    return { reply: `❌ No se pudo crear: ${escapeHtml(String(errMsg).replace(/<[^>]+>/g, "").slice(0, 200))}` };
-  } catch (e) {
-    if (e instanceof SessionExpiredError) {
-      return { reply: "⚠️ Sesión Bukeala caída justo al crear. Corre /sesion_renew y reintenta." };
+      return { reply: "⚠️ Sesión Bukeala caída. La estoy despertando…", needsRenew: true };
     }
     return { reply: `❌ Error: ${escapeHtml((e as Error).message.slice(0, 150))}` };
   }
+
+  // 5. Resumen
+  const lines: string[] = [];
+  if (ok.length > 0) {
+    lines.push(`✅ <b>Agenda abierta</b>`, ``);
+    lines.push(`📅 ${day.label}s · ⏰ ${rangeM[1]}–${rangeM[2]} (≈${slots} cupos de 20 min)`);
+    lines.push(`🗓️ ${startDate} → ${endDate}`);
+    lines.push(`👥 Perfil(es): ${ok.join(" + ")}`);
+  }
+  if (failed.length > 0) {
+    lines.push(``, `⚠️ No se pudo en: `);
+    for (const f of failed) lines.push(`• ${escapeHtml(f)}`);
+  }
+  if (ok.length > 0) {
+    lines.push(``, `<i>Los pacientes ya pueden agendar.</i>`);
+  }
+  return { reply: lines.join("\n") || "❌ No se creó ninguna agenda." };
 }
 
 function helpText(): string {
   return [
     "📋 <b>Abrir agenda (cupos)</b>",
     "",
-    "<code>/abrir_agenda &lt;día&gt; &lt;inicio&gt;-&lt;fin&gt; [desde] [hasta]</code>",
+    "<code>/abrir_agenda [perfil] &lt;día&gt; &lt;inicio&gt;-&lt;fin&gt; [desde] [hasta]</code>",
     "",
     "Ejemplos:",
-    "<code>/abrir_agenda jueves 8:00-12:20</code>",
-    "<code>/abrir_agenda lunes 7:00-13:00 01/07/2026 31/07/2026</code>",
+    "<code>/abrir_agenda jueves 8:00-12:20</code> (ambos perfiles)",
+    "<code>/abrir_agenda ninos jueves 8:00-12:20</code>",
+    "<code>/abrir_agenda adultos lunes 7:00-13:00 01/07/2026 31/07/2026</code>",
     "",
+    "• <b>Perfil</b> (opcional): <code>ninos</code> · <code>adultos</code> · <code>ambos</code> (default: ambos a la vez)",
     "• Slots de 20 min · agenda del Dr. Duque",
     "• Sin fechas = próximas 2 semanas",
-    "• Días: lunes, martes, miércoles, jueves, viernes, sábado, domingo (o lun/mar/mié...)",
+    "• Días: lunes…domingo (o lun/mar/mié...)",
   ].join("\n");
 }
 

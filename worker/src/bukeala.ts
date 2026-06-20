@@ -565,4 +565,134 @@ export class Bukeala {
       { absolute: true },
     );
   }
+
+  /**
+   * Lista los calendarios (agendas) creados de un componente. La respuesta
+   * trae bookingComponent.bookingCalendars[] con id, fechas, horas, estado.
+   * Del HAR: GET /selectBookingComponent?bookingComponentId=XXXX
+   */
+  selectBookingComponent(bookingComponentId: string | number): Promise<Response> {
+    return this.req(
+      `/admin/bookingComponents/config/selectBookingComponent?bookingComponentId=${bookingComponentId}&sucursal=${this.env.BRANCH_ID}`,
+      {},
+      { absolute: true },
+    );
+  }
+
+  /**
+   * Borra uno o varios calendarios (agendas) por id. NOTA: esto borra el
+   * MOLDE de agenda; las reservas (citas) de pacientes se cancelan aparte
+   * con cancelBooking.
+   * Del HAR: GET /deleteBookingCalendar?calendars=28479&sucursal=456
+   */
+  deleteBookingCalendar(calendarIds: Array<string | number>): Promise<Response> {
+    const ids = calendarIds.join(",");
+    return this.req(
+      `/admin/bookingComponents/config/deleteBookingCalendar?calendars=${ids}&sucursal=${this.env.BRANCH_ID}`,
+      {},
+      { absolute: true },
+    );
+  }
+
+  /**
+   * Cuenta cuántas citas (pacientes) hay en una fecha/horario — para saber
+   * a quién avisar antes de cancelar/bloquear. Devuelve un número plano.
+   * Del HAR: GET /countBookingsForDenyDate?bookingComponentId=..&requestedAreas=..&timeFrom=..&timeTo=..&requestedDates=DD-MM-YYYY
+   */
+  countBookingsForDenyDate(args: {
+    bookingComponentId: string | number;
+    areaId: string | number;
+    timeFromSeconds: number;
+    timeToSeconds: number;
+    dateDdMmYyyy: string;   // "24-06-2026"
+    isPartial?: boolean;
+  }): Promise<Response> {
+    const qs = new URLSearchParams({
+      bookingComponentId: String(args.bookingComponentId),
+      branchId: this.env.BRANCH_ID,
+      requestedAreas: String(args.areaId),
+      timeFrom: String(args.timeFromSeconds),
+      timeTo: String(args.timeToSeconds),
+      requestedDates: args.dateDdMmYyyy,
+      isPartial: String(args.isPartial ?? true),
+      _: Date.now().toString(),
+      sucursal: this.env.BRANCH_ID,
+    });
+    return this.req(
+      `/admin/bookingComponents/config/countBookingsForDenyDate?${qs}`,
+      {},
+      { absolute: true },
+    );
+  }
+
+  /**
+   * Crea un bloqueo (deny date): cierra una fecha/horario para que no se
+   * agenden citas (vacaciones, congreso, etc.).
+   * Del HAR: POST /saveDenyDate  body JSON {areas, reasonId, bookingComponents, startHour, endHour, selectedDates...}
+   */
+  saveDenyDate(args: {
+    areaId: number;
+    bookingComponentIds: number[];
+    reasonId?: string;           // "2" en el HAR
+    comment?: string;
+    startHourSeconds: number;
+    endHourSeconds: number;
+    selectedDates: string[];     // ["24-06-2026"]
+    isPrivate?: boolean;
+  }): Promise<Response> {
+    const payload = {
+      areas: [args.areaId],
+      reasonId: args.reasonId ?? "2",
+      comment: args.comment ?? "",
+      disableHours: "0",
+      bookingComponents: args.bookingComponentIds,
+      startHour: args.startHourSeconds,
+      endHour: args.endHourSeconds,
+      isPrivate: args.isPrivate ?? false,
+      selectedDates: args.selectedDates,
+    };
+    return this.req(
+      `/admin/bookingComponents/config/saveDenyDate?sucursal=${this.env.BRANCH_ID}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Referer": "https://appoint.tuscitasmedicas.com/admin/bookingComponents/config/" + this.env.BRANCH_ID,
+        },
+        body: JSON.stringify(payload),
+      },
+      { absolute: true },
+    );
+  }
+
+  /**
+   * Lista los bloqueos (deny dates) de un componente.
+   * Del HAR: GET /getDenyDatesByComponent
+   */
+  getDenyDatesByComponent(bookingComponentId: string | number): Promise<Response> {
+    return this.req(
+      `/admin/bookingComponents/config/getDenyDatesByComponent?bookingComponentId=${bookingComponentId}&sucursal=${this.env.BRANCH_ID}`,
+      {},
+      { absolute: true },
+    );
+  }
+
+  /**
+   * Quita un bloqueo por id. El body es el id como string JSON crudo.
+   * Del HAR: POST /deleteDenyDates  body: "71472"
+   */
+  deleteDenyDates(denyDateId: string | number): Promise<Response> {
+    return this.req(
+      `/admin/bookingComponents/config/deleteDenyDates?sucursal=${this.env.BRANCH_ID}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Referer": "https://appoint.tuscitasmedicas.com/admin/bookingComponents/config/" + this.env.BRANCH_ID,
+        },
+        body: JSON.stringify(String(denyDateId)),
+      },
+      { absolute: true },
+    );
+  }
 }

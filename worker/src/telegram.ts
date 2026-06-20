@@ -231,7 +231,9 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
       "/semana — resumen 7 días",
       "/stats — estadísticas semanales",
       "/bloquear DD/MM/YYYY HH:MM HH:MM motivo",
-      "/abrir_agenda jueves 8:00-12:20 — abrir cupos (solo doctor)",
+      "/abrir_agenda [perfil] jueves 8:00-12:20 — abrir cupos (solo doctor)",
+      "/cancelar_agenda — borrar agendas + avisar pacientes (solo doctor)",
+      "/bloquear_dia DD/MM/YYYY [HH:MM-HH:MM] — cerrar un día (solo doctor)",
       "",
       "<b>👥 Pacientes</b>",
       "/p &lt;cédula&gt; — lookup directo del paciente",
@@ -364,6 +366,37 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     const { handleAbrirAgenda } = await import("./commands/abrirAgenda");
     const r = await handleAbrirAgenda(env, argsText);
     await sendMessage(env, chatId, r.reply);
+    if (r.needsRenew) await wakeSessionAndNotify(env, chatId);
+    return;
+  }
+
+  // /cancelar_agenda — borrar agendas (calendarios) + avisar pacientes (solo doctores)
+  if (text === "/cancelar_agenda" || text.startsWith("/cancelar_agenda ") ||
+      text.startsWith("/cancelar_agenda@")) {
+    if (!(await isDoctor(env, chatId))) {
+      await sendMessage(env, chatId, "❌ Solo doctores pueden cancelar agenda.");
+      return;
+    }
+    const argsText = text.replace(/^\/cancelar_agenda(@\S+)?/, "").trim();
+    const { handleCancelarAgenda } = await import("./commands/cancelarAgenda");
+    const r = await handleCancelarAgenda(env, argsText);
+    await sendMessage(env, chatId, r.reply);
+    if (r.needsRenew) await wakeSessionAndNotify(env, chatId);
+    return;
+  }
+
+  // /bloquear_dia — cerrar un día/horario (deny date), ambos perfiles (solo doctores)
+  if (text === "/bloquear_dia" || text.startsWith("/bloquear_dia ") ||
+      text.startsWith("/bloquear_dia@")) {
+    if (!(await isDoctor(env, chatId))) {
+      await sendMessage(env, chatId, "❌ Solo doctores pueden bloquear días.");
+      return;
+    }
+    const argsText = text.replace(/^\/bloquear_dia(@\S+)?/, "").trim();
+    const { handleBloquearDia } = await import("./commands/bloquearDia");
+    const r = await handleBloquearDia(env, argsText);
+    await sendMessage(env, chatId, r.reply);
+    if (r.needsRenew) await wakeSessionAndNotify(env, chatId);
     return;
   }
 
@@ -2551,4 +2584,22 @@ function secondsToHHMM(s: number): string {
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   return `${pad2(h)}:${pad2(m)}`;
+}
+
+/**
+ * Cuando un comando de agenda (abrir/cancelar/bloquear) falla por sesión caída
+ * —común en modo bajo-demanda—, despierta la sesión Bukeala (la VM hace login)
+ * y le pide al doctor reintentar en ~1-2 min, sin tener que correr /sesion_renew.
+ */
+async function wakeSessionAndNotify(env: Env, chatId: string): Promise<void> {
+  try {
+    await requestRefresh(env, chatId);
+    await sendMessage(
+      env,
+      chatId,
+      "🔔 Desperté la sesión de Bukeala. Reintenta el comando en <b>~1-2 min</b>.",
+    );
+  } catch (e) {
+    console.log("[wakeSession] requestRefresh falló:", (e as Error).message);
+  }
 }
