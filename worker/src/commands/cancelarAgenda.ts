@@ -135,24 +135,29 @@ async function confirmarCancelacion(
     return { reply: `❌ No encontré la agenda <code>${escapeHtml(calId)}</code>. Lista con /cancelar_agenda.` };
   }
 
-  // 2. Buscar pacientes agendados en ese día (agenda diaria del área)
-  //    El calendario puede cubrir un rango; avisamos a los del día de inicio.
-  //    getAgenda usa DD-MM-YYYY (con guiones).
-  const ddmmyyyy = cal.startFmt; // DD/MM/YY
+  // 2. Buscar pacientes agendados en TODO el rango del calendario y avisarles.
+  //    Un calendario puede cubrir varios días (agenda recurrente); al borrar el
+  //    molde, todos esos días se quedan sin agenda. Recorremos día a día.
+  //    Topes de seguridad para no exceder los límites de subrequests del Worker.
+  const MAX_DAYS = 31;            // no recorrer rangos absurdamente largos
+  const MAX_PATIENTS = 40;        // tope de cancelaciones/avisos por ejecución
+  const days = enumerateDays(cal.startFmt, cal.endFmt, MAX_DAYS);
   let avisados = 0;
   let pacientesInfo: string[] = [];
   let citasNoCanceladas = 0;
+  let truncado = false;
   try {
-    // Convertir DD/MM/YY → DD-MM-YYYY (asumiendo 20YY)
-    const m = ddmmyyyy.match(/^(\d{2})\/(\d{2})\/(\d{2})$/);
-    if (m) {
-      const dashed = `${m[1]}-${m[2]}-20${m[3]}`;
+    for (const d of days) {
+      if (pacientesInfo.length >= MAX_PATIENTS) { truncado = true; break; }
+      const dashed = `${d.dd}-${d.mm}-${d.yyyy}`;      // DD-MM-YYYY
+      const human = `${d.dd}/${d.mm}/${d.yyyy.slice(2)}`; // DD/MM/YY
       const res = await b.getAgenda(dashed, AREA_ID, false);
       const j = await res.json<any>().catch(() => null);
       const bookings: any[] = j?.areas?.[0]?.bookings ?? [];
       const active = bookings.filter((bk) => !bk.isCanceled && bk.stateCode !== "CANCELED" && !bk.isBusyTime);
 
       for (const bk of active) {
+        if (pacientesInfo.length >= MAX_PATIENTS) { truncado = true; break; }
         const name = bk.name ?? "Paciente";
         const phone = extractPhone(bk);
         const time = bk.startHourFormatted ?? "";
@@ -162,7 +167,7 @@ async function confirmarCancelacion(
             await sendText(
               env,
               phone,
-              `Hola ${name.split(" ")[0]}, lamentamos informarle que su cita del ${ddmmyyyy} a las ${time} con el Dr. David Duque debe ser reprogramada. Por favor escríbanos para reagendar. Disculpe el inconveniente.`,
+              `Hola ${name.split(" ")[0]}, lamentamos informarle que su cita del ${human} a las ${time} con el Dr. David Duque debe ser reprogramada. Por favor escríbanos para reagendar. Disculpe el inconveniente.`,
             );
             avisados++;
           } catch { /* fuera de ventana 24h o sin tel */ }
@@ -176,7 +181,7 @@ async function confirmarCancelacion(
         } else {
           citasNoCanceladas++;
         }
-        pacientesInfo.push(`• ${name} ${time}${phone ? " 📞" : ""}`);
+        pacientesInfo.push(`• ${name} ${human} ${time}${phone ? " 📞" : ""}`);
       }
     }
   } catch (e) {
@@ -197,20 +202,53 @@ async function confirmarCancelacion(
   }
 
   // 4. Resumen al doctor
+  const rango = cal.startFmt === cal.endFmt ? cal.startFmt : `${cal.startFmt}→${cal.endFmt}`;
   const lines = [
     `✅ <b>Agenda cancelada</b>`,
-    `🆔 <code>${escapeHtml(calId)}</code> · ${escapeHtml(cal.profile)} · ${escapeHtml(cal.startFmt)}`,
+    `🆔 <code>${escapeHtml(calId)}</code> · ${escapeHtml(cal.profile)} · ${escapeHtml(rango)}`,
     ``,
-    `👥 Pacientes ese día: ${pacientesInfo.length}`,
+    `👥 Pacientes afectados: ${pacientesInfo.length}`,
     `📲 Avisados por WhatsApp: ${avisados}`,
   ];
   if (citasNoCanceladas > 0) {
     lines.push(`⚠️ Citas que debes cancelar manual (sin código): ${citasNoCanceladas}`);
   }
+  if (truncado) {
+    lines.push(`⚠️ Llegué al tope de ${MAX_PATIENTS} pacientes; revisa si quedan más por avisar.`);
+  }
   if (pacientesInfo.length > 0) {
     lines.push(``, ...pacientesInfo.slice(0, 20));
   }
   return { reply: lines.join("\n") };
+}
+
+/**
+ * Enumera los días entre dos fechas "DD/MM/YY" (inclusive), con tope maxDays.
+ * Devuelve partes ya separadas para construir DD-MM-YYYY sin depender de Date
+ * para el formateo (pero sí para iterar). Asume siglo 20YY.
+ */
+function enumerateDays(startFmt: string, endFmt: string, maxDays: number): Array<{ dd: string; mm: string; yyyy: string }> {
+  const parse = (s: string): Date | null => {
+    const m = s.match(/^(\d{2})\/(\d{2})\/(\d{2})$/);
+    if (!m) return null;
+    return new Date(Date.UTC(2000 + parseInt(m[3], 10), parseInt(m[2], 10) - 1, parseInt(m[1], 10)));
+  };
+  const start = parse(startFmt);
+  const end = parse(endFmt) ?? start;
+  if (!start) return [];
+  const out: Array<{ dd: string; mm: string; yyyy: string }> = [];
+  const cur = new Date(start.getTime());
+  const last = (end && end.getTime() >= start.getTime()) ? end : start;
+  for (let i = 0; i < maxDays; i++) {
+    out.push({
+      dd: String(cur.getUTCDate()).padStart(2, "0"),
+      mm: String(cur.getUTCMonth() + 1).padStart(2, "0"),
+      yyyy: String(cur.getUTCFullYear()),
+    });
+    if (cur.getTime() >= last.getTime()) break;
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+  return out;
 }
 
 function extractPhone(bk: any): string {
