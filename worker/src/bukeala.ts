@@ -448,4 +448,121 @@ export class Bukeala {
       }),
     });
   }
+
+  // ---------- Schedule / Disponibilidad (abrir cupos) ----------
+  //
+  // Estos endpoints viven bajo /admin (backoffice), no bajo /keraltyadscritos,
+  // por eso usan { absolute: true }. Capturados del HAR de "crear agenda".
+
+  /**
+   * Valida que la sala/área esté libre en el rango+días antes de crear el
+   * horario. Devuelve {result:{code:"SUCCESS"}} si está OK.
+   */
+  validateRoomAvailability(args: {
+    roomId: number | string;       // 0 = sin sala específica
+    areaId: number;                // 1074 = agenda del Dr.
+    startDateStr: string;          // DD/MM/YYYY
+    endDateStr: string;            // DD/MM/YYYY
+    startSeconds: number;
+    endSeconds: number;
+    daysSelectedStr: string;       // ej "4-" (jueves) — días separados por "-"
+    repeatWeek?: number;
+  }): Promise<Response> {
+    const qs = new URLSearchParams({
+      roomId: String(args.roomId),
+      areaId: String(args.areaId),
+      startDateStr: args.startDateStr,
+      endDateStr: args.endDateStr,
+      startSeconds: String(args.startSeconds),
+      endSeconds: String(args.endSeconds),
+      daysSelectedStr: args.daysSelectedStr,
+      repeatWeek: String(args.repeatWeek ?? 1),
+      sucursal: this.env.BRANCH_ID,
+    });
+    return this.req(
+      `/admin/bookingComponents/config/validateRoomAvailability?${qs}`,
+      {},
+      { absolute: true },
+    );
+  }
+
+  /**
+   * Crea un bloque de horario (abre cupos). El payload es JSON; los valores
+   * por defecto replican el HAR (CIRUGÍA PLÁSTICA, área del Dr., slots 20min).
+   */
+  createSchedule(args: {
+    bookingComponentId: string;       // "1222"
+    componentCode: string;            // "890239-1"
+    daysSelected: string[];           // ["4"] = jueves
+    areaId: string;                   // "1074"
+    startBookingSeconds: number;      // 28800 = 8:00
+    endBookingSeconds: number;        // 33600 = 9:20
+    startDate: string;                // DD/MM/YYYY
+    endDate: string;                  // DD/MM/YYYY
+    intervalSeconds?: number;         // 1200 = 20min
+    repeatWeek?: number;              // 1
+    roomId?: number | string;         // 0 = sin sala
+    allowHolidays?: string;           // "REGULAR"
+  }): Promise<Response> {
+    const interval = args.intervalSeconds ?? 1200;
+    const payload = {
+      bookingComponentId: args.bookingComponentId,
+      componentsCodeSelected: [args.componentCode],
+      daysSelected: args.daysSelected,
+      areasSelected: [{
+        areaId: args.areaId,
+        minBookingSize: 1,
+        maxBookingSize: 1,
+        maxIntervalAvailability: "1",
+        intervalSeconds: interval,
+        marginSeconds: 0,
+        intervalBreakSeconds: interval,
+      }],
+      startBookingSeconds: args.startBookingSeconds,
+      endBookingSeconds: args.endBookingSeconds,
+      repeatWeek: String(args.repeatWeek ?? 1),
+      startDate: args.startDate,
+      endDate: args.endDate,
+      isGlobal: null,
+      isPublic: null,
+      isSpecial: null,
+      isPremium: null,
+      bookingCalendarParametersDto: [{
+        planGroupId: null,
+        isGlobal: true,
+        isPublic: true,
+        isPremium: false,
+        isSpecial: false,
+        hideFromPatient: false,
+      }],
+      bookingComponentsSelected: [{
+        code: args.componentCode,
+        intervalSeconds: interval,
+        intervalBreakSeconds: interval,
+      }],
+      maxIntervalSeconds: String(Math.floor(interval / 60)),
+      groupedBookingCalendar: true,
+      isPresential: "true",
+      roomId: String(args.roomId ?? 0),
+      isSpontaneous: false,
+      releaseHours: "",
+      releaseMinutes: "",
+      allowHolidays: args.allowHolidays ?? "REGULAR",
+      renewalDays: null,
+      renewalEnd: "",
+      planGroupSelected: null,
+    };
+    return this.req(
+      `/admin/bookingComponents/config/createSchedule?sucursal=${this.env.BRANCH_ID}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Referer": "https://appoint.tuscitasmedicas.com/admin/bookingComponents/config/" + this.env.BRANCH_ID,
+        },
+        body: JSON.stringify(payload),
+      },
+      { absolute: true },
+    );
+  }
 }

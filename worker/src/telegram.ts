@@ -231,6 +231,7 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
       "/semana — resumen 7 días",
       "/stats — estadísticas semanales",
       "/bloquear DD/MM/YYYY HH:MM HH:MM motivo",
+      "/abrir_agenda jueves 8:00-12:20 — abrir cupos (solo doctor)",
       "",
       "<b>👥 Pacientes</b>",
       "/p &lt;cédula&gt; — lookup directo del paciente",
@@ -352,6 +353,20 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     const args = text.slice("/bloquear ".length).trim();
     return startBloquear(env, chatId, args);
   }
+  // /abrir_agenda — abrir cupos en Bukeala (solo doctores)
+  if (text === "/abrir_agenda" || text.startsWith("/abrir_agenda ") ||
+      text === "/abrir_agenda@agendadavid_bot" || text.startsWith("/abrir_agenda@")) {
+    if (!(await isDoctor(env, chatId))) {
+      await sendMessage(env, chatId, "❌ Solo doctores pueden abrir agenda.");
+      return;
+    }
+    const argsText = text.replace(/^\/abrir_agenda(@\S+)?/, "").trim();
+    const { handleAbrirAgenda } = await import("./commands/abrirAgenda");
+    const r = await handleAbrirAgenda(env, argsText);
+    await sendMessage(env, chatId, r.reply);
+    return;
+  }
+
   if (text === "/bloquear") {
     return startBloquear(env, chatId, "");
   }
