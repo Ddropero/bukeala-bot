@@ -26,13 +26,21 @@ import { processPendingRequests, loadPendingRequests } from "./claudeBookingAgen
 import { requestRefresh } from "./handlers/nativeHostEvent";
 import { handleHandoffWebhook, setupHandoffWebhook } from "./handoffBot";
 import { handleQuotesWebhook, setupQuotesWebhook } from "./quotesBot";
+import OAuthProvider from "@cloudflare/workers-oauth-provider";
+import { BukealaMcp } from "./mcp/server";
+import { registerMcpAuthRoutes } from "./mcp/authorize";
 
-// Re-export the Durable Object class so wrangler can find it.
+// Re-export the Durable Object classes so wrangler can find them.
 export { BukealaProxy } from "./proxy";
+export { BukealaMcp } from "./mcp/server";
 
 const app = new Hono<{ Bindings: Env }>();
 
 app.get("/", (c) => c.text("Bukeala bot worker — alive"));
+
+// OAuth consent screen para el MCP (GET/POST /authorize). El resto de
+// endpoints OAuth (/token, /register, discovery) los implementa OAuthProvider.
+registerMcpAuthRoutes(app);
 
 // Cookie capture from the browser extension
 app.post("/capture", handleCapture);
@@ -567,8 +575,22 @@ async function keepAlive(env: Env): Promise<void> {
   }
 }
 
+// OAuthProvider envuelve el Worker: protege /mcp (y /sse legacy) con OAuth,
+// implementa /token, /register y los discovery endpoints, y delega todo lo
+// demás (Telegram, WhatsApp, /authorize, etc.) al Hono app vía defaultHandler.
+const oauth = new OAuthProvider({
+  apiHandlers: {
+    "/mcp": BukealaMcp.serve("/mcp"),
+    "/sse": BukealaMcp.serveSSE("/sse"),
+  },
+  defaultHandler: app as unknown as ExportedHandler<Env>,
+  authorizeEndpoint: "/authorize",
+  tokenEndpoint: "/token",
+  clientRegistrationEndpoint: "/register",
+});
+
 export default {
-  fetch: app.fetch,
+  fetch: oauth.fetch.bind(oauth) as ExportedHandler<Env>["fetch"],
   scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     // Dispatch by cron schedule
     if (event.cron === "0 12 * * *") {

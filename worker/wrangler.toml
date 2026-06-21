@@ -50,6 +50,11 @@ id = "854907b4b344415abe9d46b9d62fa744"
 binding = "STATE"
 id = "372dbe91417340d995ac6aa831344898"
 
+# OAuth store del servidor MCP (tokens, grants, clientes registrados).
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "85121aa537d24933b20c6e34a322c4e7"
+
 # Cloudflare Workers AI — usado para transcribir voice notes con Whisper.
 # Modelo: @cf/openai/whisper-large-v3-turbo (mejor para español + médico).
 [ai]
@@ -60,9 +65,19 @@ binding = "AI"
 name = "BUKEALA_PROXY"
 class_name = "BukealaProxy"
 
+# Durable Object del servidor MCP (McpAgent). Ver src/mcp/server.ts.
+[[durable_objects.bindings]]
+name = "MCP_OBJECT"
+class_name = "BukealaMcp"
+
 [[migrations]]
 tag = "v1"
 new_classes = ["BukealaProxy"]
+
+# McpAgent usa almacenamiento SQLite → new_sqlite_classes (no editar v1).
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["BukealaMcp"]
 
 # Secrets — set with `wrangler secret put <NAME>`:
 #   CAPTURE_TOKEN        random 32+ char string, used by the extension
@@ -70,3 +85,4 @@ new_classes = ["BukealaProxy"]
 #   TELEGRAM_BOT_TOKEN   from @BotFather
 #   ALLOWED_CHAT_ID      your numeric Telegram chat id (from @userinfobot)
 #   WEBHOOK_SECRET       random string, used by Telegram → Worker webhook auth
+#   MCP_PASSWORD         contraseña para autorizar el MCP (gate single-user OAuth)

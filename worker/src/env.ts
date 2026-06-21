@@ -1,10 +1,22 @@
+import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+
 export type Env = {
   // KV namespaces
   SESSIONS: KVNamespace;
   STATE: KVNamespace;
+  OAUTH_KV: KVNamespace; // store de OAuthProvider (tokens/grants del MCP)
 
   // Durable Object pinned to enam (us-east) for proxying Bukeala fetches.
   BUKEALA_PROXY: DurableObjectNamespace;
+
+  // Durable Object del servidor MCP (McpAgent). Ver src/mcp/server.ts.
+  MCP_OBJECT: DurableObjectNamespace;
+
+  // Helpers inyectados por OAuthProvider (parseAuthRequest, completeAuthorization…).
+  OAUTH_PROVIDER: OAuthHelpers;
+
+  // Secret: contraseña única para autorizar el MCP (gate single-user).
+  MCP_PASSWORD?: string;
 
   // vars (wrangler.toml)
   BUKEALA_BASE: string; // https://appoint.tuscitasmedicas.com/keraltyadscritos
