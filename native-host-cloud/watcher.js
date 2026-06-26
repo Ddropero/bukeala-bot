@@ -3,9 +3,12 @@
  *
  * Proceso long-running 24/7. Dos responsabilidades:
  *
- *  1. KEEP-ALIVE PROACTIVO: cada PROACTIVE_INTERVAL_MS hace un auto-login
- *     fresco y empuja cookies nuevas al Worker. Como la sesión de Bukeala
- *     expira sola en ~10-15 min, renovar cada ~10 min la mantiene siempre viva.
+ *  1. KEEP-ALIVE PROACTIVO: en horario laboral renueva cada PROACTIVE_INTERVAL_MS
+ *     y empuja cookies nuevas al Worker. La sesión expira en ~10-15 min, así que
+ *     renovar cada ~10 min la mantiene siempre viva. Usa un PERFIL PERSISTENTE
+ *     de Chromium → reutiliza el TGC de CAS → la mayoría de renovaciones son sin
+ *     reCAPTCHA (rápidas y casi gratis). El captcha solo se gasta cuando el TGC
+ *     expira (cada varias horas).
  *
  *  2. ON-DEMAND: cada POLL_INTERVAL_MS consulta /native-host/check-refresh.
  *     Si alguien pidió /sesion_renew por Telegram, hace login inmediato.
@@ -20,9 +23,13 @@
  *   PROACTIVE_INTERVAL_MS   (default 600000 = 10 min)
  */
 const os = require("node:os");
+const path = require("node:path");
 const { runAutoLogin } = require("./autoLogin");
 
 const APP_DIR = os.tmpdir(); // solo para screenshots de error
+// Perfil persistente de Chromium (guarda el TGC de CAS entre corridas → la
+// mayoría de renovaciones no usan captcha). Junto al código = sobrevive reinicios.
+const PROFILE_DIR = process.env.PROFILE_DIR || path.join(__dirname, "chrome-profile");
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
 const PROACTIVE_INTERVAL_MS = parseInt(process.env.PROACTIVE_INTERVAL_MS || "600000", 10);
 
@@ -39,6 +46,7 @@ function cfg() {
     CAPTURE_TOKEN: process.env.CAPTURE_TOKEN,
     WORKER_URL: process.env.WORKER_URL,
     APP_DIR,
+    PROFILE_DIR,
     log,
   };
   const missing = ["CAS_USERNAME", "CAS_PASSWORD", "TWO_CAPTCHA_API_KEY", "CAPTURE_TOKEN", "WORKER_URL"]
@@ -102,8 +110,9 @@ async function doLogin(c, reason) {
     const r = await runAutoLogin(c);
     const durationMs = Date.now() - startedAt;
     if (r.ok) {
-      log("info", "auto-login OK", { cookieCount: r.cookieCount, durationMs, reason });
-      await reportEvent(c, { type: "ok", message: `${r.cookieCount} cookies (cloud, ${reason})`, cookieCount: r.cookieCount, durationMs });
+      const via = r.usedCaptcha ? "captcha" : "TGC";
+      log("info", "auto-login OK", { cookieCount: r.cookieCount, durationMs, reason, via });
+      await reportEvent(c, { type: "ok", message: `${r.cookieCount} cookies (cloud, ${reason}, ${via})`, cookieCount: r.cookieCount, durationMs });
     } else {
       log("error", "auto-login FAIL", { reason: r.reason, durationMs });
       await reportEvent(c, { type: "error", message: `${r.reason} (cloud, ${reason})`, durationMs });
@@ -126,14 +135,15 @@ async function main() {
   // Login inmediato al arrancar (sesión fresca de una)
   await doLogin(c, "startup");
 
-  // MODO BAJO DEMANDA (ahorro de 2Captcha):
-  // Ya NO renovamos cada X minutos en vacío. La sesión se renueva solo cuando:
-  //   a) llega un paciente / cron pide refresh (on-demand), o
-  //   b) UN único login proactivo al inicio del día (7am Bogotá), para que
-  //      el primer paciente de la mañana no espere los ~90s del login.
-  // Esto baja el gasto ~75-80% sin afectar el servicio (los disparadores
-  // reactivos + el watchdog del worker cubren cualquier hueco).
-  let lastMorningLoginDay = -1; // día del mes en que ya hicimos el login de las 7am
+  // ESTRATEGIA (perfil persistente + TGC):
+  // Renovar ya casi no cuesta captcha (el TGC del perfil reusa el SSO). Por eso
+  // volvemos a un KEEP-ALIVE en horario laboral: renovar cada PROACTIVE_INTERVAL_MS
+  // mantiene la sesión SIEMPRE viva → el paciente nunca espera. El captcha solo
+  // se gasta cuando el TGC expira (cada varias horas), no en cada renovación.
+  // Fuera de horario no renovamos (no hay pacientes + Bukeala hace limpieza
+  // nocturna). On-demand sigue como respaldo inmediato.
+  let lastMorningLoginDay = -1;          // día Bogotá del último login matutino
+  let lastProactiveAt = Date.now();      // último keep-alive (el startup cuenta)
 
   while (true) {
     try {
@@ -162,12 +172,21 @@ async function main() {
         }
       }
 
-      // 2. UN solo login proactivo al inicio del día (7am Bogotá). Deja la
-      //    sesión lista para el primer paciente. Después, todo es bajo demanda.
+      // 2. Login matutino (7am Bogotá): primer toque del día. Si el TGC sigue
+      //    vivo será sin captcha; si expiró de noche, aquí se renueva el TGC.
       if (bogotaHour === 7 && lastMorningLoginDay !== bogotaDay) {
-        log("info", "login matutino (7am, 1 vez al día)");
+        log("info", "login matutino (7am)");
         await doLogin(c, "morning");
         lastMorningLoginDay = bogotaDay;
+        lastProactiveAt = Date.now();
+      }
+
+      // 3. KEEP-ALIVE: en horario laboral, renovar cada PROACTIVE_INTERVAL_MS
+      //    para mantener la sesión siempre viva. Barato porque reusa el TGC.
+      if (inBusinessHours && Date.now() - lastProactiveAt >= PROACTIVE_INTERVAL_MS) {
+        log("info", "keep-alive (TGC)");
+        await doLogin(c, "keep-alive");
+        lastProactiveAt = Date.now();
       }
     } catch (e) {
       log("error", "tick failed", { error: e.message });

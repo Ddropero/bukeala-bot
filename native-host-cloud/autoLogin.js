@@ -91,18 +91,36 @@ async function runAutoLogin(env) {
   const creds = { username: CAS_USERNAME, password: CAS_PASSWORD };
   log("info", "credentials from env", { user: creds.username });
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-    ],
-  });
-  const context = await browser.newContext(CONTEXT_OPTIONS);
-  const page = await context.newPage();
+  const USER_DATA_DIR = env.PROFILE_DIR || path.join(process.cwd(), "chrome-profile");
+  const LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+  ];
+
+  // Perfil PERSISTENTE: conserva el TGC (Ticket Granting Cookie) de CAS entre
+  // corridas. Con el TGC vivo, CAS emite una sesión nueva SIN login ni reCAPTCHA
+  // (renovación ~5s, gratis). Solo se hace login completo (captcha) cuando el
+  // TGC expiró. Si el perfil está bloqueado/corrupto, cae a contexto efímero
+  // (= comportamiento de antes: login con captcha). Nunca peor que hoy.
+  let context;
+  let browser = null;
+  try {
+    context = await chromium.launchPersistentContext(USER_DATA_DIR, {
+      headless: true,
+      args: LAUNCH_ARGS,
+      ...CONTEXT_OPTIONS,
+    });
+    log("info", "persistent profile loaded", { dir: USER_DATA_DIR });
+  } catch (e) {
+    log("warn", "persistent context failed → ephemeral fallback", { error: e.message });
+    browser = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
+    context = await browser.newContext(CONTEXT_OPTIONS);
+  }
+  const page = context.pages()[0] || (await context.newPage());
 
   let result = { ok: false };
+  let usedCaptcha = false;
 
   try {
     log("info", "navigating to Bukeala");
@@ -112,7 +130,9 @@ async function runAutoLogin(env) {
     log("info", "after navigation", { url });
 
     if (url.includes("appoint.tuscitasmedicas.com") && !url.includes("/cas/login")) {
-      log("info", "session already alive, skipping login");
+      // Llegamos a Bukeala SIN pasar por el formulario CAS → el TGC del perfil
+      // persistente reusó el SSO. Cero captcha. Esta es la ruta barata/rápida.
+      log("info", "TGC reuse — authenticated without login (no captcha)");
     } else {
       log("info", "at CAS login, filling credentials");
       const userSel = 'input[name="username"], input#username';
@@ -161,6 +181,7 @@ async function runAutoLogin(env) {
           }
         }, token);
         log("info", "reCAPTCHA token injected");
+        usedCaptcha = true;
       } else {
         log("info", "no reCAPTCHA detected, submitting directly");
       }
@@ -230,8 +251,8 @@ async function runAutoLogin(env) {
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(`Worker rejected: ${res.status} ${JSON.stringify(body).slice(0, 200)}`);
 
-    log("info", "session pushed to worker", { status: res.status, cookieCount: filtered.length });
-    result = { ok: true, cookieCount: filtered.length };
+    log("info", "session pushed to worker", { status: res.status, cookieCount: filtered.length, usedCaptcha });
+    result = { ok: true, cookieCount: filtered.length, usedCaptcha };
   } catch (e) {
     log("error", "auto-login failed", { error: e.message });
     try {
@@ -240,7 +261,7 @@ async function runAutoLogin(env) {
     result = { ok: false, reason: e.message };
   } finally {
     await context.close().catch(() => {});
-    await browser.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
   }
 
   return result;
