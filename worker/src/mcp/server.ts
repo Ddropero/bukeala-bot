@@ -17,6 +17,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Env } from "../env";
 import { Bukeala, SessionExpiredError } from "../bukeala";
+import { sendText, sendHelloWorld, normalizeColombianPhone } from "../whatsapp";
 import { requestRefresh } from "../handlers/nativeHostEvent";
 import { handleAbrirAgenda } from "../commands/abrirAgenda";
 import { handleCancelarAgenda } from "../commands/cancelarAgenda";
@@ -139,6 +140,35 @@ export class BukealaMcp extends McpAgent<Env, unknown, Props> {
           if (e instanceof SessionExpiredError) return textResult("Sesión Bukeala caída." + (await maybeWake(true)));
           return textResult(`Error: ${(e as Error).message}`);
         }
+      },
+    );
+
+    // ---- WHATSAPP ----
+
+    this.server.tool(
+      "enviar_whatsapp",
+      "Envía un WhatsApp a un número. Si das 'mensaje' intenta texto libre (solo si hay conversación abierta <24h); si no, o si no das mensaje, envía la plantilla de prueba 'hello_world'.",
+      {
+        numero: z.string().describe("Número del destinatario (ej 573001234567 o 3001234567)"),
+        mensaje: z.string().optional().describe("Texto a enviar (opcional). Si se omite, manda plantilla de prueba."),
+      },
+      async ({ numero, mensaje }) => {
+        const to = normalizeColombianPhone(numero);
+        if (!to || to.length < 10) return textResult(`Número inválido: "${numero}".`);
+        // Con mensaje: intentar texto libre; si falla (fuera de ventana 24h), caer a plantilla.
+        if (mensaje && mensaje.trim()) {
+          const r: any = await sendText(env, to, mensaje.trim());
+          if (r?.ok) return textResult(`✅ Mensaje enviado a ${to}.`);
+          const err = r?.data?.error?.message ?? "fuera de ventana 24h";
+          const hw: any = await sendHelloWorld(env, to);
+          if (hw?.ok) return textResult(`⚠️ No se pudo enviar texto libre (${err}). Envié la plantilla 'hello_world' a ${to} en su lugar.`);
+          return textResult(`❌ No se pudo enviar a ${to}: ${err}`);
+        }
+        // Sin mensaje: plantilla de prueba (funciona siempre).
+        const hw: any = await sendHelloWorld(env, to);
+        if (hw?.ok) return textResult(`✅ Plantilla de prueba 'hello_world' enviada a ${to}.`);
+        const err = hw?.data?.error?.message ?? `HTTP ${hw?.status ?? "?"}`;
+        return textResult(`❌ No se pudo enviar a ${to}: ${err}`);
       },
     );
 
