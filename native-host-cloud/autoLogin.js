@@ -17,6 +17,8 @@
  *   → submit → bind /keraltyadscritos → captura cookies → push al Worker.
  */
 const path = require("node:path");
+const os = require("node:os");
+const fs = require("node:fs");
 const { chromium } = require("playwright-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 
@@ -91,33 +93,28 @@ async function runAutoLogin(env) {
   const creds = { username: CAS_USERNAME, password: CAS_PASSWORD };
   log("info", "credentials from env", { user: creds.username });
 
-  const USER_DATA_DIR = env.PROFILE_DIR || path.join(process.cwd(), "chrome-profile");
+  const STATE_FILE = env.STATE_FILE || path.join(os.tmpdir(), "bukeala-state.json");
   const LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--no-sandbox",
     "--disable-dev-shm-usage",
   ];
 
-  // Perfil PERSISTENTE: conserva el TGC (Ticket Granting Cookie) de CAS entre
-  // corridas. Con el TGC vivo, CAS emite una sesión nueva SIN login ni reCAPTCHA
-  // (renovación ~5s, gratis). Solo se hace login completo (captcha) cuando el
-  // TGC expiró. Si el perfil está bloqueado/corrupto, cae a contexto efímero
-  // (= comportamiento de antes: login con captcha). Nunca peor que hoy.
-  let context;
-  let browser = null;
+  // storageState: guardamos/restauramos TODAS las cookies (incluida CASTGC, que
+  // es cookie de SESIÓN — un perfil normal la descarta al cerrar Chromium). Al
+  // restaurar el TGC, CAS emite una sesión nueva SIN login ni reCAPTCHA (~5s).
+  // Si no hay archivo o el TGC expiró, se hace login completo (captcha) y se
+  // vuelve a guardar. La carpeta /tmp siempre es escribible (evita líos de
+  // permisos). Nunca peor que antes (en el peor caso = captcha como hoy).
+  const browser = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
+  const ctxOptions = { ...CONTEXT_OPTIONS };
+  let restoredState = false;
   try {
-    context = await chromium.launchPersistentContext(USER_DATA_DIR, {
-      headless: true,
-      args: LAUNCH_ARGS,
-      ...CONTEXT_OPTIONS,
-    });
-    log("info", "persistent profile loaded", { dir: USER_DATA_DIR });
-  } catch (e) {
-    log("warn", "persistent context failed → ephemeral fallback", { error: e.message });
-    browser = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
-    context = await browser.newContext(CONTEXT_OPTIONS);
-  }
-  const page = context.pages()[0] || (await context.newPage());
+    if (fs.existsSync(STATE_FILE)) { ctxOptions.storageState = STATE_FILE; restoredState = true; }
+  } catch { /* ignore */ }
+  const context = await browser.newContext(ctxOptions);
+  log("info", restoredState ? "cookies restored (storageState)" : "no prior state (fresh login)", { file: STATE_FILE });
+  const page = await context.newPage();
 
   let result = { ok: false };
   let usedCaptcha = false;
@@ -252,6 +249,13 @@ async function runAutoLogin(env) {
     if (!res.ok) throw new Error(`Worker rejected: ${res.status} ${JSON.stringify(body).slice(0, 200)}`);
 
     log("info", "session pushed to worker", { status: res.status, cookieCount: filtered.length, usedCaptcha });
+    // Persistir cookies (incl. TGC) para que la próxima renovación no use captcha.
+    try {
+      await context.storageState({ path: STATE_FILE });
+      log("info", "storageState saved", { file: STATE_FILE });
+    } catch (e) {
+      log("warn", "storageState save failed", { error: e.message });
+    }
     result = { ok: true, cookieCount: filtered.length, usedCaptcha };
   } catch (e) {
     log("error", "auto-login failed", { error: e.message });

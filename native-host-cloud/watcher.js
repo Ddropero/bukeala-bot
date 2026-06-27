@@ -5,8 +5,8 @@
  *
  *  1. KEEP-ALIVE PROACTIVO: en horario laboral renueva cada PROACTIVE_INTERVAL_MS
  *     y empuja cookies nuevas al Worker. La sesión expira en ~10-15 min, así que
- *     renovar cada ~10 min la mantiene siempre viva. Usa un PERFIL PERSISTENTE
- *     de Chromium → reutiliza el TGC de CAS → la mayoría de renovaciones son sin
+ *     renovar cada ~10 min la mantiene siempre viva. Guarda/restaura cookies con
+ *     storageState (incluido el TGC de CAS) → la mayoría de renovaciones son sin
  *     reCAPTCHA (rápidas y casi gratis). El captcha solo se gasta cuando el TGC
  *     expira (cada varias horas).
  *
@@ -27,9 +27,9 @@ const path = require("node:path");
 const { runAutoLogin } = require("./autoLogin");
 
 const APP_DIR = os.tmpdir(); // solo para screenshots de error
-// Perfil persistente de Chromium (guarda el TGC de CAS entre corridas → la
-// mayoría de renovaciones no usan captcha). Junto al código = sobrevive reinicios.
-const PROFILE_DIR = process.env.PROFILE_DIR || path.join(__dirname, "chrome-profile");
+// Archivo de cookies (storageState). Guarda el TGC de CAS entre renovaciones →
+// la mayoría no usan captcha. /tmp siempre escribible (sin líos de permisos).
+const STATE_FILE = process.env.STATE_FILE || path.join(os.tmpdir(), "bukeala-state.json");
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
 const PROACTIVE_INTERVAL_MS = parseInt(process.env.PROACTIVE_INTERVAL_MS || "600000", 10);
 
@@ -46,7 +46,7 @@ function cfg() {
     CAPTURE_TOKEN: process.env.CAPTURE_TOKEN,
     WORKER_URL: process.env.WORKER_URL,
     APP_DIR,
-    PROFILE_DIR,
+    STATE_FILE,
     log,
   };
   const missing = ["CAS_USERNAME", "CAS_PASSWORD", "TWO_CAPTCHA_API_KEY", "CAPTURE_TOKEN", "WORKER_URL"]
