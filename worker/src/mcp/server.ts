@@ -19,6 +19,7 @@ import type { Env } from "../env";
 import { Bukeala, SessionExpiredError } from "../bukeala";
 import { sendText, sendHelloWorld, normalizeColombianPhone } from "../whatsapp";
 import { requestRefresh } from "../handlers/nativeHostEvent";
+import { loadSession } from "../kv";
 import { handleAbrirAgenda } from "../commands/abrirAgenda";
 import { handleCancelarAgenda } from "../commands/cancelarAgenda";
 import { handleBloquearDia } from "../commands/bloquearDia";
@@ -140,6 +141,52 @@ export class BukealaMcp extends McpAgent<Env, unknown, Props> {
           if (e instanceof SessionExpiredError) return textResult("Sesión Bukeala caída." + (await maybeWake(true)));
           return textResult(`Error: ${(e as Error).message}`);
         }
+      },
+    );
+
+    // ---- SALUD / MONITOR ----
+
+    this.server.tool(
+      "estado_sistema",
+      "Reporte de salud del sistema: estado de la sesión Bukeala, últimas renovaciones (TGC vs captcha), errores recientes y actividad de la VM renovadora.",
+      {},
+      async () => {
+        const lines: string[] = [];
+        const now = Date.now();
+
+        // 1. Sesión Bukeala (frescura de cookies)
+        let s: any = null;
+        try { s = await loadSession(env); } catch { /* ignore */ }
+        if (s && s.capturedAt) {
+          const ageMin = Math.round((now - new Date(s.capturedAt).getTime()) / 60000);
+          lines.push(`🔑 Sesión: cookies presentes, capturadas hace ${ageMin} min ${ageMin <= 16 ? "(fresca ✅)" : "(quizá vencida ⚠️)"}`);
+        } else {
+          lines.push("🔑 Sesión: sin cookies activas (caída) ⚠️");
+        }
+
+        // 2. Actividad de la VM (eventos de renovación)
+        let events: any[] = [];
+        try { const raw = await env.STATE.get("nativeHost:events"); if (raw) events = JSON.parse(raw); } catch { /* ignore */ }
+        if (events.length) {
+          const last = events[events.length - 1];
+          const lastMin = Math.round((now - new Date(last.at).getTime()) / 60000);
+          lines.push(`🖥️ VM: último evento hace ${lastMin} min ${lastMin <= 20 ? "(activa ✅)" : "(¿caída? ⚠️)"}`);
+          lines.push(`   última: ${last.type} — ${last.message ?? ""}`);
+          const recent = events.slice(-12);
+          const tgc = recent.filter((e) => /TGC/.test(e.message ?? "")).length;
+          const cap = recent.filter((e) => /captcha/.test(e.message ?? "")).length;
+          const errs = recent.filter((e) => e.type !== "ok").length;
+          lines.push(`📊 Últimas ${recent.length} renovaciones: TGC ${tgc} · captcha ${cap} · errores ${errs}`);
+          const lastErr = [...recent].reverse().find((e) => e.type !== "ok");
+          if (lastErr) lines.push(`❌ Último error: ${lastErr.at} — ${(lastErr.message ?? "").slice(0, 120)}`);
+        } else {
+          lines.push("🖥️ VM: sin eventos registrados ⚠️");
+        }
+
+        // 3. ¿Refresh pendiente en cola?
+        try { if (await env.STATE.get("nativeHost:refreshRequest")) lines.push("🔄 Hay un refresh on-demand pendiente."); } catch { /* ignore */ }
+
+        return textResult("🩺 Estado del sistema\n\n" + lines.join("\n"));
       },
     );
 
