@@ -57,7 +57,12 @@ export async function handleCapture(c: Context<{ Bindings: Env }>) {
   if (cleaned.length === 0) {
     return c.json({ error: "no relevant cookies" }, 400);
   }
-  console.log(`[capture] ${relevant.length} cookies → ${cleaned.length} tras dedup`);
+  const jsList = cleaned.filter((c) => c.name === "JSESSIONID").map((c) => `${c.domain}${c.path}`);
+  console.log(
+    `[capture] ${relevant.length} cookies → ${cleaned.length} tras dedup | ` +
+    `JSESSIONID: ${jsList.length ? jsList.join(" , ") : "NONE"} | ` +
+    `names: ${cleaned.map((c) => c.name).join(",").slice(0, 350)}`,
+  );
 
   await saveSession(c.env, {
     cookies: cleaned,

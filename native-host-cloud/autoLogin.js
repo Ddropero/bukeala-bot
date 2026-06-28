@@ -31,6 +31,16 @@ const TWO_CAPTCHA_MAX_WAIT_MS = 120 * 1000;
 const BUKEALA_HOME =
   "https://appoint.tuscitasmedicas.com/keraltyadscritos/findAvailability";
 
+// URL de login CAS con el service de Bukeala. Navegar aquí FUERZA el flujo de
+// ticket: con un TGC válido (restaurado vía storageState) CAS emite un service
+// ticket SIN pedir login/captcha → redirige a Bukeala?ticket=ST-... → Bukeala
+// valida y emite un JSESSIONID FRESCO de appoint.tuscitasmedicas.com. Esto es
+// lo que faltaba: navegar directo a BUKEALA_HOME no forzaba el ticket y solo
+// quedaba el JSESSIONID del CAS (inútil para el Worker). Si el TGC expiró, CAS
+// muestra el formulario (y ahí sí se resuelve el reCAPTCHA).
+const CAS_LOGIN_URL =
+  "https://app01.colsanitas.com/cas/login?service=" + encodeURIComponent(BUKEALA_HOME);
+
 const CONTEXT_OPTIONS = {
   viewport: { width: 1366, height: 800 },
   locale: "es-CO",
@@ -120,16 +130,16 @@ async function runAutoLogin(env) {
   let usedCaptcha = false;
 
   try {
-    log("info", "navigating to Bukeala");
-    await page.goto(BUKEALA_HOME, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForTimeout(2000);
+    log("info", "navigating to CAS service-login (forces fresh Bukeala JSESSIONID)");
+    await page.goto(CAS_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForTimeout(2500);
     const url = page.url();
     log("info", "after navigation", { url });
 
     if (url.includes("appoint.tuscitasmedicas.com") && !url.includes("/cas/login")) {
-      // Llegamos a Bukeala SIN pasar por el formulario CAS → el TGC del perfil
-      // persistente reusó el SSO. Cero captcha. Esta es la ruta barata/rápida.
-      log("info", "TGC reuse — authenticated without login (no captcha)");
+      // CAS aceptó el TGC, emitió el ticket y Bukeala ya nos validó →
+      // JSESSIONID FRESCO de Bukeala. Cero captcha. Ruta barata/rápida.
+      log("info", "TGC reuse — service ticket OK, fresh Bukeala session (no captcha)");
     } else {
       log("info", "at CAS login, filling credentials");
       const userSel = 'input[name="username"], input#username';
