@@ -1,31 +1,22 @@
 /**
- * Auto-login flow para la NUBE (Google Cloud VM).
+ * Auto-login flow para la NUBE (Fly.io).
  *
- * Credenciales por env vars (no se cifran en disco; la plataforma ya las
- * protege en reposo).
+ * Diferencia clave vs Windows/Mac: las credenciales NO se cifran en disco.
+ * Vienen directo de variables de entorno (Fly secrets), que ya están
+ * cifradas en reposo por la plataforma. Así no hay master key ni creds.dat.
  *
- * Env requeridas:
- *   CAS_USERNAME, CAS_PASSWORD, TWO_CAPTCHA_API_KEY, CAPTURE_TOKEN, WORKER_URL
- * Opcional: STATE_FILE (default /tmp/bukeala-state.json)
+ * Env vars requeridas:
+ *   CAS_USERNAME          usuario CAS Colsanitas (ej. 80040718.prest)
+ *   CAS_PASSWORD          password CAS
+ *   TWO_CAPTCHA_API_KEY   key de 2Captcha
+ *   CAPTURE_TOKEN         token compartido con el Worker
+ *   WORKER_URL            https://bukeala-bot.ddropero.workers.dev/capture
  *
- * ESTRATEGIA (robusta, descubierta a las malas):
- *   - El objetivo es capturar un JSESSIONID de BUKEALA (appoint.tuscitasmedicas.com
- *     /keraltyadscritos). Un JSESSIONID del CAS (app01.colsanitas.com/cas) NO sirve
- *     — el Worker lo manda al login.
- *   - Restauramos SOLO las cookies del CAS/Colsanitas (incluye el TGC). NO
- *     restauramos las cookies viejas de Bukeala: así la navegación FUERZA a
- *     Bukeala a emitir un JSESSIONID fresco vía el ticket de CAS (con TGC válido,
- *     sin captcha).
- *   - Navegamos a BUKEALA_HOME y dejamos que Bukeala maneje el redirect a CAS con
- *     SU service registrado (no inventamos la URL del service).
- *   - VERIFICAMOS que haya un JSESSIONID de Bukeala. Si no lo hay (TGC expiró o el
- *     SSO no estableció sesión), hacemos un LOGIN COMPLETO LIMPIO (borramos
- *     cookies + formulario + reCAPTCHA). Eso SIEMPRE produce el JSESSIONID de
- *     Bukeala (es lo que funcionaba históricamente). En el peor caso = 1 captcha.
+ * Flow idéntico al de siempre:
+ *   Chromium headless stealth → CAS → user+pass → reCAPTCHA (2Captcha)
+ *   → submit → bind /keraltyadscritos → captura cookies → push al Worker.
  */
 const path = require("node:path");
-const os = require("node:os");
-const fs = require("node:fs");
 const { chromium } = require("playwright-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 
@@ -83,83 +74,9 @@ async function solveRecaptcha(twoCaptchaKey, sitekey, pageUrl, log) {
   throw new Error("2Captcha timeout (>2 min)");
 }
 
-/** ¿El contexto tiene un JSESSIONID de Bukeala (no del CAS)? */
-async function hasBukealaSession(context) {
-  const cks = await context.cookies();
-  return cks.some(
-    (c) => c.name === "JSESSIONID" && (c.domain || "").toLowerCase().includes("tuscitasmedicas"),
-  );
-}
-
-/**
- * Llena el formulario de CAS (usuario+clave+reCAPTCHA) y envía.
- * Asume que la página ya está en /cas/login. Devuelve true si usó captcha.
- */
-async function submitCasForm(page, creds, TWO_CAPTCHA_API_KEY, log) {
-  log("info", "at CAS login, filling credentials");
-  const userSel = 'input[name="username"], input#username';
-  const passSel = 'input[name="password"], input#password';
-  const submitSel = 'button[type="submit"], input[type="submit"], button[name="submit"]';
-
-  await page.waitForSelector(userSel, { timeout: 30_000 });
-  await page.fill(userSel, creds.username);
-  await page.fill(passSel, creds.password);
-
-  let usedCaptcha = false;
-  const sitekey = await page
-    .$eval(".g-recaptcha, [data-sitekey]", (el) => el.getAttribute("data-sitekey"))
-    .catch(() => null);
-
-  if (sitekey) {
-    log("info", "reCAPTCHA detected", { sitekey });
-    const token = await solveRecaptcha(TWO_CAPTCHA_API_KEY, sitekey, page.url(), log);
-    await page.evaluate((t) => {
-      let el = document.getElementById("g-recaptcha-response");
-      if (!el) {
-        el = document.createElement("textarea");
-        el.id = "g-recaptcha-response";
-        el.name = "g-recaptcha-response";
-        el.style.display = "none";
-        document.body.appendChild(el);
-      }
-      el.value = t;
-      el.innerHTML = t;
-      if (typeof window.___grecaptcha_cfg !== "undefined" && window.___grecaptcha_cfg.clients) {
-        const clients = window.___grecaptcha_cfg.clients;
-        for (const cid in clients) {
-          for (const k in clients[cid]) {
-            if (typeof clients[cid][k] === "object") {
-              for (const k2 in clients[cid][k]) {
-                if (
-                  typeof clients[cid][k][k2] === "object" &&
-                  clients[cid][k][k2] &&
-                  typeof clients[cid][k][k2].callback === "function"
-                ) {
-                  try { clients[cid][k][k2].callback(t); } catch {}
-                }
-              }
-            }
-          }
-        }
-      }
-    }, token);
-    log("info", "reCAPTCHA token injected");
-    usedCaptcha = true;
-  } else {
-    log("info", "no reCAPTCHA detected, submitting directly");
-  }
-
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60_000 }),
-    page.click(submitSel),
-  ]);
-  await page.waitForTimeout(2500);
-  return usedCaptcha;
-}
-
 /**
  * @param {object} env  { CAS_USERNAME, CAS_PASSWORD, TWO_CAPTCHA_API_KEY,
- *                        CAPTURE_TOKEN, WORKER_URL, APP_DIR, STATE_FILE, log }
+ *                        CAPTURE_TOKEN, WORKER_URL, APP_DIR, log }
  */
 async function runAutoLogin(env) {
   const {
@@ -172,83 +89,122 @@ async function runAutoLogin(env) {
   if (!CAPTURE_TOKEN || !WORKER_URL) return { ok: false, reason: "CAPTURE_TOKEN/WORKER_URL missing" };
 
   const creds = { username: CAS_USERNAME, password: CAS_PASSWORD };
-  const STATE_FILE = env.STATE_FILE || path.join(os.tmpdir(), "bukeala-state.json");
   log("info", "credentials from env", { user: creds.username });
 
   const browser = await chromium.launch({
     headless: true,
-    args: ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+    args: [
+      "--disable-blink-features=AutomationControlled",
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+    ],
   });
-
-  // Restaurar SOLO cookies del CAS/Colsanitas (TGC). NO las de Bukeala: así
-  // forzamos un JSESSIONID fresco de Bukeala vía el ticket de CAS.
-  const ctxOptions = { ...CONTEXT_OPTIONS };
-  let restoredTgc = false;
-  try {
-    if (fs.existsSync(STATE_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      const casCookies = (raw.cookies || []).filter((c) =>
-        (c.domain || "").toLowerCase().includes("colsanitas.com"));
-      if (casCookies.length) {
-        ctxOptions.storageState = { cookies: casCookies, origins: [] };
-        restoredTgc = true;
-      }
-    }
-  } catch (e) { log("warn", "no se pudo leer STATE_FILE", { error: e.message }); }
-
-  const context = await browser.newContext(ctxOptions);
-  log("info", restoredTgc ? "TGC restaurado (solo CAS)" : "sin TGC previo (login completo)");
+  const context = await browser.newContext(CONTEXT_OPTIONS);
   const page = await context.newPage();
 
   let result = { ok: false };
-  let usedCaptcha = false;
 
   try {
-    // Intento 1: navegar a Bukeala. Si hay TGC válido, CAS auto-emite el ticket
-    // y Bukeala crea JSESSIONID sin captcha. Si no, caemos al formulario.
     log("info", "navigating to Bukeala");
     await page.goto(BUKEALA_HOME, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForTimeout(2500);
-    log("info", "after navigation", { url: page.url() });
+    await page.waitForTimeout(2000);
+    const url = page.url();
+    log("info", "after navigation", { url });
 
-    if (page.url().includes("/cas/login")) {
-      usedCaptcha = await submitCasForm(page, creds, TWO_CAPTCHA_API_KEY, log) || usedCaptcha;
+    if (url.includes("appoint.tuscitasmedicas.com") && !url.includes("/cas/login")) {
+      log("info", "session already alive, skipping login");
     } else {
-      log("info", "TGC reuse — no CAS form shown");
+      log("info", "at CAS login, filling credentials");
+      const userSel = 'input[name="username"], input#username';
+      const passSel = 'input[name="password"], input#password';
+      const submitSel = 'button[type="submit"], input[type="submit"], button[name="submit"]';
+
+      await page.waitForSelector(userSel, { timeout: 30_000 });
+      await page.fill(userSel, creds.username);
+      await page.fill(passSel, creds.password);
+
+      const sitekey = await page
+        .$eval(".g-recaptcha, [data-sitekey]", (el) => el.getAttribute("data-sitekey"))
+        .catch(() => null);
+
+      if (sitekey) {
+        log("info", "reCAPTCHA detected", { sitekey });
+        const token = await solveRecaptcha(TWO_CAPTCHA_API_KEY, sitekey, page.url(), log);
+        await page.evaluate((t) => {
+          let el = document.getElementById("g-recaptcha-response");
+          if (!el) {
+            el = document.createElement("textarea");
+            el.id = "g-recaptcha-response";
+            el.name = "g-recaptcha-response";
+            el.style.display = "none";
+            document.body.appendChild(el);
+          }
+          el.value = t;
+          el.innerHTML = t;
+          if (typeof window.___grecaptcha_cfg !== "undefined" && window.___grecaptcha_cfg.clients) {
+            const clients = window.___grecaptcha_cfg.clients;
+            for (const cid in clients) {
+              for (const k in clients[cid]) {
+                if (typeof clients[cid][k] === "object") {
+                  for (const k2 in clients[cid][k]) {
+                    if (
+                      typeof clients[cid][k][k2] === "object" &&
+                      clients[cid][k][k2] &&
+                      typeof clients[cid][k][k2].callback === "function"
+                    ) {
+                      try { clients[cid][k][k2].callback(t); } catch {}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }, token);
+        log("info", "reCAPTCHA token injected");
+      } else {
+        log("info", "no reCAPTCHA detected, submitting directly");
+      }
+
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60_000 }),
+        page.click(submitSel),
+      ]);
+      await page.waitForTimeout(2500);
+
+      const finalUrl = page.url();
+      log("info", "after submit", { url: finalUrl });
+
+      if (finalUrl.includes("/cas/login") && !finalUrl.includes("ticket=")) {
+        const errorText = await page
+          .locator(".alert-danger, .errors, .login-error")
+          .first().textContent().catch(() => null);
+        throw new Error(`Login failed (still at CAS): ${errorText ?? "unknown"}`);
+      }
     }
 
-    // Asegurar que estamos en /keraltyadscritos (donde vive el JSESSIONID útil).
+    // Bind del JSESSIONID de /keraltyadscritos
     if (!page.url().includes("/keraltyadscritos/")) {
-      await page.goto(BUKEALA_HOME, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
-      await page.waitForTimeout(1500);
-    }
-
-    // VERIFICACIÓN CLAVE: ¿tenemos JSESSIONID de Bukeala? Si no, login limpio.
-    if (!(await hasBukealaSession(context))) {
-      log("warn", "sin JSESSIONID de Bukeala tras intento 1 → login completo limpio");
-      await context.clearCookies();
-      await page.goto(BUKEALA_HOME, { waitUntil: "domcontentloaded", timeout: 60_000 });
-      await page.waitForTimeout(2000);
-      if (page.url().includes("/cas/login")) {
-        usedCaptcha = await submitCasForm(page, creds, TWO_CAPTCHA_API_KEY, log) || usedCaptcha;
-      }
-      if (!page.url().includes("/keraltyadscritos/")) {
-        await page.goto(BUKEALA_HOME, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+      log("info", "post-login en otra app, navegando a /keraltyadscritos");
+      try {
+        await page.goto(BUKEALA_HOME, { waitUntil: "domcontentloaded", timeout: 30_000 });
         await page.waitForTimeout(1500);
-      }
-      if (!(await hasBukealaSession(context))) {
-        throw new Error("No se obtuvo JSESSIONID de Bukeala ni con login completo");
+        log("info", "ahora en", { url: page.url() });
+      } catch (e) {
+        log("warn", "navegación falló (continuo igual)", { error: e.message });
       }
     }
 
-    // Confirmación (no bloqueante)
     try {
       const verifyResp = await page.evaluate(async () => {
-        const r = await fetch("/keraltyadscritos/findCustomer", { credentials: "include", redirect: "manual" });
-        return { status: r.status, type: r.type };
+        const r = await fetch("/keraltyadscritos/findCustomer", {
+          credentials: "include", redirect: "manual",
+        });
+        return { status: r.status, type: r.type, ok: r.ok };
       });
       log("info", "verificación /keraltyadscritos", verifyResp);
-    } catch { /* ignore */ }
+    } catch (e) {
+      log("warn", "verificación falló (no bloqueante)", { error: e.message });
+    }
 
     const cookies = await context.cookies();
     const filtered = cookies.filter((c) => {
@@ -274,17 +230,13 @@ async function runAutoLogin(env) {
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(`Worker rejected: ${res.status} ${JSON.stringify(body).slice(0, 200)}`);
 
-    log("info", "session pushed to worker", { status: res.status, cookieCount: filtered.length, usedCaptcha });
-    // Guardar storageState COMPLETO (incluye TGC) para el próximo reuso.
-    try {
-      await context.storageState({ path: STATE_FILE });
-      log("info", "storageState saved", { file: STATE_FILE });
-    } catch (e) { log("warn", "storageState save failed", { error: e.message }); }
-
-    result = { ok: true, cookieCount: filtered.length, usedCaptcha };
+    log("info", "session pushed to worker", { status: res.status, cookieCount: filtered.length });
+    result = { ok: true, cookieCount: filtered.length };
   } catch (e) {
     log("error", "auto-login failed", { error: e.message });
-    try { if (APP_DIR) await page.screenshot({ path: path.join(APP_DIR, "last-error.png"), fullPage: true }); } catch {}
+    try {
+      if (APP_DIR) await page.screenshot({ path: path.join(APP_DIR, "last-error.png"), fullPage: true });
+    } catch {/* ignore */}
     result = { ok: false, reason: e.message };
   } finally {
     await context.close().catch(() => {});
