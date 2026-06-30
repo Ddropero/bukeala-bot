@@ -279,7 +279,6 @@ function renderHtml(d: RenderInput): string {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="30">
 <title>Dr. Duque · Dashboard</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -324,6 +323,39 @@ function renderHtml(d: RenderInput): string {
   footer { margin-top: 24px; padding-top: 16px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #6b7280; display: flex; gap: 16px; flex-wrap: wrap; }
   footer a { color: #10b981; text-decoration: none; }
   footer a:hover { text-decoration: underline; }
+  /* Pestañas */
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 2px solid #e5e7eb; flex-wrap: wrap; }
+  .tabs button { background: none; border: none; padding: 10px 16px; font-size: 15px; font-weight: 600; color: #6b7280; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -2px; }
+  .tabs button.active { color: #10b981; border-bottom-color: #10b981; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  /* Formato Marly */
+  .marly { background: white; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); max-width: 800px; margin: 0 auto; }
+  .marly-title { text-align: center; font-weight: 700; font-size: 15px; color: #111827; }
+  .marly-sub { text-align: center; font-size: 12px; color: #6b7280; margin-bottom: 14px; }
+  .marly table { width: 100%; border-collapse: collapse; }
+  .marly td { border: 1px solid #d1d5db; padding: 0; vertical-align: top; }
+  .marly td.lbl { background: #f3f4f6; font-size: 11px; font-weight: 600; text-transform: uppercase; color: #374151; padding: 8px; width: 40%; }
+  .marly input, .marly textarea { width: 100%; border: none; padding: 8px; font-size: 14px; font-family: inherit; background: transparent; color: #111827; resize: vertical; }
+  .marly textarea { min-height: 40px; }
+  .marly input:focus, .marly textarea:focus { outline: 2px solid #10b981; outline-offset: -2px; }
+  .marly-note { font-size: 11px; color: #991b1b; margin-top: 12px; font-style: italic; }
+  .marly-actions { display: flex; gap: 10px; margin: 4px 0 16px; flex-wrap: wrap; align-items: center; }
+  .marly-actions button { padding: 12px 18px; border: none; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer; }
+  .btn-print { background: #10b981; color: white; }
+  .btn-clear { background: #f3f4f6; color: #374151; }
+  .saved-hint { font-size: 12px; color: #9ca3af; }
+  /* Impresión: solo el formato Marly, limpio */
+  @media print {
+    body { padding: 0; background: white; }
+    .tabs, header, footer, .no-print { display: none !important; }
+    .tab-panel:not(.active) { display: none !important; }
+    #tab-dashboard { display: none !important; }
+    .marly { box-shadow: none; border-radius: 0; padding: 0; max-width: none; }
+    .marly input, .marly textarea { outline: none !important; }
+    .marly td.lbl { background: #eee !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    @page { size: A4 portrait; margin: 12mm; }
+  }
 </style>
 </head>
 <body>
@@ -332,12 +364,21 @@ function renderHtml(d: RenderInput): string {
     <h1>🩺 Dr. Duque · Dashboard</h1>
     <small>Actualizado ${esc(updatedStr)} · auto-refresh 30s</small>
   </header>
-  ${statusBar}
-  <div class="grid">
-    ${todayCard}
-    ${tomorrowCard}
-    ${contactsCard}
-    ${quotesCard}
+  <div class="tabs">
+    <button data-tab="dashboard" class="active" onclick="showTab('dashboard')">📊 Dashboard</button>
+    <button data-tab="marly" onclick="showTab('marly')">🏥 Programación Marly</button>
+  </div>
+  <div id="tab-dashboard" class="tab-panel active">
+    ${statusBar}
+    <div class="grid">
+      ${todayCard}
+      ${tomorrowCard}
+      ${contactsCard}
+      ${quotesCard}
+    </div>
+  </div>
+  <div id="tab-marly" class="tab-panel">
+    ${marlyTabHtml()}
   </div>
   <footer>
     <span>AREA_ID ${AREA_ID}</span>
@@ -345,8 +386,78 @@ function renderHtml(d: RenderInput): string {
     <a href="/debug/state?token=${encodeURIComponent(d.token)}">🔧 KV state</a>
   </footer>
 </div>
+<script>
+function showTab(t){
+  document.querySelectorAll('.tab-panel').forEach(function(p){ p.classList.toggle('active', p.id==='tab-'+t); });
+  document.querySelectorAll('.tabs button').forEach(function(b){ b.classList.toggle('active', b.dataset.tab===t); });
+  try{ localStorage.setItem('dashTab', t); }catch(e){}
+}
+(function(){
+  try{ var t=localStorage.getItem('dashTab'); if(t) showTab(t); }catch(e){}
+  var MK='marlyForm_v1';
+  var hint=document.getElementById('savedHint');
+  function fields(){ return document.querySelectorAll('#tab-marly [data-f]'); }
+  function save(){ var d={}; fields().forEach(function(el){ d[el.getAttribute('data-f')]=el.value; }); try{ localStorage.setItem(MK, JSON.stringify(d)); if(hint) hint.textContent='Guardado ✓'; }catch(e){} }
+  function load(){ try{ var d=JSON.parse(localStorage.getItem(MK)||'{}'); fields().forEach(function(el){ var k=el.getAttribute('data-f'); if(d[k]!=null) el.value=d[k]; }); }catch(e){} }
+  window.clearMarly=function(){ if(!confirm('¿Limpiar todo el formato?')) return; fields().forEach(function(el){ el.value=''; }); try{ localStorage.removeItem(MK); }catch(e){} if(hint) hint.textContent='Limpiado'; };
+  fields().forEach(function(el){ el.addEventListener('input', save); });
+  load();
+  // Auto-refresh controlado: recarga cada 30s SOLO en Dashboard y si no estás
+  // escribiendo, para no borrar el formulario de Marly.
+  setInterval(function(){
+    var onDash=(localStorage.getItem('dashTab')||'dashboard')==='dashboard';
+    var typing=document.activeElement && ['INPUT','TEXTAREA'].indexOf(document.activeElement.tagName)>=0;
+    if(onDash && !typing) location.reload();
+  }, 30000);
+})();
+</script>
 </body>
 </html>`;
+}
+
+/** Pestaña "Programación Marly": formato llenable + imprimir/guardar PDF. */
+function marlyTabHtml(): string {
+  const fields: Array<[string, string, "text" | "textarea"]> = [
+    ["paciente", "Nombres y apellidos del paciente", "text"],
+    ["identificacion", "Identificación", "text"],
+    ["edad", "Edad en años", "text"],
+    ["telefono", "Teléfono del paciente", "text"],
+    ["asegurador", "Asegurador", "text"],
+    ["autorizacion", "Autorización por asegurador", "text"],
+    ["procedimiento", "Nombre del procedimiento", "textarea"],
+    ["fecha", "Fecha del procedimiento", "text"],
+    ["hora", "Hora del procedimiento", "text"],
+    ["tiempo", "Tiempo quirúrgico", "text"],
+    ["cirujano", "Cirujano tratante", "text"],
+    ["ayudante", "Ayudante especialista o médico", "text"],
+    ["anestesia", "Tipo de anestesia", "text"],
+    ["hospitalizacion", "Hospitalizado vs ambulatorio", "text"],
+    ["insumos", "Insumos especiales y casa comercial", "textarea"],
+    ["equipos", "Equipos especiales y casa comercial", "textarea"],
+    ["uci", "Necesidad de UCI POP", "text"],
+    ["antMetab", "Antecedentes metabólicos", "textarea"],
+    ["antCardio", "Antecedentes cardiovasculares", "textarea"],
+    ["antOtros", "Otros antecedentes importantes", "textarea"],
+    ["sintResp", "Síntomas respiratorios", "textarea"],
+    ["vacuna", "Vacuna (esquema)", "text"],
+  ];
+  const rows = fields.map(([k, label, type]) => {
+    const input = type === "textarea"
+      ? `<textarea data-f="${k}" rows="2"></textarea>`
+      : `<input data-f="${k}" type="text" autocomplete="off">`;
+    return `<tr><td class="lbl">${label}</td><td>${input}</td></tr>`;
+  }).join("");
+  return `<div class="marly">
+    <div class="marly-title">FORMATO DE PROGRAMACIÓN · SALAS DE CIRUGÍA</div>
+    <div class="marly-sub">CLÍNICA DE MARLY S.A.</div>
+    <div class="marly-actions no-print">
+      <button class="btn-print" onclick="window.print()">🖨️ Guardar / Imprimir PDF</button>
+      <button class="btn-clear" onclick="clearMarly()">🗑️ Limpiar</button>
+      <span class="saved-hint" id="savedHint">Se guarda solo en este celular ✓</span>
+    </div>
+    <table><tbody>${rows}</tbody></table>
+    <div class="marly-note">*Recuerde que los insumos y equipos especiales deben ser ingresados exclusivamente mediante cumplimiento de protocolos institucionales; no está autorizado su ingreso por el paciente ni por el especialista.</div>
+  </div>`;
 }
 
 function renderStatusBar(s: SessionInfo, refresh: RefreshRequest | null, pendingWa: number): string {
