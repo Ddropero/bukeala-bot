@@ -173,10 +173,16 @@ export class BukealaMcp extends McpAgent<Env, unknown, Props> {
           lines.push(`🖥️ VM: último evento hace ${lastMin} min ${lastMin <= 20 ? "(activa ✅)" : "(¿caída? ⚠️)"}`);
           lines.push(`   última: ${last.type} — ${last.message ?? ""}`);
           const recent = events.slice(-12);
-          const tgc = recent.filter((e) => /TGC/.test(e.message ?? "")).length;
-          const cap = recent.filter((e) => /captcha/.test(e.message ?? "")).length;
+          const msg = (e: any) => (e.message ?? "");
+          // tgc = reuso real del TGC (sin captcha, sin fallback). captcha = login
+          // limpio (TGC expiró, normal). fallback = el TGC NO dio sesión de Bukeala
+          // y tocó re-loguear (señal del bug; vigilar si crece).
+          const tgc = recent.filter((e) => /\btgc\b/i.test(msg(e)) && !/fallback/i.test(msg(e))).length;
+          const fb = recent.filter((e) => /fallback/i.test(msg(e))).length;
+          const cap = recent.filter((e) => /captcha/i.test(msg(e)) && !/fallback/i.test(msg(e))).length;
           const errs = recent.filter((e) => e.type !== "ok").length;
-          lines.push(`📊 Últimas ${recent.length} renovaciones: TGC ${tgc} · captcha ${cap} · errores ${errs}`);
+          lines.push(`📊 Últimas ${recent.length}: TGC ${tgc} · captcha ${cap} · fallback ${fb} · errores ${errs}`);
+          if (fb > 0) lines.push(`   ⚠️ ${fb} renovación(es) cayeron al fallback (el TGC no dio sesión de Bukeala).`);
           const lastErr = [...recent].reverse().find((e) => e.type !== "ok");
           if (lastErr) lines.push(`❌ Último error: ${lastErr.at} — ${(lastErr.message ?? "").slice(0, 120)}`);
         } else {

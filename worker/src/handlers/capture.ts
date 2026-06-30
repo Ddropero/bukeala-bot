@@ -27,6 +27,12 @@ export async function handleCapture(c: Context<{ Bindings: Env }>) {
       c.domain.includes("tuscitasmedicas.com") ||
       c.domain.includes("colsanitas.com"),
     )
+    // CAUSA RAÍZ del bug histórico: a veces llegan DOS cookies "JSESSIONID" —
+    // la de Bukeala (appoint.tuscitasmedicas.com, la útil) y la del CAS
+    // (app01.colsanitas.com, inútil para el Worker). Si se guarda la del CAS,
+    // cookieHeader no la envía a appoint (filtra por dominio) → 302 al login.
+    // Descartamos SIEMPRE el JSESSIONID de colsanitas: el Worker nunca lo usa.
+    .filter((c) => !(c.name === "JSESSIONID" && c.domain.toLowerCase().includes("colsanitas")))
     .map((c) => ({
       name: c.name,
       value: c.value,
@@ -45,9 +51,17 @@ export async function handleCapture(c: Context<{ Bindings: Env }>) {
     const ex = byName.get(ck.name);
     if (!ex) { byName.set(ck.name, ck); continue; }
     if (ck.name === "JSESSIONID") {
-      const ckK = (ck.path || "").includes("keraltyadscritos");
-      const exK = (ex.path || "").includes("keraltyadscritos");
-      if (ckK && !exK) byName.set(ck.name, ck);
+      // Preferir SIEMPRE el de dominio Bukeala (tuscitasmedicas); el del CAS ya
+      // se filtró arriba, pero por si acaso. Empate de dominio → preferir path
+      // /keraltyadscritos (el servlet de las consultas).
+      const ckBuk = (ck.domain || "").toLowerCase().includes("tuscitasmedicas");
+      const exBuk = (ex.domain || "").toLowerCase().includes("tuscitasmedicas");
+      if (ckBuk && !exBuk) { byName.set(ck.name, ck); }
+      else if (ckBuk === exBuk) {
+        const ckK = (ck.path || "").includes("keraltyadscritos");
+        const exK = (ex.path || "").includes("keraltyadscritos");
+        if (ckK && !exK) byName.set(ck.name, ck);
+      }
     } else {
       byName.set(ck.name, ck); // última gana
     }

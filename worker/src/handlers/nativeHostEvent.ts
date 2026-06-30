@@ -26,6 +26,12 @@ interface NativeHostEvent {
   message?: string;
   cookieCount?: number;
   durationMs?: number;
+  // Diagnóstico estructurado del autoLogin de la VM (la VM no logea a journald,
+  // este es el único canal remoto para saber cómo renovó la sesión).
+  via?: string;              // "tgc" | "captcha" | "captcha-fallback"
+  fellBack?: boolean;        // true si el TGC no dio sesión y tocó re-loguear
+  hadBukealaJsession?: boolean;
+  postNavUrl?: string;       // URL tras la 1ª navegación (para diagnosticar)
 }
 
 export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
@@ -47,6 +53,10 @@ export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
     message: body.message,
     cookieCount: body.cookieCount,
     durationMs: body.durationMs,
+    via: body.via,
+    fellBack: body.fellBack,
+    hadBukealaJsession: body.hadBukealaJsession,
+    postNavUrl: body.postNavUrl,
   };
 
   // Append to rolling log

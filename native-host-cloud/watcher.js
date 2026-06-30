@@ -29,7 +29,9 @@ const { runAutoLogin } = require("./autoLogin");
 const APP_DIR = os.tmpdir(); // solo para screenshots de error
 // Archivo de cookies (storageState). Guarda el TGC de CAS entre renovaciones →
 // la mayoría no usan captcha. /tmp siempre escribible (sin líos de permisos).
-const STATE_FILE = process.env.STATE_FILE || path.join(os.tmpdir(), "bukeala-state.json");
+// Solo guarda la cookie TGC (no el estado completo). Nombre nuevo a propósito:
+// ignora cualquier bukeala-state.json viejo (estado completo que envenenaba).
+const STATE_FILE = process.env.STATE_FILE || path.join(os.tmpdir(), "bukeala-tgc.json");
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
 const PROACTIVE_INTERVAL_MS = parseInt(process.env.PROACTIVE_INTERVAL_MS || "600000", 10);
 
@@ -102,7 +104,7 @@ async function reportEvent(c, event) {
 let loginInFlight = false;
 
 async function doLogin(c, reason) {
-  if (loginInFlight) { log("info", "login already in flight, skip", { reason }); return; }
+  if (loginInFlight) { log("info", "login already in flight, skip", { reason }); return "skipped"; }
   loginInFlight = true;
   const startedAt = Date.now();
   try {
@@ -110,12 +112,21 @@ async function doLogin(c, reason) {
     const r = await runAutoLogin(c);
     const durationMs = Date.now() - startedAt;
     if (r.ok) {
-      const via = r.usedCaptcha ? "captcha" : "TGC";
-      log("info", "auto-login OK", { cookieCount: r.cookieCount, durationMs, reason, via });
-      await reportEvent(c, { type: "ok", message: `${r.cookieCount} cookies (cloud, ${reason}, ${via})`, cookieCount: r.cookieCount, durationMs });
+      // via real reportado por autoLogin: tgc | captcha | captcha-fallback
+      const via = r.via || (r.usedCaptcha ? "captcha" : "tgc");
+      const tag = via + (r.fellBack ? "+fallback" : "");
+      log("info", "auto-login OK", { cookieCount: r.cookieCount, durationMs, reason, via, fellBack: r.fellBack, url: r.postNavUrl });
+      await reportEvent(c, {
+        type: "ok", message: `${r.cookieCount} cookies (cloud, ${reason}, ${tag})`,
+        cookieCount: r.cookieCount, durationMs,
+        via, fellBack: !!r.fellBack, hadBukealaJsession: !!r.hadBukealaJsession, postNavUrl: r.postNavUrl,
+      });
     } else {
-      log("error", "auto-login FAIL", { reason: r.reason, durationMs });
-      await reportEvent(c, { type: "error", message: `${r.reason} (cloud, ${reason})`, durationMs });
+      log("error", "auto-login FAIL", { reason: r.reason, durationMs, via: r.via, url: r.postNavUrl });
+      await reportEvent(c, {
+        type: "error", message: `${r.reason} (cloud, ${reason}, via=${r.via || "?"})`,
+        durationMs, via: r.via, fellBack: !!r.fellBack, hadBukealaJsession: !!r.hadBukealaJsession, postNavUrl: r.postNavUrl,
+      });
     }
     return r.ok;
   } finally {
@@ -153,8 +164,9 @@ async function main() {
       const req = await checkForRefreshRequest(c);
       if (req) {
         log("info", "refresh requested", { by: String(req.requestedBy || ""), at: req.requestedAt });
-        const ok = await doLogin(c, "on-demand");
-        await reportComplete(c, ok, ok ? "cloud login OK" : "cloud login failed");
+        const r = await doLogin(c, "on-demand");
+        // "skipped" = ya había un login en curso (no es un fallo) → no reportar error.
+        if (r !== "skipped") await reportComplete(c, !!r, r ? "cloud login OK" : "cloud login failed");
       }
 
       // 2. KEEP-ALIVE 24/7: renovar cada PROACTIVE_INTERVAL_MS a cualquier hora
