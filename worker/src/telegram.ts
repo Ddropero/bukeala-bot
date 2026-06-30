@@ -710,6 +710,25 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     return;
   }
 
+  // /wa_templates — lista las plantillas de la WABA que usa el envío (con su
+  // código de idioma RAW) para diagnosticar el 132001.
+  if (text === "/wa_templates") {
+    const { listTemplates } = await import("./handlers/waTemplates");
+    const { waba, templates, debug } = await listTemplates(env);
+    if (!waba) {
+      await sendMessage(env, chatId, `❌ No pude derivar el WABA del envío.\n<code>${escapeHtmlLocal(JSON.stringify(debug).slice(0, 600))}</code>`);
+      return;
+    }
+    const lines = templates.map((t) => `• <b>${t.name}</b> | idioma <code>${t.language}</code> | ${t.status}`);
+    await sendMessage(
+      env, chatId,
+      `📋 <b>WABA del envío:</b> <code>${waba}</code>\n` +
+      `(WA_PHONE_ID: <code>${env.WA_PHONE_ID}</code>)\n\n` +
+      (lines.length ? lines.join("\n") : "⚠️ Esta WABA NO tiene plantillas — están en otra WABA (causa del 132001)."),
+    );
+    return;
+  }
+
   // /wa_confirmar <num> | <nombre> | <fecha> | <hora> | <lugar>  (prueba de confirmación)
   if (text.startsWith("/wa_confirmar ")) {
     const rest = text.slice("/wa_confirmar ".length).trim();

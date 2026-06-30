@@ -215,19 +215,28 @@ export async function sendAppointmentConfirmation(
     console.log("[whatsapp] confirmation skipped: invalid phone", patientPhoneRaw);
     return { ok: false, reason: "invalid_phone" };
   }
+  // FIX (132001 / WABA mismatch): las plantillas confirmar_cita/appointment_reminder
+  // viven en una WABA distinta a la del número que envía (WA_PHONE_ID), así que
+  // Meta no las encuentra → 132001. Como la confirmación se manda JUSTO cuando el
+  // paciente acaba de agendar (escribió → ventana de 24h ABIERTA), enviamos TEXTO
+  // LIBRE, que no depende de plantillas y funciona de inmediato.
+  const body =
+    `✅ Hola ${patientName}, tu cita con el Dr. David Duque quedó agendada:\n\n` +
+    `📅 ${dateText}\n⏰ ${timeText}\n📍 ${place}\n\n` +
+    `Si necesitas reprogramar, escríbenos por aquí. ¡Te esperamos!`;
+  const txt = await sendText(env, to, body);
+  if (txt.ok) return txt;
+  // Fuera de la ventana 24h el texto libre falla → intentamos plantilla (sirve
+  // solo si existe en la WABA del número; hoy falla, pero queda listo para cuando
+  // se creen las plantillas en la WABA correcta).
+  console.log("[whatsapp] confirmación texto libre falló (¿fuera de 24h?), intento plantilla:", JSON.stringify((txt as any).data?.error ?? txt).slice(0, 160));
   const params: Array<{ type: "text"; text: string }> = [
     { type: "text", text: patientName },
     { type: "text", text: dateText },
     { type: "text", text: timeText },
     { type: "text", text: place },
   ];
-  // FIX (132001): "appointment_confirmation_v2" NO existe en Meta. Usamos las
-  // plantillas que SÍ están aprobadas en el WABA: confirmar_cita → fallback
-  // appointment_reminder. Ambas son es, 4 variables (name/date/time/place).
-  const r = await sendTemplate(env, to, "confirmar_cita", "es", params);
-  if (r.ok) return r;
-  console.log("[whatsapp] confirmar_cita falló, fallback appointment_reminder:", JSON.stringify((r as any).data?.error ?? r).slice(0, 200));
-  return sendTemplate(env, to, "appointment_reminder", "es", params);
+  return sendTemplate(env, to, "confirmar_cita", "es", params);
 }
 
 /**

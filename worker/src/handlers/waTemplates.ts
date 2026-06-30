@@ -48,16 +48,30 @@ async function getWabaId(env: Env, override?: string): Promise<{ id: string | nu
   return { id: null, debug };
 }
 
-export async function handleListTemplates(c: Context<{ Bindings: Env }>) {
-  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) return c.json({ error: "unauthorized" }, 401);
-  const { id: waba, debug } = await getWabaId(c.env, c.req.query("waba"));
-  if (!waba) return c.json({ error: "no se pudo derivar WABA id", debug }, 500);
+/**
+ * Lista las plantillas desde Meta. Reusable por el endpoint HTTP y por el
+ * comando de Telegram /wa_templates. Devuelve el WABA usado + las plantillas
+ * con su CÓDIGO DE IDIOMA real (clave para diagnosticar el 132001).
+ */
+export async function listTemplates(
+  env: Env,
+  override?: string,
+): Promise<{ waba: string | null; templates: Array<{ name: string; status: string; language: string; category?: string }>; debug: any }> {
+  const { id: waba, debug } = await getWabaId(env, override);
+  if (!waba) return { waba: null, templates: [], debug };
   const res = await fetch(
-    `https://graph.facebook.com/${API_VERSION}/${waba}/message_templates?fields=name,status,category,language&limit=100&access_token=${encodeURIComponent(c.env.WA_TOKEN)}`,
+    `https://graph.facebook.com/${API_VERSION}/${waba}/message_templates?fields=name,status,category,language&limit=100&access_token=${encodeURIComponent(env.WA_TOKEN)}`,
   );
   const data = await res.json<any>().catch(() => ({}));
-  const list = (data?.data ?? []).map((t: any) => ({ name: t.name, status: t.status, category: t.category, language: t.language }));
-  return c.json({ waba, count: list.length, templates: list });
+  const templates = (data?.data ?? []).map((t: any) => ({ name: t.name, status: t.status, category: t.category, language: t.language }));
+  return { waba, templates, debug };
+}
+
+export async function handleListTemplates(c: Context<{ Bindings: Env }>) {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) return c.json({ error: "unauthorized" }, 401);
+  const { waba, templates, debug } = await listTemplates(c.env, c.req.query("waba"));
+  if (!waba) return c.json({ error: "no se pudo derivar WABA id", debug }, 500);
+  return c.json({ waba, count: templates.length, templates });
 }
 
 /** Definiciones de las plantillas que queremos asegurar que existan. */
