@@ -710,6 +710,20 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     return;
   }
 
+  // /wa_confirmar <num> | <nombre> | <fecha> | <hora> | <lugar>  (prueba de confirmación)
+  if (text.startsWith("/wa_confirmar ")) {
+    const rest = text.slice("/wa_confirmar ".length).trim();
+    const parts = rest.split("|").map((s) => s.trim());
+    if (parts.length < 5) {
+      await sendMessage(env, chatId, "Uso: <code>/wa_confirmar &lt;num&gt; | &lt;nombre&gt; | &lt;fecha&gt; | &lt;hora&gt; | &lt;lugar&gt;</code>\n\nEj: <code>/wa_confirmar 573204933887 | David | Lunes 07/07 | 9:00 AM | Calle 80 #10-43</code>");
+      return;
+    }
+    const [num, name, date, time, place] = parts;
+    const r = await sendAppointmentConfirmation(env, num, name, date, time, place);
+    await sendMessage(env, chatId, r.ok ? `✅ Confirmación enviada a <code>${normalizeColombianPhone(num)}</code>` : `❌ Error: ${escapeHtmlLocal(r.data?.error?.message ?? r.reason ?? "unknown")}`);
+    return;
+  }
+
   // /wa_postcirugia <num> | <nombre> | <dias>
   if (text.startsWith("/wa_postcirugia ")) {
     const rest = text.slice("/wa_postcirugia ".length).trim();

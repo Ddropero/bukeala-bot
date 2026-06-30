@@ -215,12 +215,19 @@ export async function sendAppointmentConfirmation(
     console.log("[whatsapp] confirmation skipped: invalid phone", patientPhoneRaw);
     return { ok: false, reason: "invalid_phone" };
   }
-  return sendTemplate(env, to, "appointment_confirmation_v2", "es", [
+  const params: Array<{ type: "text"; text: string }> = [
     { type: "text", text: patientName },
     { type: "text", text: dateText },
     { type: "text", text: timeText },
     { type: "text", text: place },
-  ]);
+  ];
+  // FIX (132001): "appointment_confirmation_v2" NO existe en Meta. Usamos las
+  // plantillas que SÍ están aprobadas en el WABA: confirmar_cita → fallback
+  // appointment_reminder. Ambas son es, 4 variables (name/date/time/place).
+  const r = await sendTemplate(env, to, "confirmar_cita", "es", params);
+  if (r.ok) return r;
+  console.log("[whatsapp] confirmar_cita falló, fallback appointment_reminder:", JSON.stringify((r as any).data?.error ?? r).slice(0, 200));
+  return sendTemplate(env, to, "appointment_reminder", "es", params);
 }
 
 /**
