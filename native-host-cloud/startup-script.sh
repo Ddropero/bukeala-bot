@@ -487,7 +487,10 @@ async function main() {
   // NOTA: de noche Bukeala puede hacer mantenimiento e invalidar la sesión; en
   // ese caso algunas renovaciones nocturnas pueden fallar/usar captcha. Es un
   // experimento — vigilar con el tool MCP estado_sistema.
-  let lastProactiveAt = Date.now();      // último keep-alive (el startup cuenta)
+  let lastProactiveAt = Date.now();   // último keep-alive EXITOSO (el startup cuenta)
+  let lastAttemptAt = Date.now();     // último INTENTO (éxito o fallo)
+  let renewFailing = false;           // true si el último intento falló → reintentar pronto
+  const RETRY_DELAY_MS = 90 * 1000;   // tras un fallo, reintentar en 90s (no esperar el intervalo)
 
   while (true) {
     try {
@@ -499,14 +502,21 @@ async function main() {
         const r = await doLogin(c, "on-demand");
         // "skipped" = ya había un login en curso (no es un fallo) → no reportar error.
         if (r !== "skipped") await reportComplete(c, !!r, r ? "cloud login OK" : "cloud login failed");
+        if (r === true) { lastProactiveAt = Date.now(); lastAttemptAt = Date.now(); renewFailing = false; }
       }
 
-      // 2. KEEP-ALIVE 24/7: renovar cada PROACTIVE_INTERVAL_MS a cualquier hora
-      //    para mantener la sesión siempre viva. Barato porque reusa el TGC.
-      if (Date.now() - lastProactiveAt >= PROACTIVE_INTERVAL_MS) {
-        log("info", "keep-alive (TGC)");
-        await doLogin(c, "keep-alive");
-        lastProactiveAt = Date.now();
+      // 2. KEEP-ALIVE 24/7 con REINTENTO tras fallo: renovar cada
+      //    PROACTIVE_INTERVAL_MS; pero si el último intento falló (timeout de
+      //    2Captcha, "fetch failed", etc.), reintentar a los RETRY_DELAY_MS en
+      //    vez de esperar el intervalo completo → evita huecos largos de agenda.
+      const intervalDue = Date.now() - lastProactiveAt >= PROACTIVE_INTERVAL_MS;
+      const retryDue = renewFailing && (Date.now() - lastAttemptAt >= RETRY_DELAY_MS);
+      if (intervalDue || retryDue) {
+        log("info", retryDue ? "keep-alive (reintento tras fallo)" : "keep-alive");
+        const res = await doLogin(c, "keep-alive");
+        lastAttemptAt = Date.now();
+        if (res === true) { lastProactiveAt = Date.now(); renewFailing = false; }
+        else if (res === false) { renewFailing = true; } // reintenta en 90s
       }
     } catch (e) {
       log("error", "tick failed", { error: e.message });
