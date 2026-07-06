@@ -763,16 +763,20 @@ async function toolFindSlots(
 
     await (await b.selectCustomer(foundType, cedula)).text();
 
-    // 2) Component (cache global por 7 días — Dr. Duque tiene 1 sola especialidad)
-    let component: { id: number; code: string; name: string } | null = null;
-    const cachedComp = await env.STATE.get("bukeala:firstComponent");
-    if (cachedComp) {
-      try { component = JSON.parse(cachedComp); } catch { /* ignore */ }
+    // 2) Componentes (cache global 7 días de la LISTA completa — ya NO solo
+    // el primero). El Dr. Duque tiene DOS especialidades activas (Niños y
+    // Adolescentes / Adultos); cuál tiene cupos ABIERTOS cambia con el
+    // tiempo, así que hay que probar cada una y ofrecer la que SÍ tenga
+    // agenda — nunca asumir que la primera que devuelve la API es la vigente.
+    let components: Array<{ id: number; code: string; name: string }> = [];
+    const cachedComps = await env.STATE.get("bukeala:components");
+    if (cachedComps) {
+      try { components = JSON.parse(cachedComps); } catch { /* ignore */ }
     }
-    if (!component) {
+    if (components.length === 0) {
       const cRes = await b.loadComponents();
       const cJson = await cRes.json<any>().catch(() => []);
-      const components = Array.isArray(cJson)
+      components = Array.isArray(cJson)
         ? cJson
             .map((x: any) => ({
               id: Number(x.id ?? 0),
@@ -784,47 +788,63 @@ async function toolFindSlots(
       if (components.length === 0) {
         return { output: { error: "no_components", message: "No hay especialidades disponibles para este paciente" } };
       }
-      component = components[0];
-      await env.STATE.put("bukeala:firstComponent", JSON.stringify(component), {
+      await env.STATE.put("bukeala:components", JSON.stringify(components), {
         expirationTtl: 60 * 60 * 24 * 7,
       });
     }
 
-    // 3) Warmup secuencial OBLIGATORIO: changeUserType primero (setea contexto
-    // de plan en la sesión Java). Después los otros 3 en PARALELO (no
-    // dependen entre ellos, ahorra ~1.5-2.5s vs secuencial).
+    // changeUserType UNA sola vez: setea el contexto de plan en la sesión
+    // Java, no depende del componente.
     try {
       await (await b.changeUserTypeSelected("309", "")).text();
-      await Promise.all([
-        b.loadBranches("", [component.code]).then((r) => r.text()),
-        b.getAvailablePlans().then((r) => r.text()),
-        b.loadAreaHints(component.code).then((r) => r.text()),
-      ]);
+      await (await b.getAvailablePlans()).text();
     } catch (e) {
       console.log("[agent] warmup error (ignored):", (e as Error).message);
     }
-    // doPage SECUENCIAL antes de doSearch (doSearch lee contexto que doPage setea)
-    await (await b.findAvailabilityDoPage({
-      componentCodes: [component.code],
-      startDateStr: date,
-    })).text();
 
-    // 4) Search
-    const searchRes = await b.doSearch({ startDateStr: date, componentCodes: [component.code] });
-    const searchJson = await searchRes.json<any>().catch(() => null);
     const year = (() => {
       const m = date.match(/\/(\d{4})$/);
       return m ? Number(m[1]) : new Date().getFullYear();
     })();
-    const slots = parseSlots(searchJson, { componentCode: component.code, year });
 
-    if (slots.length === 0) {
-      const next = searchJson?.nextDayForSearchFormatted as string | undefined;
+    // 3) Probar cada componente hasta encontrar uno con cupos ABIERTOS para
+    // la fecha pedida — se ofrece el primero que tenga disponibilidad real.
+    let component: { id: number; code: string; name: string } | null = null;
+    let slots: Slot[] = [];
+    let lastSearchJson: any = null;
+    for (const cand of components) {
+      try {
+        await Promise.all([
+          b.loadBranches("", [cand.code]).then((r) => r.text()),
+          b.loadAreaHints(cand.code).then((r) => r.text()),
+        ]);
+        // doPage SECUENCIAL antes de doSearch (doSearch lee contexto que doPage setea)
+        await (await b.findAvailabilityDoPage({
+          componentCodes: [cand.code],
+          startDateStr: date,
+        })).text();
+        const searchRes = await b.doSearch({ startDateStr: date, componentCodes: [cand.code] });
+        const searchJson = await searchRes.json<any>().catch(() => null);
+        lastSearchJson = searchJson;
+        const candSlots = parseSlots(searchJson, { componentCode: cand.code, year });
+        if (candSlots.length > 0) {
+          component = cand;
+          slots = candSlots;
+          break;
+        }
+      } catch (e) {
+        if (e instanceof SessionExpiredError) throw e;
+        console.log(`[agent] búsqueda falló para "${cand.name}" (continúo con el siguiente):`, (e as Error).message);
+      }
+    }
+
+    if (!component || slots.length === 0) {
+      const next = lastSearchJson?.nextDayForSearchFormatted as string | undefined;
       return {
         output: {
           slots: [],
-          message: searchJson?.emptyMessage
-            ? String(searchJson.emptyMessage).replace(/<[^>]+>/g, "")
+          message: lastSearchJson?.emptyMessage
+            ? String(lastSearchJson.emptyMessage).replace(/<[^>]+>/g, "")
             : "Sin slots en la fecha pedida",
           next_date_suggestion: next ?? null,
         },
