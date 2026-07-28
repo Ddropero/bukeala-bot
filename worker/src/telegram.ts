@@ -275,7 +275,7 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
         "/add_user &lt;chatId&gt; &lt;doctor|secretary&gt; &lt;nombre&gt;",
         "/remove_user &lt;chatId&gt;",
         "/doctor — cambiar doctor activo",
-        "/sesion — estado sesión Bukeala",
+        "/estado — ¿Bukeala en línea? (ping real + captchas hoy + cola)",
         "/sesion_stats — estadísticas Native Host",
       );
     }
@@ -290,17 +290,63 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     return;
   }
 
-  if (text === "/sesion") {
+  if (text === "/sesion" || text === "/estado") {
     const s = await loadSession(env);
     if (!s) {
-      await sendMessage(env, chatId, "🔴 Sin sesión. Captura una con la extensión.");
-    } else {
-      await sendMessage(
-        env,
-        chatId,
-        `🟢 Sesión activa.\nCapturada: ${s.capturedAt}\nCookies: ${s.cookies.length}`,
-      );
+      await sendMessage(env, chatId, "🔴 <b>Sin sesión en KV.</b>\nCorre /sesion_renew o captura con la extensión.");
+      return;
     }
+    const ageMin = Math.round((Date.now() - new Date(s.capturedAt).getTime()) / 60000);
+
+    // Verificación EN VIVO: ping real a Bukeala. Antes este comando solo
+    // miraba si el blob existía en KV (TTL 12h) — podía decir 🟢 con la
+    // sesión muerta hace horas.
+    let alive = false;
+    let pingNote = "";
+    try {
+      const b = new Bukeala(env);
+      const r = await b.findCustomerPage();
+      await r.text();
+      alive = true;
+      pingNote = `HTTP ${r.status}`;
+    } catch (e) {
+      alive = false;
+      pingNote = e instanceof SessionExpiredError
+        ? "sesión rechazada (redirect a login)"
+        : `error: ${(e as Error).message.slice(0, 60)}`;
+    }
+
+    // Contexto operativo: último evento de la VM, gasto de captcha hoy, cola
+    const events = await getNativeHostEvents(env);
+    const last = events[events.length - 1];
+    let vmLine = "VM: sin eventos reportados";
+    if (last) {
+      const agoMin = Math.round((Date.now() - new Date(last.at).getTime()) / 60000);
+      const via = last.via ? ` vía ${last.via}${last.tgcSource === "worker" ? " (TGC rescatado del Worker)" : ""}` : "";
+      vmLine = `VM: ${last.type === "ok" ? "✅ renovó" : "❌ falló"} hace ${agoMin} min${via}`;
+    }
+    const day = new Date().toISOString().slice(0, 10);
+    const [tgcC, capC, fallC, errC, pendingRaw] = await Promise.all([
+      env.STATE.get(`stats:renew:${day}:ok:tgc`),
+      env.STATE.get(`stats:renew:${day}:ok:captcha`),
+      env.STATE.get(`stats:renew:${day}:ok:captcha-fallback`),
+      env.STATE.get(`stats:renew:${day}:error`),
+      env.STATE.get("wa:pending:list"),
+    ]);
+    let pendingCount = 0;
+    try { pendingCount = pendingRaw ? (JSON.parse(pendingRaw) as unknown[]).length : 0; } catch { /* ignore */ }
+    const captchasHoy = (parseInt(capC ?? "0", 10) || 0) + (parseInt(fallC ?? "0", 10) || 0);
+
+    const lines = [
+      alive ? "🟢 <b>Bukeala EN LÍNEA</b> (ping real OK)" : "🔴 <b>Bukeala CAÍDA</b>",
+      `Ping: ${pingNote}`,
+      `Sesión: capturada hace ${ageMin} min · ${s.cookies.length} cookies`,
+      vmLine,
+      `Hoy: ${parseInt(tgcC ?? "0", 10) || 0} renovaciones sin captcha · ${captchasHoy} con captcha · ${parseInt(errC ?? "0", 10) || 0} errores`,
+      pendingCount > 0 ? `⏳ Cola: ${pendingCount} paciente(s) esperando` : "Cola: vacía",
+    ];
+    if (!alive) lines.push("", "Para renovar ya: /sesion_renew");
+    await sendMessage(env, chatId, lines.join("\n"));
     return;
   }
 
