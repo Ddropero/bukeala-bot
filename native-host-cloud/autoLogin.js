@@ -200,12 +200,58 @@ async function saveTgc(context, STATE_FILE, log) {
 }
 
 function loadTgc(STATE_FILE) {
+  // Busca el TGC en el archivo configurado y, si no está, en la ruta legacy
+  // de /tmp (versiones viejas lo guardaban ahí y un reboot lo borraba).
+  const candidates = [STATE_FILE, path.join(os.tmpdir(), "bukeala-tgc.json")];
+  for (const file of candidates) {
+    try {
+      if (!fs.existsSync(file)) continue;
+      const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+      const tgc = (raw.cookies || []).filter((c) => isTgcName(c.name));
+      if (tgc.length) return { cookies: tgc, origins: [] };
+    } catch { /* probar siguiente */ }
+  }
+  return null;
+}
+
+/**
+ * Rescate de TGC desde el Worker: la última sesión que la VM empujó a KV
+ * (TTL 12h) incluye la cookie CASTGC. Si el archivo local se perdió (reboot),
+ * esto evita gastar un captcha para re-bootstrapear.
+ */
+async function fetchTgcFromWorker(WORKER_URL, CAPTURE_TOKEN, log) {
   try {
-    if (!fs.existsSync(STATE_FILE)) return null;
-    const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-    const tgc = (raw.cookies || []).filter((c) => isTgcName(c.name));
-    return tgc.length ? { cookies: tgc, origins: [] } : null;
-  } catch { return null; }
+    const base = WORKER_URL.replace(/\/capture$/, "");
+    const res = await fetch(`${base}/native-host/tgc`, {
+      headers: { "X-Capture-Token": CAPTURE_TOKEN },
+    });
+    if (!res.ok) { log("warn", "worker TGC fetch non-OK", { status: res.status }); return null; }
+    const data = await res.json();
+    if (!data.found || !Array.isArray(data.cookies) || data.cookies.length === 0) {
+      log("info", "worker no tiene TGC para rescatar", { reason: data.reason });
+      return null;
+    }
+    log("info", "TGC rescatado del Worker", { capturedAt: data.capturedAt, count: data.cookies.length });
+    return { cookies: data.cookies, origins: [] };
+  } catch (e) {
+    log("warn", "worker TGC fetch failed", { error: e.message });
+    return null;
+  }
+}
+
+/** Normaliza una cookie (del archivo o del Worker) para context.addCookies(). */
+function toPlaywrightCookie(c) {
+  const ck = {
+    name: c.name,
+    value: c.value,
+    domain: c.domain,
+    path: c.path || "/",
+    httpOnly: !!c.httpOnly,
+    secure: c.secure !== undefined ? !!c.secure : true, // CASTGC es Secure
+  };
+  if (typeof c.expires === "number" && c.expires > 0) ck.expires = c.expires;
+  if (c.sameSite) ck.sameSite = c.sameSite;
+  return ck;
 }
 
 async function runAutoLogin(env) {
@@ -215,7 +261,9 @@ async function runAutoLogin(env) {
   if (!CAPTURE_TOKEN || !WORKER_URL) return { ok: false, reason: "CAPTURE_TOKEN/WORKER_URL missing" };
 
   const creds = { username: CAS_USERNAME, password: CAS_PASSWORD };
-  const STATE_FILE = env.STATE_FILE || path.join(os.tmpdir(), "bukeala-tgc.json");
+  // Default en el HOME (persiste reboots). /tmp era el default viejo: cada
+  // reinicio de la VM borraba el TGC → captcha para re-bootstrapear.
+  const STATE_FILE = env.STATE_FILE || path.join(os.homedir(), ".bukeala-tgc.json");
   log("info", "credentials from env", { user: creds.username });
 
   const browser = await chromium.launch({
@@ -223,14 +271,22 @@ async function runAutoLogin(env) {
     args: ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
   });
 
-  const diag = { via: "captcha", postNavUrl: null, hadBukealaJsession: false, fellBack: false, tgcSaved: false };
+  const diag = { via: "captcha", postNavUrl: null, hadBukealaJsession: false, fellBack: false, tgcSaved: false, tgcSource: null };
   let result = { ok: false };
 
   try {
     // ---- INTENTO 1: restaurar SOLO la cookie TGC ----
-    const savedTgc = loadTgc(STATE_FILE);
-    const ctx1 = await browser.newContext(savedTgc ? { ...CONTEXT_OPTIONS, storageState: savedTgc } : { ...CONTEXT_OPTIONS });
-    log("info", savedTgc ? "TGC restaurado (solo cookie TGC)" : "sin TGC previo");
+    // Orden: archivo local → rescate desde el Worker (si el archivo se perdió,
+    // p.ej. tras un reboot cuando vivía en /tmp) → sin TGC (captcha directo).
+    let savedTgc = loadTgc(STATE_FILE);
+    diag.tgcSource = savedTgc ? "file" : null;
+    if (!savedTgc) {
+      savedTgc = await fetchTgcFromWorker(WORKER_URL, CAPTURE_TOKEN, log);
+      if (savedTgc) diag.tgcSource = "worker";
+    }
+    const ctx1 = await browser.newContext({ ...CONTEXT_OPTIONS });
+    if (savedTgc) await ctx1.addCookies(savedTgc.cookies.map(toPlaywrightCookie));
+    log("info", savedTgc ? `TGC restaurado (fuente: ${diag.tgcSource})` : "sin TGC previo");
     const page1 = await ctx1.newPage();
     const nav1 = await navigateAndLogin(page1, creds, TWO_CAPTCHA_API_KEY, log);
     diag.postNavUrl = nav1.postNavUrl;

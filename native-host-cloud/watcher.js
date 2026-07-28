@@ -27,11 +27,11 @@ const path = require("node:path");
 const { runAutoLogin } = require("./autoLogin");
 
 const APP_DIR = os.tmpdir(); // solo para screenshots de error
-// Archivo de cookies (storageState). Guarda el TGC de CAS entre renovaciones →
-// la mayoría no usan captcha. /tmp siempre escribible (sin líos de permisos).
-// Solo guarda la cookie TGC (no el estado completo). Nombre nuevo a propósito:
-// ignora cualquier bukeala-state.json viejo (estado completo que envenenaba).
-const STATE_FILE = process.env.STATE_FILE || path.join(os.tmpdir(), "bukeala-tgc.json");
+// Archivo del TGC de CAS entre renovaciones → la mayoría no usan captcha.
+// Vive en el HOME (persiste reboots — /tmp se borraba al reiniciar la VM y
+// cada reboot costaba un captcha). Solo guarda la cookie TGC, no el estado
+// completo (el estado completo envenenaba la sesión — lección jun 2026).
+const STATE_FILE = process.env.STATE_FILE || path.join(os.homedir(), ".bukeala-tgc.json");
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
 const PROACTIVE_INTERVAL_MS = parseInt(process.env.PROACTIVE_INTERVAL_MS || "600000", 10);
 
@@ -114,21 +114,23 @@ async function doLogin(c, reason) {
     if (r.ok) {
       // via real reportado por autoLogin: tgc | captcha | captcha-fallback
       const via = r.via || (r.usedCaptcha ? "captcha" : "tgc");
-      const tag = via + (r.fellBack ? "+fallback" : "");
-      log("info", "auto-login OK", { cookieCount: r.cookieCount, durationMs, reason, via, fellBack: r.fellBack, url: r.postNavUrl });
+      const tag = via + (r.fellBack ? "+fallback" : "") + (r.tgcSource === "worker" ? "+tgcWorker" : "");
+      log("info", "auto-login OK", { cookieCount: r.cookieCount, durationMs, reason, via, fellBack: r.fellBack, tgcSource: r.tgcSource, url: r.postNavUrl });
       await reportEvent(c, {
         type: "ok", message: `${r.cookieCount} cookies (cloud, ${reason}, ${tag})`,
         cookieCount: r.cookieCount, durationMs,
         via, fellBack: !!r.fellBack, hadBukealaJsession: !!r.hadBukealaJsession, postNavUrl: r.postNavUrl,
+        tgcSource: r.tgcSource || undefined,
       });
     } else {
       log("error", "auto-login FAIL", { reason: r.reason, durationMs, via: r.via, url: r.postNavUrl });
       await reportEvent(c, {
         type: "error", message: `${r.reason} (cloud, ${reason}, via=${r.via || "?"})`,
         durationMs, via: r.via, fellBack: !!r.fellBack, hadBukealaJsession: !!r.hadBukealaJsession, postNavUrl: r.postNavUrl,
+        tgcSource: r.tgcSource || undefined,
       });
     }
-    return r.ok;
+    return r;
   } finally {
     loginInFlight = false;
   }
@@ -143,48 +145,80 @@ async function main() {
     proactiveMs: PROACTIVE_INTERVAL_MS,
   });
 
-  // Login inmediato al arrancar (sesión fresca de una)
-  await doLogin(c, "startup");
-
-  // ESTRATEGIA 24/7 (storageState + TGC):
-  // Renovar ya casi no cuesta captcha (se reusa el TGC vía storageState). Por eso
-  // mantenemos la sesión viva TODO EL DÍA: keep-alive cada PROACTIVE_INTERVAL_MS,
-  // sin importar la hora. El captcha solo se gasta cuando el TGC expira (cada
-  // varias horas o tras la limpieza nocturna de Bukeala). Las solicitudes
-  // on-demand se atienden a cualquier hora (también pacientes de madrugada).
-  // NOTA: de noche Bukeala puede hacer mantenimiento e invalidar la sesión; en
-  // ese caso algunas renovaciones nocturnas pueden fallar/usar captcha. Es un
-  // experimento — vigilar con el tool MCP estado_sistema.
+  // ESTRATEGIA 24/7 (TGC persistente):
+  // Renovar casi nunca cuesta captcha (se reusa el TGC del archivo en HOME o,
+  // si se perdió, se rescata del Worker). Keep-alive cada PROACTIVE_INTERVAL_MS
+  // a toda hora; on-demand a cualquier hora. El captcha solo se gasta cuando
+  // el TGC de CAS expira de verdad.
   let lastProactiveAt = Date.now();   // último keep-alive EXITOSO (el startup cuenta)
   let lastAttemptAt = Date.now();     // último INTENTO (éxito o fallo)
-  let renewFailing = false;           // true si el último intento falló → reintentar pronto
-  const RETRY_DELAY_MS = 90 * 1000;   // tras un fallo, reintentar en 90s (no esperar el intervalo)
+  let renewFailing = false;           // true si el último intento falló → reintentar con backoff
+  let consecutiveFails = 0;           // fallos seguidos (escala el backoff)
+  let fatalReason = null;             // p.ej. ZERO_BALANCE → backoff largo (requiere humano)
+  const RETRY_DELAY_MS = 90 * 1000;   // tras un fallo normal, reintentar en 90s
+  // Errores que NO se arreglan reintentando (requieren acción humana, p.ej. recargar saldo):
+  const FATAL_PATTERNS = [/ZERO_BALANCE/i];
+
+  // Delay del próximo reintento tras fallo. Normal: 90s. Fallos repetidos
+  // (5+): 10 min — martillar cada 90s nos ganó "Too Many Requests" de
+  // 2Captcha/CAS. Fatal (sin saldo): escalera 15 → 30 → 60 min.
+  function retryDelayMs() {
+    if (fatalReason) {
+      const ladder = [15, 30, 60];
+      return ladder[Math.min(Math.max(consecutiveFails - 1, 0), ladder.length - 1)] * 60 * 1000;
+    }
+    if (consecutiveFails >= 5) return 10 * 60 * 1000;
+    return RETRY_DELAY_MS;
+  }
+
+  function noteResult(r) {
+    if (r === "skipped") return;
+    if (r && r.ok) {
+      lastProactiveAt = Date.now();
+      renewFailing = false; consecutiveFails = 0; fatalReason = null;
+      return;
+    }
+    renewFailing = true;
+    consecutiveFails += 1;
+    const reason = (r && r.reason) || "";
+    fatalReason = FATAL_PATTERNS.some((p) => p.test(reason)) ? reason : null;
+    if (fatalReason) {
+      log("error", "fallo FATAL — backoff largo hasta acción humana", {
+        reason: fatalReason,
+        nextRetryMin: Math.round(retryDelayMs() / 60000),
+      });
+    }
+  }
+
+  // Login inmediato al arrancar (sesión fresca de una)
+  noteResult(await doLogin(c, "startup"));
 
   while (true) {
     try {
       // 1. ¿Refresh on-demand pedido (Telegram, WhatsApp entrante, MCP)?
-      //    24/7: se atiende a cualquier hora (también pacientes de madrugada).
+      //    24/7 y SIN backoff: siempre se intenta ya — un humano pudo haber
+      //    recargado el saldo y /sesion_renew debe funcionar de inmediato.
       const req = await checkForRefreshRequest(c);
       if (req) {
         log("info", "refresh requested", { by: String(req.requestedBy || ""), at: req.requestedAt });
         const r = await doLogin(c, "on-demand");
         // "skipped" = ya había un login en curso (no es un fallo) → no reportar error.
-        if (r !== "skipped") await reportComplete(c, !!r, r ? "cloud login OK" : "cloud login failed");
-        if (r === true) { lastProactiveAt = Date.now(); lastAttemptAt = Date.now(); renewFailing = false; }
+        if (r !== "skipped") await reportComplete(c, !!(r && r.ok), r && r.ok ? "cloud login OK" : "cloud login failed");
+        lastAttemptAt = Date.now();
+        noteResult(r);
       }
 
-      // 2. KEEP-ALIVE 24/7 con REINTENTO tras fallo: renovar cada
-      //    PROACTIVE_INTERVAL_MS; pero si el último intento falló (timeout de
-      //    2Captcha, "fetch failed", etc.), reintentar a los RETRY_DELAY_MS en
-      //    vez de esperar el intervalo completo → evita huecos largos de agenda.
-      const intervalDue = Date.now() - lastProactiveAt >= PROACTIVE_INTERVAL_MS;
-      const retryDue = renewFailing && (Date.now() - lastAttemptAt >= RETRY_DELAY_MS);
+      // 2. KEEP-ALIVE con backoff. OJO: mientras renewFailing, el intervalo
+      //    normal NO dispara (antes sí: lastProactiveAt solo avanza con éxito,
+      //    así que tras 10 min fallando se intentaba en CADA tick de 30s —
+      //    esa fue la tormenta de reintentos del 28/jul).
+      const intervalDue = !renewFailing && Date.now() - lastProactiveAt >= PROACTIVE_INTERVAL_MS;
+      const retryDue = renewFailing && Date.now() - lastAttemptAt >= retryDelayMs();
       if (intervalDue || retryDue) {
-        log("info", retryDue ? "keep-alive (reintento tras fallo)" : "keep-alive");
+        log("info", retryDue ? `keep-alive (reintento tras ${consecutiveFails} fallo(s))` : "keep-alive");
         const res = await doLogin(c, "keep-alive");
         lastAttemptAt = Date.now();
-        if (res === true) { lastProactiveAt = Date.now(); renewFailing = false; }
-        else if (res === false) { renewFailing = true; } // reintenta en 90s
+        noteResult(res);
       }
     } catch (e) {
       log("error", "tick failed", { error: e.message });

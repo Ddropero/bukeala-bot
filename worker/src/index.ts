@@ -9,7 +9,7 @@ import { handleIgDiscover } from "./handlers/instagramDiscover";
 import { handleGetProfile, handleUpdateProfilePicture, handlePhoneInfo } from "./handlers/whatsappProfile";
 import { handleListTemplates, handleCreateTemplates } from "./handlers/waTemplates";
 import { handleDashboard } from "./handlers/dashboard";
-import { handleNativeHostEvent, handleCheckRefresh, handleRefreshComplete } from "./handlers/nativeHostEvent";
+import { handleNativeHostEvent, handleCheckRefresh, handleRefreshComplete, handleGetTgc } from "./handlers/nativeHostEvent";
 import { Bukeala, SessionExpiredError } from "./bukeala";
 import { loadSession } from "./kv";
 import { dailySummary } from "./cron/dailySummary";
@@ -53,6 +53,10 @@ app.get("/native-host/check-refresh", handleCheckRefresh);
 
 // Native Host reports back when refresh completed (success/fail) → notifies requester
 app.post("/native-host/refresh-complete", handleRefreshComplete);
+
+// TGC rescue: la VM recupera el TGC de la última sesión en KV tras un reboot
+// (evita gastar captcha para re-bootstrapear). Solo devuelve cookies TGC.
+app.get("/native-host/tgc", handleGetTgc);
 
 // Telegram webhook (Telegram → Worker)
 app.post("/tg/webhook", handleTelegramWebhook);
@@ -432,6 +436,58 @@ app.get("/js/wa-button.js", (c) => {
 //   /debug/search?date=DD/MM/YYYY&componentCode=...
 //   /debug/customer?type=C&id=...
 //   /debug/myBookings
+// Telemetría de sesión/renovación acumulada. Responde con datos reales:
+// cuánto viven los JSESSIONID (sessionLifetimes), cuánto vive el TGC
+// (tgcLifetimesMin = gap entre logins con captcha), captchas/día
+// (renewCounters) y el estado actual. Auth igual que /debug/:resource.
+app.get("/debug/session-stats", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const parse = (r: string | null) => { try { return r ? JSON.parse(r) : null; } catch { return null; } };
+
+  const [lifetimesRaw, tgcRaw, lastCaptchaRaw, lastGoodRaw, pendingRaw, zeroBalanceRaw] = await Promise.all([
+    c.env.STATE.get("stats:sessionLifetimes"),
+    c.env.STATE.get("stats:tgcLifetimes"),
+    c.env.STATE.get("stats:lastCaptchaOkAt"),
+    c.env.STATE.get("keepalive:lastGood"),
+    c.env.STATE.get("wa:pending:list"),
+    c.env.STATE.get("nativeHost:zeroBalanceAlertAt"),
+  ]);
+  const session = await loadSession(c.env);
+
+  // Contadores de hoy y ayer (UTC) por vía de renovación
+  const days = [0, 1].map((d) => new Date(Date.now() - d * 86400000).toISOString().slice(0, 10));
+  const buckets = ["ok:tgc", "ok:captcha", "ok:captcha-fallback", "ok:unknown", "error"];
+  const renewCounters: Record<string, Record<string, number>> = {};
+  for (const day of days) {
+    renewCounters[day] = {};
+    for (const bucket of buckets) {
+      const v = await c.env.STATE.get(`stats:renew:${day}:${bucket}`);
+      if (v) renewCounters[day][bucket] = parseInt(v, 10) || 0;
+    }
+  }
+
+  const hasTgc = (name: string) => name.toUpperCase().startsWith("TGC") || name.toUpperCase().startsWith("CASTGC");
+  return c.json({
+    session: session
+      ? {
+          capturedAt: session.capturedAt,
+          ageMin: Math.round((Date.now() - new Date(session.capturedAt).getTime()) / 60000),
+          cookieCount: session.cookies.length,
+          hasTgc: session.cookies.some((k) => hasTgc(k.name)),
+        }
+      : null,
+    sessionLifetimes: parse(lifetimesRaw),
+    tgcLifetimesMin: parse(tgcRaw),
+    lastCaptchaOkAt: lastCaptchaRaw ? new Date(parseInt(lastCaptchaRaw, 10)).toISOString() : null,
+    keepaliveLastGood: parse(lastGoodRaw),
+    pendingQueue: ((parse(pendingRaw) as unknown[]) ?? []).length,
+    lastZeroBalanceAlertAt: zeroBalanceRaw ? new Date(parseInt(zeroBalanceRaw, 10)).toISOString() : null,
+    renewCounters,
+  });
+});
+
 app.get("/debug/:resource", handleDebug);
 
 // Keep-alive cron:
@@ -476,6 +532,16 @@ async function keepAlive(env: Env): Promise<void> {
       console.log("[keepalive] findAvailability falló (no crítico):", (e2 as Error).message);
     }
 
+    // Telemetría: recordar el último ping OK de ESTA sesión (por capturedAt)
+    // para medir su vida real cuando muera → stats:sessionLifetimes.
+    try {
+      await env.STATE.put(
+        "keepalive:lastGood",
+        JSON.stringify({ at: Date.now(), capturedAt: s.capturedAt }),
+        { expirationTtl: 60 * 60 * 24 },
+      );
+    } catch { /* telemetría no bloqueante */ }
+
     // Reset the "notified" flag SOLO si llevábamos un rato realmente caídos
     // (recuperación genuina), no en cada éxito. La sesión a veces fluctúa
     // 200/302 entre pings; si borráramos el flag con cada 200, el siguiente
@@ -505,6 +571,30 @@ async function keepAlive(env: Env): Promise<void> {
       return;
     }
     console.log("[keepalive] session expired");
+
+    // Telemetría: si ESTA misma sesión tuvo un ping OK antes, registrar cuánto
+    // vivió realmente (responde "¿cuánto dura el JSESSIONID?" con datos).
+    try {
+      const lastGoodRaw = await env.STATE.get("keepalive:lastGood");
+      if (lastGoodRaw) {
+        const lastGood = JSON.parse(lastGoodRaw) as { at: number; capturedAt: string };
+        if (lastGood.capturedAt === s.capturedAt) {
+          const now = Date.now();
+          const lifeMin = Math.round((now - new Date(s.capturedAt).getTime()) / 6000) / 10;
+          const sinceOkMin = Math.round((now - lastGood.at) / 6000) / 10;
+          let lifes: Array<{ capturedAt: string; lifeMin: number; sinceOkMin: number }> = [];
+          try { lifes = JSON.parse((await env.STATE.get("stats:sessionLifetimes")) ?? "[]"); } catch { /* ignore */ }
+          lifes.push({ capturedAt: s.capturedAt, lifeMin, sinceOkMin });
+          await env.STATE.put("stats:sessionLifetimes", JSON.stringify(lifes.slice(-100)), {
+            expirationTtl: 60 * 60 * 24 * 90,
+          });
+          await env.STATE.delete("keepalive:lastGood");
+          console.log(`[keepalive] sesión vivió ${lifeMin} min (último OK hace ${sinceOkMin} min)`);
+        }
+      }
+    } catch (e) {
+      console.log("[keepalive] lifetime tracking failed:", (e as Error).message);
+    }
 
     // MODO BAJO DEMANDA: solo renovamos si HAY pacientes esperando en la cola.
     // Si la sesión está caída pero nadie la necesita, NO gastamos captcha —

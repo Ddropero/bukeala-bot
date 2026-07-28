@@ -13,6 +13,7 @@ import type { Context } from "hono";
 import type { Env } from "../env";
 import { getDoctorRecipients } from "../users";
 import { processPendingRequests } from "../claudeBookingAgent";
+import { loadSession } from "../kv";
 
 const TG = (token: string) => `https://api.telegram.org/bot${token}`;
 const KV_KEY = "nativeHost:events";
@@ -32,6 +33,7 @@ interface NativeHostEvent {
   fellBack?: boolean;        // true si el TGC no dio sesión y tocó re-loguear
   hadBukealaJsession?: boolean;
   postNavUrl?: string;       // URL tras la 1ª navegación (para diagnosticar)
+  tgcSource?: string;        // "file" | "worker" — de dónde salió el TGC reusado
 }
 
 export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
@@ -57,6 +59,7 @@ export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
     fellBack: body.fellBack,
     hadBukealaJsession: body.hadBukealaJsession,
     postNavUrl: body.postNavUrl,
+    tgcSource: body.tgcSource,
   };
 
   // Append to rolling log
@@ -89,6 +92,68 @@ export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
     });
   } catch (e) {
     console.log("[native-host-event] hourly tracking failed:", (e as Error).message);
+  }
+
+  // Telemetría persistente (el ring buffer de 200 eventos se llena en horas
+  // durante una falla). Contadores diarios por vía + vida empírica del TGC:
+  // el gap entre dos logins CON captcha ≈ cuánto vivió el TGT de CAS.
+  try {
+    const day = event.at.slice(0, 10); // YYYY-MM-DD
+    const bucket = event.type === "ok" ? `ok:${event.via ?? "unknown"}` : "error";
+    const cKey = `stats:renew:${day}:${bucket}`;
+    const prev = parseInt((await c.env.STATE.get(cKey)) ?? "0", 10) || 0;
+    await c.env.STATE.put(cKey, String(prev + 1), { expirationTtl: 60 * 60 * 24 * 60 });
+
+    if (event.type === "ok" && (event.via === "captcha" || event.via === "captcha-fallback")) {
+      const nowMs = new Date(event.at).getTime();
+      const lastRaw = await c.env.STATE.get("stats:lastCaptchaOkAt");
+      if (lastRaw) {
+        const gapMin = Math.round((nowMs - parseInt(lastRaw, 10)) / 60000);
+        let lifes: number[] = [];
+        try { lifes = JSON.parse((await c.env.STATE.get("stats:tgcLifetimes")) ?? "[]"); } catch { /* ignore */ }
+        lifes.push(gapMin);
+        await c.env.STATE.put("stats:tgcLifetimes", JSON.stringify(lifes.slice(-50)), {
+          expirationTtl: 60 * 60 * 24 * 90,
+        });
+      }
+      await c.env.STATE.put("stats:lastCaptchaOkAt", String(nowMs), { expirationTtl: 60 * 60 * 24 * 90 });
+    }
+  } catch (e) {
+    console.log("[native-host-event] stats tracking failed:", (e as Error).message);
+  }
+
+  // Alerta INMEDIATA cuando 2Captcha se queda sin saldo (throttled 4h).
+  // Sin esto, la caída solo se nota cuando un paciente lleva 20+ min atascado
+  // (watchdog) — hoy la tormenta corrió 2h sin que nadie se enterara.
+  if (event.type === "error" && /ZERO_BALANCE/i.test(event.message ?? "")) {
+    const lastRaw = await c.env.STATE.get("nativeHost:zeroBalanceAlertAt");
+    const now = Date.now();
+    if (!lastRaw || now - parseInt(lastRaw, 10) > 4 * 60 * 60 * 1000) {
+      await c.env.STATE.put("nativeHost:zeroBalanceAlertAt", String(now), {
+        expirationTtl: 60 * 60 * 24,
+      });
+      try {
+        const doctors = await getDoctorRecipients(c.env);
+        for (const chat of doctors) {
+          await fetch(`${TG(c.env.TELEGRAM_BOT_TOKEN)}/sendMessage`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              chat_id: chat,
+              text:
+                "🔴 <b>2Captcha SIN SALDO</b>\n\n" +
+                "La VM no puede renovar la sesión de Bukeala hasta que recargues.\n\n" +
+                "1. Recarga en https://2captcha.com → Add funds\n" +
+                "2. Luego corre /sesion_renew\n\n" +
+                "<i>Alternativa gratis: loguéate en Bukeala desde el PC y captura con la extensión — la VM rescatará el TGC sola.</i>",
+              parse_mode: "HTML",
+            }),
+          }).catch(() => {});
+        }
+      } catch (e) {
+        console.log("[native-host-event] zero-balance alert failed:", (e as Error).message);
+      }
+    }
   }
 
   // On a successful refresh, kick off pending-queue processing in the background
@@ -149,6 +214,40 @@ export async function getNativeHostEvents(env: Env): Promise<NativeHostEvent[]> 
   } catch {
     return [];
   }
+}
+
+// ====================================================================
+// TGC rescue: la VM re-bootstrapea su TGC desde la última sesión en KV
+// ====================================================================
+
+const TGC_PREFIXES = ["TGC", "CASTGC"];
+const isTgcName = (n: string) => TGC_PREFIXES.some((p) => n.toUpperCase().startsWith(p));
+
+/**
+ * GET /native-host/tgc (auth: X-Capture-Token)
+ *
+ * Tras un reboot la VM pierde su archivo de TGC (antes vivía en /tmp) y sin
+ * él CADA renovación gasta un captcha. Pero la última sesión que la propia VM
+ * empujó al Worker (KV `session:active`, TTL 12h) incluye la cookie CASTGC
+ * del dominio colsanitas.com. Este endpoint se la devuelve para que la VM se
+ * re-bootstrapee sin gastar captcha. Solo devuelve cookies TGC — nunca el
+ * JSESSIONID ni el resto de la sesión.
+ */
+export async function handleGetTgc(c: Context<{ Bindings: Env }>) {
+  const token = c.req.header("X-Capture-Token");
+  if (!token || token !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+
+  const session = await loadSession(c.env);
+  if (!session) return c.json({ found: false, reason: "no session in KV" });
+
+  const tgc = session.cookies.filter((k) => isTgcName(k.name));
+  if (tgc.length === 0) {
+    return c.json({ found: false, reason: "session sin cookie TGC", capturedAt: session.capturedAt });
+  }
+  console.log(`[tgc-rescue] entregando ${tgc.length} cookie(s) TGC (capturadas ${session.capturedAt})`);
+  return c.json({ found: true, capturedAt: session.capturedAt, cookies: tgc });
 }
 
 // ====================================================================
