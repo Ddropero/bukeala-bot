@@ -88,6 +88,22 @@ export async function getOrCreateTopic(
   }
 }
 
+/**
+ * Destino del hilo del paciente para envíos que NO son texto (adjuntos).
+ * Devuelve el chat del grupo + el message_thread_id, o null si el modo forum
+ * está apagado o el hilo no se pudo crear (el llamador cae a DMs).
+ */
+export async function resolveTopicTarget(
+  env: Env,
+  phone: string,
+  patientName: string,
+): Promise<{ chatId: string; threadId: number } | null> {
+  if (!forumEnabled(env)) return null;
+  const threadId = await getOrCreateTopic(env, phone, patientName);
+  if (!threadId) return null;
+  return { chatId: groupId(env), threadId };
+}
+
 /** Devuelve el phone asociado a un message_thread_id (para responder). */
 export async function phoneForTopic(env: Env, threadId: number): Promise<string | null> {
   return await env.STATE.get(`forum:phoneByTopic:${threadId}`);

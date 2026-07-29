@@ -186,17 +186,22 @@ export async function downloadTelegramFile(
   return { buffer, mimeType, filename };
 }
 
-/** Send a photo to a Telegram chat. The buffer must be < 10 MB for sendPhoto. */
+/**
+ * Send a photo to a Telegram chat. The buffer must be < 10 MB for sendPhoto.
+ * `threadId` manda la foto DENTRO del hilo del paciente (modo forum).
+ */
 export async function sendTelegramPhoto(
   botToken: string,
   chatId: string,
   buffer: ArrayBuffer,
   caption?: string,
+  threadId?: number,
   filename = "photo.jpg",
   parseMode: "HTML" | "MarkdownV2" = "HTML",
 ): Promise<boolean> {
   const form = new FormData();
   form.append("chat_id", chatId);
+  if (threadId) form.append("message_thread_id", String(threadId));
   if (caption) {
     form.append("caption", caption);
     form.append("parse_mode", parseMode);
@@ -221,9 +226,11 @@ export async function sendTelegramDocument(
   filename: string,
   mimeType: string,
   caption?: string,
+  threadId?: number,
 ): Promise<boolean> {
   const form = new FormData();
   form.append("chat_id", chatId);
+  if (threadId) form.append("message_thread_id", String(threadId));
   if (caption) {
     form.append("caption", caption);
     form.append("parse_mode", "HTML");
@@ -245,10 +252,12 @@ export async function sendTelegramVideo(
   chatId: string,
   buffer: ArrayBuffer,
   caption?: string,
+  threadId?: number,
   filename = "video.mp4",
 ): Promise<boolean> {
   const form = new FormData();
   form.append("chat_id", chatId);
+  if (threadId) form.append("message_thread_id", String(threadId));
   if (caption) {
     form.append("caption", caption);
     form.append("parse_mode", "HTML");
@@ -272,9 +281,11 @@ export async function sendTelegramVoice(
   chatId: string,
   buffer: ArrayBuffer,
   caption?: string,
+  threadId?: number,
 ): Promise<boolean> {
   const form = new FormData();
   form.append("chat_id", chatId);
+  if (threadId) form.append("message_thread_id", String(threadId));
   if (caption) {
     form.append("caption", caption);
     form.append("parse_mode", "HTML");

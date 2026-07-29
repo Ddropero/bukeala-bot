@@ -32,6 +32,7 @@ import {
   sendTelegramVoice,
   sendTelegramVideo,
 } from "../whatsappMedia";
+import { resolveTopicTarget } from "../forumTopics";
 import { transcribeAudio } from "../whisper";
 
 const TG = (token: string) => `https://api.telegram.org/bot${token}`;
@@ -217,10 +218,14 @@ async function handleInboundMessage(
         const escTranscript = escapeHtml(transcript);
         const audioCaption =
           `🎙️ <b>${escName}</b> (<code>${from}</code>)\n\n📝 <i>${escTranscript}</i>`;
-        const recipients = await getAllRecipients(env);
-        for (const chatId of recipients) {
+        // Igual que el resto de adjuntos: al hilo del paciente si hay forum.
+        const topic = await resolveTopicTarget(env, from, senderName);
+        const targets: Array<{ chatId: string; threadId?: number }> = topic
+          ? [{ chatId: topic.chatId, threadId: topic.threadId }]
+          : (await getAllRecipients(env)).map((chatId) => ({ chatId }));
+        for (const { chatId, threadId } of targets) {
           try {
-            await sendTelegramVoice(targetToken, chatId, media.buffer, audioCaption);
+            await sendTelegramVoice(targetToken, chatId, media.buffer, audioCaption, threadId);
           } catch (e) {
             console.log(`[wa-webhook] tg push audio failed:`, (e as Error).message);
           }
@@ -710,30 +715,62 @@ async function handleInboundMedia(
     `${iconFor(kind)} <b>${escName}</b> (<code>${from}</code>)` +
     (escCaption ? `\n\n<i>${escCaption}</i>` : "");
 
-  const recipients = await getAllRecipients(env);
-  for (const chatId of recipients) {
+  // Destino: si hay modo forum, el adjunto va DENTRO del hilo del paciente
+  // (junto a su conversación, que es donde el doctor la lee). Antes iba a los
+  // DMs de cada autorizado, o sea a otro lado: el aviso "envió una foto"
+  // aparecía en el hilo pero la foto no. Sin forum, DMs como siempre.
+  const topic = await resolveTopicTarget(env, from, senderName);
+  const targets: Array<{ chatId: string; threadId?: number }> = topic
+    ? [{ chatId: topic.chatId, threadId: topic.threadId }]
+    : (await getAllRecipients(env)).map((chatId) => ({ chatId }));
+
+  let deliveredAny = false;
+  for (const { chatId, threadId } of targets) {
     try {
       let ok = false;
       if (kind === "image" || kind === "sticker") {
-        ok = await sendTelegramPhoto(targetToken, chatId, media.buffer, headerHtml);
+        ok = await sendTelegramPhoto(targetToken, chatId, media.buffer, headerHtml, threadId);
       } else if (kind === "document") {
-        ok = await sendTelegramDocument(targetToken, chatId, media.buffer, filename || "documento", media.mimeType, headerHtml);
+        ok = await sendTelegramDocument(targetToken, chatId, media.buffer, filename || "documento", media.mimeType, headerHtml, threadId);
       } else if (kind === "audio") {
-        ok = await sendTelegramVoice(targetToken, chatId, media.buffer, headerHtml);
+        ok = await sendTelegramVoice(targetToken, chatId, media.buffer, headerHtml, threadId);
       } else if (kind === "video") {
         // Reproducible inline (Telegram sendVideo). Si falla por tamaño/codec, fallback a documento.
-        ok = await sendTelegramVideo(targetToken, chatId, media.buffer, headerHtml);
+        ok = await sendTelegramVideo(targetToken, chatId, media.buffer, headerHtml, threadId);
         if (!ok) {
           console.log(`[wa-webhook] sendVideo falló, fallback a sendDocument`);
-          ok = await sendTelegramDocument(targetToken, chatId, media.buffer, "video.mp4", media.mimeType, headerHtml);
+          ok = await sendTelegramDocument(targetToken, chatId, media.buffer, "video.mp4", media.mimeType, headerHtml, threadId);
         }
       }
-      if (!ok) {
-        console.log(`[wa-webhook] tg send to ${chatId} failed for ${kind}`);
-      }
+      if (ok) deliveredAny = true;
+      else console.log(`[wa-webhook] tg send to ${chatId}${threadId ? `#${threadId}` : ""} failed for ${kind}`);
     } catch (e) {
       console.log(`[wa-webhook] tg push failed:`, (e as Error).message);
     }
+  }
+
+  // Si el hilo falló (borrado, bot sin permisos), reintentar por DMs: el
+  // adjunto puede ser clínicamente relevante, no puede perderse en silencio.
+  if (!deliveredAny && topic) {
+    console.log(`[wa-webhook] hilo falló para ${kind}, fallback a DMs`);
+    for (const chatId of await getAllRecipients(env)) {
+      try {
+        if (kind === "image" || kind === "sticker") {
+          deliveredAny = await sendTelegramPhoto(targetToken, chatId, media.buffer, headerHtml) || deliveredAny;
+        } else if (kind === "document") {
+          deliveredAny = await sendTelegramDocument(targetToken, chatId, media.buffer, filename || "documento", media.mimeType, headerHtml) || deliveredAny;
+        } else if (kind === "audio") {
+          deliveredAny = await sendTelegramVoice(targetToken, chatId, media.buffer, headerHtml) || deliveredAny;
+        } else if (kind === "video") {
+          deliveredAny = await sendTelegramDocument(targetToken, chatId, media.buffer, "video.mp4", media.mimeType, headerHtml) || deliveredAny;
+        }
+      } catch { /* siguiente destinatario */ }
+    }
+  }
+
+  if (!deliveredAny) {
+    // Nadie recibió el archivo: avisar por texto para que no pase inadvertido.
+    await notifyMediaFailure(env, from, senderName, kind, caption);
   }
 
   // También un mensaje de texto al handoff bot con los botones [📤 Responder] [🔚 Devolver IA]
