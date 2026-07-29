@@ -143,12 +143,12 @@ export async function handleUpdate(env: Env, update: any): Promise<void> {
   } catch (err) {
     if (err instanceof SessionExpiredError) {
       console.log("SessionExpiredError thrown", { stack: (err as Error).stack });
-      await sendMessage(
-        env,
-        chatId,
-        "⚠️ Sesión expirada. Logueate en Bukeala desde tu PC y haz clic en la extensión para enviar una nueva sesión.",
-      );
+      // Auto-recuperación: la VM renueva 24/7, así que pedirle un refresh es
+      // mucho mejor que mandar al usuario a loguearse a mano con la extensión
+      // (instrucción obsoleta: así se veía "caído sin remedio" durante un blip
+      // de sesión de 4-7 min, p. ej. el del 29/jul 07:42 Bogotá).
       await clearState(env, chatId);
+      await wakeSessionAndNotify(env, chatId);
       return;
     }
     console.error("handler error", err, (err as Error).stack);

@@ -60,20 +60,69 @@ async function diagnose(env: Env): Promise<string> {
   }
 }
 
-export async function watchdogCron(env: Env): Promise<void> {
-  // Solo en horario laboral (de noche no se atienden pacientes).
-  const h = bogotaHour();
-  if (h < 7 || h >= 19) {
-    await env.STATE.delete("watchdog:stuckSince");
-    await env.STATE.delete("watchdog:alerted");
+/**
+ * Vigila que el renovador (VM) siga vivo: si su último evento tiene más de
+ * STALE_MIN, alerta UNA vez (throttle 3h) y pide un refresh. Antes esto era
+ * inalcanzable: el diagnóstico "VM apagada" solo corría si había pacientes
+ * atascados, así que una VM muerta a las 3am no generaba ninguna señal.
+ */
+const STALE_MIN = 25; // la VM renueva cada ~10 min → 25 min = 2 ciclos perdidos
+
+async function checkRenewerAlive(env: Env): Promise<void> {
+  let lastAt = 0;
+  try {
+    const events = await getNativeHostEvents(env);
+    for (const e of events) {
+      const t = new Date(e.at).getTime();
+      if (Number.isFinite(t) && t > lastAt) lastAt = t;
+    }
+  } catch { return; /* sin datos: no inventamos alarma */ }
+  if (!lastAt) return;
+
+  const ageMin = (Date.now() - lastAt) / 60000;
+  if (ageMin < STALE_MIN) {
+    await env.STATE.delete("watchdog:renewerStaleAlerted");
     return;
   }
 
-  // MODO BAJO DEMANDA: la sesión está caída casi siempre A PROPÓSITO (solo se
-  // renueva cuando llega un paciente). Por eso el watchdog YA NO vigila si la
-  // sesión está viva — eso sería falsa alarma constante. En cambio vigila lo
-  // que de verdad importa: ¿hay PACIENTES EN COLA que llevan rato sin ser
-  // atendidos? Esa es la señal real de que el renovador no está funcionando.
+  try { await requestRefresh(env, "watchdog-renovador-mudo"); } catch { /* ignore */ }
+
+  if (await env.STATE.get("watchdog:renewerStaleAlerted")) return;
+  await env.STATE.put("watchdog:renewerStaleAlerted", "1", { expirationTtl: 60 * 60 * 3 });
+
+  const doctors = await getDoctorRecipients(env);
+  for (const chat of doctors) {
+    await fetch(`${TG(env.TELEGRAM_BOT_TOKEN)}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chat,
+        text:
+          `🔴 <b>El renovador de sesión no reporta hace ${Math.round(ageMin)} min</b>\n\n` +
+          "La VM de Google puede estar apagada o colgada. Sin ella, /agenda y el " +
+          "bot de WhatsApp dejan de funcionar.\n\n" +
+          "Ya pedí una renovación. Si no se recupera:\n" +
+          "• Revisa que la VM <code>bukeala-session-keeper</code> esté prendida\n" +
+          "• Comprueba con /estado",
+        parse_mode: "HTML",
+      }),
+    }).catch(() => {});
+  }
+  console.log(`[watchdog] ALERTA renovador mudo hace ${Math.round(ageMin)} min`);
+}
+
+export async function watchdogCron(env: Env): Promise<void> {
+  // 24/7: ya no hay gate de horario laboral. La VM renueva a toda hora, así
+  // que una sesión caída de madrugada es una falla real (y los pacientes
+  // escriben por WhatsApp a cualquier hora).
+
+  // VIGILANCIA 1 — ¿la VM sigue reportando? Si el último evento del renovador
+  // es viejo, la VM está apagada/colgada y nadie se enteraría: /agenda muere
+  // en silencio. Esto NO depende de que haya pacientes en cola.
+  await checkRenewerAlive(env);
+
+  // VIGILANCIA 2 — ¿hay PACIENTES EN COLA sin atender? Señal de que el
+  // renovador no está cumpliendo aunque reporte eventos.
   let pending: Array<{ queuedAt?: number }> = [];
   try { pending = (await loadPendingRequests(env)) as any[]; } catch { /* ignore */ }
 

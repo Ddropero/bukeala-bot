@@ -500,7 +500,21 @@ app.get("/debug/:resource", handleDebug);
 async function keepAlive(env: Env): Promise<void> {
   const s = await loadSession(env);
   if (!s) {
-    // No session yet — nothing to ping. Don't notify.
+    // Sin sesión en KV. Antes esto retornaba mudo, así que si la VM dejaba de
+    // empujar (apagada, colgada) el blob expiraba a las 12h y nadie se
+    // enteraba: /agenda muerto en silencio. Ahora pedimos renovación.
+    console.log("[keepalive] sin sesión en KV → pidiendo renovación");
+    const lastNoSession = await env.STATE.get("keepalive:noSessionRefreshAt");
+    if (!lastNoSession || Date.now() - parseInt(lastNoSession, 10) > 10 * 60 * 1000) {
+      try {
+        await requestRefresh(env, "auto-keepalive-sin-sesion");
+        await env.STATE.put("keepalive:noSessionRefreshAt", String(Date.now()), {
+          expirationTtl: 60 * 60,
+        });
+      } catch (e) {
+        console.log("[keepalive] refresh sin-sesión falló:", (e as Error).message);
+      }
+    }
     return;
   }
 
@@ -508,12 +522,10 @@ async function keepAlive(env: Env): Promise<void> {
   const ageMin = (Date.now() - new Date(s.capturedAt).getTime()) / 60000;
   console.log(`[keepalive] session age=${ageMin.toFixed(1)}min, cookies=${s.cookies.length}`);
 
-  // MODO BAJO DEMANDA (ahorro de 2Captcha): ya NO hacemos refresh preventivo
-  // en vacío. La sesión se renueva solo cuando un paciente real lo necesita
-  // (queuePendingRequest dispara el refresh on-demand) o en el login matutino
-  // de la VM. Si la sesión está caída pero no hay nadie usándola, la dejamos
-  // así — no gastamos captcha por nada. El keepAlive de abajo solo PINGEA
-  // (no renueva) para mantener viva una sesión que YA está buena.
+  // MODO 24/7 (desde 29/jul/2026): la VM renueva con "navegador vivo" sin
+  // gastar captcha, así que el viejo modo bajo demanda (dejar morir la sesión
+  // para ahorrar 2Captcha) ya no aplica. Este keepAlive pingea para mantener
+  // viva la sesión y, si la encuentra muerta, dispara recuperación SIEMPRE.
 
   const b = new Bukeala(env);
   try {
@@ -597,43 +609,27 @@ async function keepAlive(env: Env): Promise<void> {
       console.log("[keepalive] lifetime tracking failed:", (e as Error).message);
     }
 
-    // MODO BAJO DEMANDA: solo renovamos si HAY pacientes esperando en la cola.
-    // Si la sesión está caída pero nadie la necesita, NO gastamos captcha —
-    // se renovará en cuanto llegue un paciente (queuePendingRequest) o en el
-    // login matutino. Esto es lo que baja el gasto ~75-80%.
-    let pendingCount = 0;
-    try { pendingCount = (await loadPendingRequests(env)).length; } catch { /* ignore */ }
-    if (pendingCount > 0) {
-      const lastAutoRefreshAt = await env.STATE.get("keepalive:autoRefreshAt");
-      const now = Date.now();
-      const shouldAutoRefresh =
-        !lastAutoRefreshAt || now - parseInt(lastAutoRefreshAt, 10) > 10 * 60 * 1000;
-      if (shouldAutoRefresh) {
-        try {
-          await requestRefresh(env, "auto-keepalive-pending");
-          await env.STATE.put("keepalive:autoRefreshAt", String(now), { expirationTtl: 60 * 60 });
-          console.log(`[keepalive] refresh disparado (${pendingCount} pacientes en cola)`);
-        } catch (e) {
-          console.log("[keepalive] auto-refresh request failed:", (e as Error).message);
-        }
+    // 24/7: renovar SIEMPRE que la sesión esté caída, haya o no pacientes en
+    // cola. Antes solo se renovaba con cola no vacía ("ahorro de captcha"), y
+    // eso dejaba /agenda muerto hasta que la VM lo notara en su siguiente tick
+    // (hasta 10 min). Con el navegador vivo renovar es gratis, así que no hay
+    // razón para esperar. Throttle de 10 min para no encolar refrescos de más.
+    const lastAutoRefreshAt = await env.STATE.get("keepalive:autoRefreshAt");
+    const now = Date.now();
+    const shouldAutoRefresh =
+      !lastAutoRefreshAt || now - parseInt(lastAutoRefreshAt, 10) > 10 * 60 * 1000;
+    if (shouldAutoRefresh) {
+      try {
+        await requestRefresh(env, "auto-keepalive-24-7");
+        await env.STATE.put("keepalive:autoRefreshAt", String(now), { expirationTtl: 60 * 60 });
+        console.log("[keepalive] refresh disparado (sesión caída, modo 24/7)");
+      } catch (e) {
+        console.log("[keepalive] auto-refresh request failed:", (e as Error).message);
       }
-    } else {
-      console.log("[keepalive] sesión caída pero cola vacía — no renovar (ahorro)");
-      return;
     }
 
-    // 2) Notify the doctor — pero NO de noche y NO si ya avisamos hace poco.
-    //
-    //    De noche (7pm-7am) la sesión expira A PROPÓSITO (config: la VM solo
-    //    renueva en horario laboral). Avisar "expirada" de madrugada sería
-    //    ruido sobre algo esperado. Solo avisamos en horario laboral.
-    const bogotaHour = (new Date().getUTCHours() - 5 + 24) % 24;
-    const inBusinessHours = bogotaHour >= 7 && bogotaHour < 19;
-    if (!inBusinessHours) {
-      console.log("[keepalive] expiry nocturna esperada — no se notifica");
-      return;
-    }
-
+    // 2) Avisar al doctor. Ya NO se silencia de noche: la VM renueva 24/7, así
+    //    que una expiración nocturna es una falla real, no algo esperado.
     // Throttle: máximo 1 aviso cada 30 min (antes borrábamos el flag con cada
     // éxito, lo que causaba spam si la sesión fluctuaba). 30 min da tiempo a
     // que el refresh auto se complete antes de un segundo aviso.

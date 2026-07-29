@@ -112,12 +112,21 @@ let loginInFlight = false;
 let liveSession = null;    // { browser, context, page } o null
 let liveSessionBornAt = 0; // para reciclaje por edad
 let liveSessionUses = 0;   // renovaciones en sitio servidas por esta sesión
-// Reciclaje: acota fugas de memoria de Chromium en la e2-micro (1 GB RAM).
-// 12h de edad o 72 usos (≈12h a cadencia de 10 min), lo que llegue primero;
-// el tope de usos protege si PROACTIVE_INTERVAL_MS se acorta. Cada reciclaje
-// cuesta a lo sumo 1 captcha (~2/día) porque el TGC guardado ya se usó.
-const LIVE_SESSION_MAX_AGE_MS = 12 * 60 * 60 * 1000;
-const LIVE_SESSION_MAX_USES = 72;
+// Reciclaje PREVENTIVO (clave para el 24/7) + acota fugas de memoria de
+// Chromium en la e2-micro (1 GB RAM).
+//
+// MEDIDO EN PRODUCCIÓN (29/jul/2026): el CAS de Colsanitas mata el TGC con un
+// tope DURO de ~6h (vidas medidas: 372, 364 y 366 min) sin importar la
+// actividad. Como todas las renovaciones "en sitio" montan sobre el MISMO TGC,
+// al cumplirse esas ~6h el backend tumbaba la sesión A MITAD DE CICLO y
+// /agenda quedaba caído 4-10 min hasta el re-login (pasó a las 01:36, 07:42 y
+// 13:45 Bogotá; la de las 07:42 fue la que vio el Dr.).
+//
+// Con reciclaje a 5h20m nos adelantamos al tope: el re-login ocurre cuando NOS
+// conviene y la sesión nunca muere sola. NO cuesta captchas extra — es el
+// mismo login que CAS iba a forzar de todos modos, solo que controlado.
+const LIVE_SESSION_MAX_AGE_MS = 5 * 60 * 60 * 1000 + 20 * 60 * 1000; // 5h20m < ~6h
+const LIVE_SESSION_MAX_USES = 30; // ≈5h a cadencia de 10 min (protege si se acorta)
 
 /** Suelta la referencia ANTES de cerrar (nadie debe usarla a medio cerrar). */
 async function closeLiveSession(why) {

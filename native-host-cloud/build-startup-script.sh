@@ -72,6 +72,34 @@ export PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
 echo "Instalando Chromium + deps del SO..."
 npx playwright install --with-deps chromium
 
+# --- Swap 1GB (la e2-micro tiene 1GB de RAM y Chromium vive 24/7) ---
+# Sin swap, un pico de memoria mata Chromium: el ciclo siguiente hace login
+# completo (gasta captcha) y deja un hueco de agenda. Idempotente.
+if [ ! -f /swapfile ]; then
+  echo "Creando swap de 1GB..."
+  fallocate -l 1G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=1024
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+swapon --show || true
+
+# --- Logrotate del log del watcher ---
+# El watcher escribe JSON en cada tick a /var/log/bukeala.log (append, sin
+# rotación): a la larga llena el disco y Chromium entra en crash loop.
+cat > /etc/logrotate.d/bukeala <<'LOGROT'
+/var/log/bukeala.log /var/log/bukeala-setup.log {
+  daily
+  rotate 7
+  maxsize 50M
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+LOGROT
+
 # systemd service
 cat > /etc/systemd/system/bukeala.service <<UNIT
 [Unit]
@@ -88,7 +116,9 @@ Environment=TWO_CAPTCHA_API_KEY=$TWO_CAPTCHA_API_KEY
 Environment=CAPTURE_TOKEN=$CAPTURE_TOKEN
 Environment=WORKER_URL=$WORKER_URL
 Environment=POLL_INTERVAL_MS=30000
-Environment=PROACTIVE_INTERVAL_MS=900000
+# 10 min: la sesión de Bukeala vive ~10-15 min, con 15 min quedaban ventanas
+# muertas entre renovaciones. Renovar es gratis (navegador vivo).
+Environment=PROACTIVE_INTERVAL_MS=600000
 Environment=PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
 ExecStart=/usr/bin/node $APP/watcher.js
 Restart=always
