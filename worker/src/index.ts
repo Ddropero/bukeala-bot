@@ -458,7 +458,8 @@ app.get("/debug/session-stats", async (c) => {
 
   // Contadores de hoy y ayer (UTC) por vía de renovación
   const days = [0, 1].map((d) => new Date(Date.now() - d * 86400000).toISOString().slice(0, 10));
-  const buckets = ["ok:tgc", "ok:captcha", "ok:captcha-fallback", "ok:unknown", "error"];
+  // "ok:alive" = renovación en sitio con el navegador vivo (0 captchas).
+  const buckets = ["ok:alive", "ok:tgc", "ok:captcha", "ok:captcha-fallback", "ok:unknown", "error"];
   const renewCounters: Record<string, Record<string, number>> = {};
   for (const day of days) {
     renewCounters[day] = {};

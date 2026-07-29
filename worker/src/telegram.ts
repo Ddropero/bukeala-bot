@@ -326,7 +326,8 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
       vmLine = `VM: ${last.type === "ok" ? "✅ renovó" : "❌ falló"} hace ${agoMin} min${via}`;
     }
     const day = new Date().toISOString().slice(0, 10);
-    const [tgcC, capC, fallC, errC, pendingRaw] = await Promise.all([
+    const [aliveC, tgcC, capC, fallC, errC, pendingRaw] = await Promise.all([
+      env.STATE.get(`stats:renew:${day}:ok:alive`),
       env.STATE.get(`stats:renew:${day}:ok:tgc`),
       env.STATE.get(`stats:renew:${day}:ok:captcha`),
       env.STATE.get(`stats:renew:${day}:ok:captcha-fallback`),
@@ -336,13 +337,15 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     let pendingCount = 0;
     try { pendingCount = pendingRaw ? (JSON.parse(pendingRaw) as unknown[]).length : 0; } catch { /* ignore */ }
     const captchasHoy = (parseInt(capC ?? "0", 10) || 0) + (parseInt(fallC ?? "0", 10) || 0);
+    // Gratis = navegador vivo (alive) + reuso de TGC. Ambas evitan el captcha.
+    const gratisHoy = (parseInt(aliveC ?? "0", 10) || 0) + (parseInt(tgcC ?? "0", 10) || 0);
 
     const lines = [
       alive ? "🟢 <b>Bukeala EN LÍNEA</b> (ping real OK)" : "🔴 <b>Bukeala CAÍDA</b>",
       `Ping: ${pingNote}`,
       `Sesión: capturada hace ${ageMin} min · ${s.cookies.length} cookies`,
       vmLine,
-      `Hoy: ${parseInt(tgcC ?? "0", 10) || 0} renovaciones sin captcha · ${captchasHoy} con captcha · ${parseInt(errC ?? "0", 10) || 0} errores`,
+      `Hoy: ${gratisHoy} renovaciones sin captcha · ${captchasHoy} con captcha · ${parseInt(errC ?? "0", 10) || 0} errores`,
       pendingCount > 0 ? `⏳ Cola: ${pendingCount} paciente(s) esperando` : "Cola: vacía",
     ];
     if (!alive) lines.push("", "Para renovar ya: /sesion_renew");
