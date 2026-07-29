@@ -5,10 +5,10 @@
  *
  *  1. KEEP-ALIVE PROACTIVO 24/7: renueva cada PROACTIVE_INTERVAL_MS a cualquier
  *     hora y empuja cookies nuevas al Worker. La sesión expira en ~10-15 min, así que
- *     renovar cada ~10 min la mantiene siempre viva. Guarda/restaura cookies con
- *     storageState (incluido el TGC de CAS) → la mayoría de renovaciones son sin
- *     reCAPTCHA (rápidas y casi gratis). El captcha solo se gasta cuando el TGC
- *     expira (cada varias horas).
+ *     renovar cada ~10 min la mantiene siempre viva. Mantiene el NAVEGADOR VIVO
+ *     entre renovaciones y re-navega en sitio (el TGC de CAS es de un solo uso,
+ *     ver autoLogin.js) → renovación normal sin reCAPTCHA. El captcha solo se
+ *     gasta en cold start, mantenimiento de Bukeala o reciclaje/crash del browser.
  *
  *  2. ON-DEMAND: cada POLL_INTERVAL_MS consulta /native-host/check-refresh.
  *     Si alguien pidió /sesion_renew por Telegram, hace login inmediato.
@@ -24,7 +24,7 @@
  */
 const os = require("node:os");
 const path = require("node:path");
-const { runAutoLogin } = require("./autoLogin");
+const { runAutoLogin, keepAliveInPlace } = require("./autoLogin");
 
 const APP_DIR = os.tmpdir(); // solo para screenshots de error
 // Archivo del TGC de CAS entre renovaciones → la mayoría no usan captcha.
@@ -103,14 +103,91 @@ async function reportEvent(c, event) {
 
 let loginInFlight = false;
 
+// ---- Sesión de navegador VIVA entre renovaciones (jul 2026) ----
+// El TGC de CAS es de un solo uso (evidencia en autoLogin.js): la única forma
+// de renovar sin captcha es NO crear contexto nuevo. Se conserva el
+// browser+context+page que devolvió runAutoLogin y se re-navega en sitio;
+// login completo solo cuando la sesión muere o toca reciclarla.
+// Solo doLogin toca liveSession (serializado por loginInFlight) → sin carreras.
+let liveSession = null;    // { browser, context, page } o null
+let liveSessionBornAt = 0; // para reciclaje por edad
+let liveSessionUses = 0;   // renovaciones en sitio servidas por esta sesión
+// Reciclaje: acota fugas de memoria de Chromium en la e2-micro (1 GB RAM).
+// 12h de edad o 72 usos (≈12h a cadencia de 10 min), lo que llegue primero;
+// el tope de usos protege si PROACTIVE_INTERVAL_MS se acorta. Cada reciclaje
+// cuesta a lo sumo 1 captcha (~2/día) porque el TGC guardado ya se usó.
+const LIVE_SESSION_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const LIVE_SESSION_MAX_USES = 72;
+
+/** Suelta la referencia ANTES de cerrar (nadie debe usarla a medio cerrar). */
+async function closeLiveSession(why) {
+  const s = liveSession;
+  liveSession = null;
+  if (!s) return;
+  log("info", "cerrando sesión de navegador viva", {
+    why, uses: liveSessionUses, ageMin: Math.round((Date.now() - liveSessionBornAt) / 60000),
+  });
+  try { await s.browser.close(); } catch { /* ya estaba muerto */ }
+}
+
+function adoptLiveSession(session) {
+  liveSession = session;
+  liveSessionBornAt = Date.now();
+  liveSessionUses = 0;
+  // Si Chromium muere solo (crash/OOM), soltar la referencia para que el
+  // próximo ciclo haga login completo en vez de operar sobre un browser muerto.
+  // El chequeo de identidad evita pisar una sesión más nueva.
+  session.browser.on("disconnected", () => {
+    if (liveSession === session) {
+      liveSession = null;
+      log("warn", "browser vivo se desconectó (crash/OOM); próximo ciclo hará login completo");
+    }
+  });
+}
+
 async function doLogin(c, reason) {
   if (loginInFlight) { log("info", "login already in flight, skip", { reason }); return "skipped"; }
   loginInFlight = true;
   const startedAt = Date.now();
   try {
     log("info", "auto-login start", { reason });
-    const r = await runAutoLogin(c);
+
+    // 0. Higiene de la sesión viva: reciclar por edad/usos, o soltarla si murió.
+    if (liveSession && (Date.now() - liveSessionBornAt >= LIVE_SESSION_MAX_AGE_MS || liveSessionUses >= LIVE_SESSION_MAX_USES)) {
+      await closeLiveSession("reciclaje programado");
+    } else if (liveSession && !liveSession.browser.isConnected()) {
+      await closeLiveSession("browser desconectado");
+    }
+
+    // 1. Intento EN SITIO (0 captchas). Aplica también a on-demand: renovar en
+    //    la misma sesión de navegador produce cookies igual de frescas.
+    let aliveFail = null; // por qué no sirvió la sesión viva (va al evento KV)
+    if (liveSession) {
+      const ka = await keepAliveInPlace(c, liveSession);
+      if (ka.ok) {
+        liveSessionUses += 1;
+        const durationMs = Date.now() - startedAt;
+        log("info", "auto-login OK", { cookieCount: ka.cookieCount, durationMs, reason, via: "alive", uses: liveSessionUses, url: ka.postNavUrl });
+        await reportEvent(c, {
+          type: "ok", message: `${ka.cookieCount} cookies (cloud, ${reason}, alive)`,
+          cookieCount: ka.cookieCount, durationMs,
+          via: "alive", fellBack: false, hadBukealaJsession: true, postNavUrl: ka.postNavUrl,
+          tgcNewTail: ka.tgcNewTail || undefined,
+        });
+        return ka;
+      }
+      // No sirvió (cas-form, crash, etc.): cerrarla ANTES del login completo
+      // para no acumular Chromiums, y caer a runAutoLogin (único que puede
+      // gastar captcha).
+      aliveFail = ka.reason || "unknown";
+      log("warn", "keep-alive en sitio no sirvió → login completo", { reason: aliveFail });
+      await closeLiveSession(`en sitio: ${aliveFail}`);
+    }
+
+    // 2. Login completo, conservando el browser para renovar en sitio después.
+    const r = await runAutoLogin(c, { keepAlive: true });
     const durationMs = Date.now() - startedAt;
+    if (r.ok && r.session) adoptLiveSession(r.session);
     if (r.ok) {
       // via real reportado por autoLogin: tgc | captcha | captcha-fallback
       const via = r.via || (r.usedCaptcha ? "captcha" : "tgc");
@@ -122,6 +199,7 @@ async function doLogin(c, reason) {
         via, fellBack: !!r.fellBack, hadBukealaJsession: !!r.hadBukealaJsession, postNavUrl: r.postNavUrl,
         tgcSource: r.tgcSource || undefined,
         tgcUsedTail: r.tgcUsedTail || undefined, tgcNewTail: r.tgcNewTail || undefined,
+        aliveFail: aliveFail || undefined,
       });
     } else {
       log("error", "auto-login FAIL", { reason: r.reason, durationMs, via: r.via, url: r.postNavUrl });
@@ -130,6 +208,7 @@ async function doLogin(c, reason) {
         durationMs, via: r.via, fellBack: !!r.fellBack, hadBukealaJsession: !!r.hadBukealaJsession, postNavUrl: r.postNavUrl,
         tgcSource: r.tgcSource || undefined,
         tgcUsedTail: r.tgcUsedTail || undefined, tgcNewTail: r.tgcNewTail || undefined,
+        aliveFail: aliveFail || undefined,
       });
     }
     return r;
@@ -147,11 +226,12 @@ async function main() {
     proactiveMs: PROACTIVE_INTERVAL_MS,
   });
 
-  // ESTRATEGIA 24/7 (TGC persistente):
-  // Renovar casi nunca cuesta captcha (se reusa el TGC del archivo en HOME o,
-  // si se perdió, se rescata del Worker). Keep-alive cada PROACTIVE_INTERVAL_MS
-  // a toda hora; on-demand a cualquier hora. El captcha solo se gasta cuando
-  // el TGC de CAS expira de verdad.
+  // ESTRATEGIA 24/7 (navegador vivo):
+  // La renovación normal es EN SITIO sobre la sesión de navegador viva (0
+  // captchas). Si murió (crash, reciclaje, mantenimiento de Bukeala) se hace
+  // login completo, que siembra el TGC guardado si aún sirve (un solo uso,
+  // <15 min) y si no gasta captcha. Keep-alive cada PROACTIVE_INTERVAL_MS a
+  // toda hora; on-demand a cualquier hora.
   let lastProactiveAt = Date.now();   // último keep-alive EXITOSO (el startup cuenta)
   let lastAttemptAt = Date.now();     // último INTENTO (éxito o fallo)
   let renewFailing = false;           // true si el último intento falló → reintentar con backoff

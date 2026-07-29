@@ -261,7 +261,18 @@ function toPlaywrightCookie(c) {
   return ck;
 }
 
-async function runAutoLogin(env) {
+/**
+ * Login completo (TGC → fallback captcha).
+ *
+ * `opts.keepAlive === true`: si el login es exitoso, NO cierra el browser y
+ * devuelve `session: { browser, context, page }` para que el llamador renueve
+ * en sitio (ver keepAliveInPlace). Se eligió un 2º parámetro y no un flag en
+ * `env` porque `env` es config compartida entre llamadas (cfg() del watcher)
+ * y esto es comportamiento por-llamada. En fallo o modo legacy cierra como
+ * siempre: cero fugas de Chromium.
+ */
+async function runAutoLogin(env, opts = {}) {
+  const keepAlive = opts.keepAlive === true;
   const { CAS_USERNAME, CAS_PASSWORD, TWO_CAPTCHA_API_KEY, CAPTURE_TOKEN, WORKER_URL, log } = env;
   if (!CAS_USERNAME || !CAS_PASSWORD) return { ok: false, reason: "CAS_USERNAME/CAS_PASSWORD missing" };
   if (!TWO_CAPTCHA_API_KEY) return { ok: false, reason: "TWO_CAPTCHA_API_KEY missing" };
@@ -288,6 +299,7 @@ async function runAutoLogin(env) {
     tgcUsedTail: null, tgcNewTail: null,
   };
   let result = { ok: false };
+  let keepOpen = false; // true solo si el login OK y el llamador conserva la sesión
 
   try {
     // ---- INTENTO 1: restaurar SOLO la cookie TGC ----
@@ -311,6 +323,7 @@ async function runAutoLogin(env) {
     diag.via = nav1.usedCaptcha ? "captcha" : "tgc";
 
     let activeCtx = ctx1;
+    let activePage = page1;
 
     if (!diag.hadBukealaJsession) {
       if (nav1.usedCaptcha) {
@@ -329,6 +342,7 @@ async function runAutoLogin(env) {
       await waitForBukealaSession(ctx2, SESSION_WAIT_MS);
       diag.hadBukealaJsession = (await hasBukealaSession(ctx2)) && looksAuthenticated(page2.url());
       activeCtx = ctx2;
+      activePage = page2;
       if (!diag.hadBukealaJsession) throw new Error(`No JSESSIONID de Bukeala ni con fallback (url=${page2.url()})`);
     }
 
@@ -339,13 +353,94 @@ async function runAutoLogin(env) {
 
     log("info", "auto-login OK", diag);
     result = { ok: true, cookieCount, usedCaptcha: diag.via !== "tgc", ...diag };
+    if (keepAlive) {
+      // Entregar la sesión viva: el contexto ACTIVO real (ctx2 si hubo
+      // fallback — ctx1 ya se cerró en esa rama). El llamador es dueño del
+      // browser desde aquí y debe cerrarlo él (closeLiveSession del watcher).
+      keepOpen = true;
+      result.session = { browser, context: activeCtx, page: activePage };
+    }
   } catch (e) {
     log("error", "auto-login failed", { error: e.message, diag });
     result = { ok: false, reason: e.message, ...diag };
   } finally {
-    await browser.close().catch(() => {});
+    if (!keepOpen) await browser.close().catch(() => {});
   }
   return result;
 }
 
-module.exports = { runAutoLogin };
+// ====================================================================
+// Renovación EN SITIO con navegador vivo (jul 2026)
+// ====================================================================
+//
+// Evidencia (huellas TGC medidas el 28/jul en producción): el TGC JWT de
+// Colsanitas es de UN SOLO USO y vida ≤ ~15 min (1er uso a 5 y 14.4 min → OK;
+// 2º uso del mismo token a 5.8 y 10.8 min → rechazado; 1er uso a 16.5 min →
+// rechazado). Y CAS NO rota el valor al reusarlo (usado == nuevo), así que
+// guardar el TGC en archivo y restaurarlo en un contexto NUEVO alterna
+// captcha/tgc y nunca baja a 0 captchas.
+//
+// En cambio, un browser+context+page VIVOS entre renovaciones presentan a CAS
+// siempre la misma sesión de navegador: re-navegar a Bukeala cada ~10 min
+// renueva el ticket sin form → 0 captchas. El captcha queda solo para: cold
+// start, mantenimiento nocturno de Bukeala y crash/reciclaje del navegador.
+// El TGC guardado se sigue sembrando en el cold start (un solo uso, pero
+// gratis si el token tiene <15 min — p.ej. tras un restart rápido).
+
+/**
+ * Renueva la sesión EN SITIO: re-navega BUKEALA_HOME en la MISMA page de una
+ * sesión viva `{ browser, context, page }` (la que devolvió runAutoLogin con
+ * `{ keepAlive: true }`). NUNCA lanza y NUNCA gasta captcha:
+ *  - sin sesión utilizable, o si aparece el form CAS, o ante cualquier error
+ *    → { ok:false, needsFullLogin:true, reason } (el watcher decide hacer el
+ *    login completo, que es el único que puede gastar captcha);
+ *  - si sigue autenticado → empuja cookies al Worker + guarda TGC y devuelve
+ *    { ok:true, via:"alive", ... } (mismos campos de diagnóstico que el resto).
+ */
+async function keepAliveInPlace(env, session) {
+  try {
+    const { CAPTURE_TOKEN, WORKER_URL, log } = env;
+    const STATE_FILE = env.STATE_FILE || path.join(os.homedir(), ".bukeala-tgc.json");
+    if (!session || !session.browser || !session.context || !session.page) {
+      return { ok: false, needsFullLogin: true, reason: "sin sesión viva" };
+    }
+    const { browser, context, page } = session;
+    // Chromium pudo morir entre renovaciones (crash/OOM en la e2-micro).
+    if (!browser.isConnected()) return { ok: false, needsFullLogin: true, reason: "browser desconectado" };
+    if (page.isClosed()) return { ok: false, needsFullLogin: true, reason: "page cerrada" };
+
+    // Misma secuencia de navegación que navigateAndLogin, pero SIN submitCasForm:
+    // si CAS pide form aquí, la sesión de navegador ya no sirve y gastar el
+    // captcha le toca al login completo (con su fallback probado), no a esta ruta.
+    await page.goto(BUKEALA_HOME, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForTimeout(1500);
+    const postNavUrl = page.url();
+    log("info", "keep-alive en sitio: after navigation", { url: postNavUrl });
+    if (postNavUrl.includes("/cas/login")) {
+      return { ok: false, needsFullLogin: true, reason: "cas-form", postNavUrl };
+    }
+    // Asegurar /keraltyadscritos (donde vive el JSESSIONID útil).
+    if (!page.url().includes("/keraltyadscritos/")) {
+      await page.goto(BUKEALA_HOME, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+      await page.waitForTimeout(1000);
+    }
+    await waitForBukealaSession(context, SESSION_WAIT_MS); // espera activa por la cookie
+    const authed = (await hasBukealaSession(context)) && looksAuthenticated(page.url());
+    if (!authed) {
+      return { ok: false, needsFullLogin: true, reason: `sin sesión Bukeala en sitio (url=${page.url()})`, postNavUrl };
+    }
+
+    const cookieCount = await captureAndPush(context, WORKER_URL, CAPTURE_TOKEN, log);
+    const savedTail = await saveTgc(context, STATE_FILE, log);
+    return {
+      ok: true, cookieCount, via: "alive",
+      postNavUrl, hadBukealaJsession: true,
+      tgcSaved: !!savedTail, tgcNewTail: savedTail || null,
+    };
+  } catch (e) {
+    // Nunca propagar: el watcher corre 24/7 y decide el fallback.
+    return { ok: false, needsFullLogin: true, reason: e.message };
+  }
+}
+
+module.exports = { runAutoLogin, keepAliveInPlace };
