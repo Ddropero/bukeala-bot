@@ -190,13 +190,20 @@ async function captureAndPush(context, WORKER_URL, CAPTURE_TOKEN, log) {
   return filtered.length;
 }
 
-/** Guarda SOLO la cookie TGC. Devuelve true si guardó algo. */
+/**
+ * Guarda SOLO la cookie TGC. Devuelve los últimos 12 chars del valor guardado
+ * (huella para rastrear identidad del token entre renovaciones) o false.
+ */
 async function saveTgc(context, STATE_FILE, log) {
   const cks = await context.cookies();
   const tgc = cks.filter((c) => isTgcName(c.name));
   if (tgc.length === 0) { log("warn", "no TGC cookie to save"); return false; }
-  try { fs.writeFileSync(STATE_FILE, JSON.stringify({ cookies: tgc, origins: [] })); log("info", "TGC saved", { count: tgc.length }); return true; }
-  catch (e) { log("warn", "save TGC failed", { error: e.message }); return false; }
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ cookies: tgc, origins: [] }));
+    const tail = (tgc[0].value || "").slice(-12);
+    log("info", "TGC saved", { count: tgc.length, tail });
+    return tail;
+  } catch (e) { log("warn", "save TGC failed", { error: e.message }); return false; }
 }
 
 function loadTgc(STATE_FILE) {
@@ -271,7 +278,15 @@ async function runAutoLogin(env) {
     args: ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
   });
 
-  const diag = { via: "captcha", postNavUrl: null, hadBukealaJsession: false, fellBack: false, tgcSaved: false, tgcSource: null };
+  const diag = {
+    via: "captcha", postNavUrl: null, hadBukealaJsession: false, fellBack: false,
+    tgcSaved: false, tgcSource: null,
+    // Huellas (últimos 12 chars de la firma JWT) para rastrear la identidad
+    // del token entre renovaciones: ¿presentamos el token correcto? ¿CAS lo
+    // rotó al reusarlo? Sin esto no se puede distinguir bug de guardado vs
+    // política del servidor.
+    tgcUsedTail: null, tgcNewTail: null,
+  };
   let result = { ok: false };
 
   try {
@@ -284,6 +299,7 @@ async function runAutoLogin(env) {
       savedTgc = await fetchTgcFromWorker(WORKER_URL, CAPTURE_TOKEN, log);
       if (savedTgc) diag.tgcSource = "worker";
     }
+    if (savedTgc) diag.tgcUsedTail = (savedTgc.cookies[0]?.value || "").slice(-12) || null;
     const ctx1 = await browser.newContext({ ...CONTEXT_OPTIONS });
     if (savedTgc) await ctx1.addCookies(savedTgc.cookies.map(toPlaywrightCookie));
     log("info", savedTgc ? `TGC restaurado (fuente: ${diag.tgcSource})` : "sin TGC previo");
@@ -317,7 +333,9 @@ async function runAutoLogin(env) {
     }
 
     const cookieCount = await captureAndPush(activeCtx, WORKER_URL, CAPTURE_TOKEN, log);
-    diag.tgcSaved = await saveTgc(activeCtx, STATE_FILE, log);
+    const savedTail = await saveTgc(activeCtx, STATE_FILE, log);
+    diag.tgcSaved = !!savedTail;
+    diag.tgcNewTail = savedTail || null;
 
     log("info", "auto-login OK", diag);
     result = { ok: true, cookieCount, usedCaptcha: diag.via !== "tgc", ...diag };

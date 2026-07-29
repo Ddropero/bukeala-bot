@@ -34,6 +34,8 @@ interface NativeHostEvent {
   hadBukealaJsession?: boolean;
   postNavUrl?: string;       // URL tras la 1ª navegación (para diagnosticar)
   tgcSource?: string;        // "file" | "worker" — de dónde salió el TGC reusado
+  tgcUsedTail?: string;      // últimos 12 chars del TGC presentado a CAS
+  tgcNewTail?: string;       // últimos 12 chars del TGC guardado tras el login
 }
 
 export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
@@ -60,6 +62,8 @@ export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
     hadBukealaJsession: body.hadBukealaJsession,
     postNavUrl: body.postNavUrl,
     tgcSource: body.tgcSource,
+    tgcUsedTail: body.tgcUsedTail,
+    tgcNewTail: body.tgcNewTail,
   };
 
   // Append to rolling log

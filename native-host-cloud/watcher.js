@@ -121,6 +121,7 @@ async function doLogin(c, reason) {
         cookieCount: r.cookieCount, durationMs,
         via, fellBack: !!r.fellBack, hadBukealaJsession: !!r.hadBukealaJsession, postNavUrl: r.postNavUrl,
         tgcSource: r.tgcSource || undefined,
+        tgcUsedTail: r.tgcUsedTail || undefined, tgcNewTail: r.tgcNewTail || undefined,
       });
     } else {
       log("error", "auto-login FAIL", { reason: r.reason, durationMs, via: r.via, url: r.postNavUrl });
@@ -128,6 +129,7 @@ async function doLogin(c, reason) {
         type: "error", message: `${r.reason} (cloud, ${reason}, via=${r.via || "?"})`,
         durationMs, via: r.via, fellBack: !!r.fellBack, hadBukealaJsession: !!r.hadBukealaJsession, postNavUrl: r.postNavUrl,
         tgcSource: r.tgcSource || undefined,
+        tgcUsedTail: r.tgcUsedTail || undefined, tgcNewTail: r.tgcNewTail || undefined,
       });
     }
     return r;
