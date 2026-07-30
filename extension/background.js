@@ -61,6 +61,8 @@ async function casHeartbeat() {
 }
 
 // Light ping to the appoint host, just to make sure JSESSIONID gets touched.
+// Además decide si ESTE navegador está autenticado: la URL final tras seguir
+// redirects delata la sesión (si acaba en el login de CAS, no lo está).
 async function appointPing() {
   try {
     const r = await fetch(APPOINT_PING_URL, {
@@ -69,11 +71,17 @@ async function appointPing() {
       redirect: "follow",
       headers: { Accept: "text/html" },
     });
-    console.log(`[bukeala-bg] appoint ping → ${r.status} ${r.url}`);
-    return { ok: r.ok || r.redirected, status: r.status };
+    const finalUrl = r.url || "";
+    const authenticated =
+      r.ok &&
+      !finalUrl.includes("/cas/login") &&
+      !finalUrl.includes("/authentication/login");
+    console.log(`[bukeala-bg] appoint ping → ${r.status} ${finalUrl} (auth=${authenticated})`);
+    return { ok: r.ok || r.redirected, status: r.status, url: finalUrl, authenticated };
   } catch (e) {
     console.log("[bukeala-bg] appoint ping error:", e.message);
-    return { ok: false, error: e.message };
+    // Error de red: no podemos concluir que no esté autenticado.
+    return { ok: false, error: e.message, authenticated: null };
   }
 }
 
@@ -163,8 +171,30 @@ async function autoTick() {
   // 1. Refresh CAS-TGC. This is the key step that worker can't do itself.
   await casHeartbeat();
   // 2. Touch JSESSIONID at appoint host so cookies are fresh.
-  await appointPing();
-  // 3. Capture all cookies and send to worker (which decrypts + uses them).
+  const ping = await appointPing();
+
+  // 3. Enviar SOLO si este navegador está realmente autenticado.
+  //
+  // Antes se enviaba siempre. Si el Chrome del doctor tenía la sesión de
+  // Bukeala caducada (pasa a diario), reenviaba cookies muertas cada 5 min y
+  // PISABA la sesión buena que mantiene la VM 24/7 → /agenda caído a ratos.
+  // Medido el 30/jul/2026: disponibilidad 20-30% mientras el PC estuvo
+  // encendido. El Worker ahora también rechaza estos pushes (409), pero no
+  // enviarlos de entrada evita el ruido.
+  //
+  // authenticated === null → error de red: no concluimos nada, mejor enviar
+  // (la VM es la fuente principal y el Worker valida antes de reemplazar).
+  if (ping.authenticated === false) {
+    console.log("[bukeala-bg] navegador NO autenticado en Bukeala → no se envía (evita pisar la sesión buena)");
+    await chrome.storage.local.set({
+      lastAutoSendAt: new Date().toISOString(),
+      lastAutoSendOk: false,
+      lastAutoSendError: "navegador sin sesión de Bukeala — no se envió",
+    });
+    return;
+  }
+
+  // 4. Capture all cookies and send to worker (which decrypts + uses them).
   await sendSessionToWorker();
 }
 

@@ -137,24 +137,48 @@ async function verifySessionWorks(context, log) {
  * "OK" con /agenda caído. Esta prueba mide justo lo que importa.
  */
 async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log) {
-  try {
-    const base = WORKER_URL.replace(/\/capture$/, "");
-    const res = await fetch(`${base}/debug/measure?token=${encodeURIComponent(CAPTURE_TOKEN)}`);
-    if (!res.ok) {
-      log("warn", "verify via worker: HTTP no-OK", { status: res.status });
-      return { ok: false, detail: `worker HTTP ${res.status}` };
+  const base = WORKER_URL.replace(/\/capture$/, "");
+  const url = `${base}/debug/measure?token=${encodeURIComponent(CAPTURE_TOKEN)}`;
+
+  // Un intento: distingue VEREDICTO ({alive:true/false}) de AMBIGUO (5xx, red,
+  // cuerpo no-JSON). Solo un veredicto explícito de "no sirve" descarta la sesión.
+  async function attempt() {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+      if (!res.ok) return { verdict: "ambiguo", detail: `worker HTTP ${res.status}` };
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { return { verdict: "ambiguo", detail: "cuerpo no-JSON" }; }
+      if (data.alive === true) return { verdict: "ok", detail: `worker status ${data.status}` };
+      if (data.alive === false) {
+        return {
+          verdict: "malo",
+          detail: `worker dice ${data.status ?? data.err ?? "no-alive"} (${data.cookies ?? "?"} cookies)`,
+        };
+      }
+      return { verdict: "ambiguo", detail: "respuesta sin campo alive" };
+    } catch (e) {
+      return { verdict: "ambiguo", detail: e.message };
     }
-    const data = await res.json().catch(() => ({}));
-    if (data.alive === true) return { ok: true, detail: `worker status ${data.status}` };
-    log("warn", "verify via worker: el Worker NO puede usar la sesión", {
-      status: data.status, cookies: data.cookies, err: data.err,
-    });
-    return { ok: false, detail: `worker dice ${data.status ?? data.err ?? "no-alive"} (${data.cookies ?? "?"} cookies)` };
-  } catch (e) {
-    // Fallo de red hacia el Worker: no podemos concluir que la sesión esté mal.
-    log("warn", "verify via worker lanzó (se asume OK)", { error: e.message });
-    return { ok: true, detail: `inconcluso: ${e.message}` };
   }
+
+  let r = await attempt();
+  if (r.verdict === "ambiguo") {
+    // Reintento único: un hipo de red del Worker no debe costar un captcha.
+    await new Promise((res) => setTimeout(res, 5000));
+    r = await attempt();
+  }
+
+  if (r.verdict === "ok") return { ok: true, detail: r.detail };
+  if (r.verdict === "malo") {
+    log("warn", "verify via worker: el Worker NO puede usar la sesión", { detail: r.detail });
+    return { ok: false, detail: r.detail };
+  }
+  // AMBIGUO tras reintento: asumir OK. verifySessionWorks() ya validó la sesión
+  // contra Bukeala desde el navegador; tirar el navegador vivo por no poder
+  // hablar con el Worker gastaría un captcha por nada (y en cadena).
+  log("warn", "verify via worker inconcluso tras reintento → se asume OK", { detail: r.detail });
+  return { ok: true, detail: `inconcluso: ${r.detail}` };
 }
 
 /** ¿Estamos en una página de Bukeala autenticada (no login)? */
