@@ -35,8 +35,11 @@ const TWO_CAPTCHA_POLL_INTERVAL_MS = 5000;
 const TWO_CAPTCHA_MAX_WAIT_MS = 120 * 1000;
 const SESSION_WAIT_MS = 10000; // espera activa por el JSESSIONID de Bukeala
 
-const BUKEALA_HOME =
-  "https://appoint.tuscitasmedicas.com/keraltyadscritos/findAvailability";
+const BUKEALA_BASE = "https://appoint.tuscitasmedicas.com/keraltyadscritos";
+const BUKEALA_HOME = `${BUKEALA_BASE}/findAvailability`;
+// Endpoint autenticado y barato para PROBAR que la sesión de verdad sirve
+// (el mismo que usa el Worker): con sesión muerta responde 302/403, no JSON.
+const VERIFY_PATH = "/findAvailability/loadComponents?branchIdStr=456&attentionType=P&areaCode=&authorizationCode=";
 
 // Prefijos de cookie que constituyen el TGC de CAS (match flexible).
 const TGC_PREFIXES = ["TGC", "CASTGC"];
@@ -79,6 +82,79 @@ async function solveRecaptcha(twoCaptchaKey, sitekey, pageUrl, log) {
 async function hasBukealaSession(context) {
   const cks = await context.cookies();
   return cks.some((c) => c.name === "JSESSIONID" && (c.domain || "").toLowerCase().includes("tuscitasmedicas"));
+}
+
+/**
+ * PRUEBA REAL de que la sesión sirve: llama un endpoint autenticado con las
+ * cookies del contexto y exige 200 + JSON.
+ *
+ * Por qué existe: comprobar "la cookie JSESSIONID existe" + "la URL parece
+ * autenticada" NO alcanza. El 29/jul (19:27-19:55 Bogotá) Bukeala invalidó la
+ * sesión y el navegador vivo siguió navegando a /keraltyadscritos/findCustomer
+ * sin ver el form de CAS → reportó "alive OK" y empujó una sesión MUERTA cada
+ * 10 min durante ~28 min. /agenda caído todo ese rato sin que nadie lo supiera.
+ * Con esta prueba, ese caso cae a login completo (~90 s) en el primer ciclo.
+ */
+async function verifySessionWorks(context, log) {
+  try {
+    const url = `${BUKEALA_BASE}${VERIFY_PATH}&_=${Date.now()}`;
+    const res = await context.request.get(url, {
+      headers: {
+        "X-Requested-With": "XMLHttpRequest",
+        Accept: "application/json, text/javascript, */*; q=0.01",
+        Referer: BUKEALA_HOME,
+      },
+      maxRedirects: 0,      // un 302 a login es fallo, no algo que seguir
+      timeout: 20_000,
+    });
+    const status = res.status();
+    if (status !== 200) {
+      log("warn", "verificación de sesión falló", { status });
+      return { ok: false, detail: `status ${status}` };
+    }
+    const body = (await res.text().catch(() => "")).trim();
+    // Con sesión viva loadComponents devuelve un array JSON.
+    if (!body.startsWith("[") && !body.startsWith("{")) {
+      log("warn", "verificación de sesión: respuesta no-JSON", { head: body.slice(0, 60) });
+      return { ok: false, detail: "respuesta no-JSON" };
+    }
+    return { ok: true, detail: `200 (${body.length} bytes)` };
+  } catch (e) {
+    log("warn", "verificación de sesión lanzó", { error: e.message });
+    return { ok: false, detail: e.message };
+  }
+}
+
+/**
+ * Verificación AUTORITATIVA: le pregunta al WORKER si la sesión que acabamos
+ * de empujar le sirve (GET /debug/measure → {alive:true|false}).
+ *
+ * Por qué no basta verifySessionWorks(): esa prueba usa las cookies del
+ * NAVEGADOR, y el Worker solo recibe el subconjunto que captureAndPush filtra
+ * (y de ese, cookieHeader manda las del dominio/path). Si falta una pieza —p.
+ * ej. AWSALB, que fija el backend con la sesión Java— el navegador funciona y
+ * el Worker recibe 302. Eso es lo que pasó el 29/jul: pushes de 14 cookies
+ * "OK" con /agenda caído. Esta prueba mide justo lo que importa.
+ */
+async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log) {
+  try {
+    const base = WORKER_URL.replace(/\/capture$/, "");
+    const res = await fetch(`${base}/debug/measure?token=${encodeURIComponent(CAPTURE_TOKEN)}`);
+    if (!res.ok) {
+      log("warn", "verify via worker: HTTP no-OK", { status: res.status });
+      return { ok: false, detail: `worker HTTP ${res.status}` };
+    }
+    const data = await res.json().catch(() => ({}));
+    if (data.alive === true) return { ok: true, detail: `worker status ${data.status}` };
+    log("warn", "verify via worker: el Worker NO puede usar la sesión", {
+      status: data.status, cookies: data.cookies, err: data.err,
+    });
+    return { ok: false, detail: `worker dice ${data.status ?? data.err ?? "no-alive"} (${data.cookies ?? "?"} cookies)` };
+  } catch (e) {
+    // Fallo de red hacia el Worker: no podemos concluir que la sesión esté mal.
+    log("warn", "verify via worker lanzó (se asume OK)", { error: e.message });
+    return { ok: true, detail: `inconcluso: ${e.message}` };
+  }
 }
 
 /** ¿Estamos en una página de Bukeala autenticada (no login)? */
@@ -346,7 +422,52 @@ async function runAutoLogin(env, opts = {}) {
       if (!diag.hadBukealaJsession) throw new Error(`No JSESSIONID de Bukeala ni con fallback (url=${page2.url()})`);
     }
 
-    const cookieCount = await captureAndPush(activeCtx, WORKER_URL, CAPTURE_TOKEN, log);
+    // Probar que la sesión SIRVE (no solo que la cookie existe) antes de
+    // empujarla al Worker. Si el TGC dio una sesión inútil, caer al fallback
+    // con captcha en vez de publicar algo muerto.
+    const verify = await verifySessionWorks(activeCtx, log);
+    if (!verify.ok) {
+      if (diag.via === "tgc") {
+        log("warn", "TGC dio sesión inválida → fallback contexto fresco", { detail: verify.detail });
+        diag.fellBack = true;
+        diag.via = "captcha-fallback";
+        await ctx1.close().catch(() => {});
+        const ctx3 = await browser.newContext({ ...CONTEXT_OPTIONS });
+        const page3 = await ctx3.newPage();
+        await navigateAndLogin(page3, creds, TWO_CAPTCHA_API_KEY, log);
+        await waitForBukealaSession(ctx3, SESSION_WAIT_MS);
+        activeCtx = ctx3;
+        activePage = page3;
+        diag.hadBukealaJsession = (await hasBukealaSession(ctx3)) && looksAuthenticated(page3.url());
+        const verify2 = await verifySessionWorks(activeCtx, log);
+        if (!verify2.ok) throw new Error(`sesión inválida incluso tras captcha (${verify2.detail})`);
+      } else {
+        throw new Error(`sesión inválida tras login con captcha (${verify.detail})`);
+      }
+    }
+
+    let cookieCount = await captureAndPush(activeCtx, WORKER_URL, CAPTURE_TOKEN, log);
+
+    // Comprobación FINAL con el Worker. Si el push no le sirve y veníamos por
+    // TGC, reintentar con contexto fresco + captcha (login probado).
+    let wv = await verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log);
+    if (!wv.ok && diag.via === "tgc") {
+      log("warn", "push por TGC inservible para el Worker → fallback captcha", { detail: wv.detail });
+      diag.fellBack = true;
+      diag.via = "captcha-fallback";
+      await ctx1.close().catch(() => {});
+      const ctx4 = await browser.newContext({ ...CONTEXT_OPTIONS });
+      const page4 = await ctx4.newPage();
+      await navigateAndLogin(page4, creds, TWO_CAPTCHA_API_KEY, log);
+      await waitForBukealaSession(ctx4, SESSION_WAIT_MS);
+      activeCtx = ctx4;
+      activePage = page4;
+      diag.hadBukealaJsession = (await hasBukealaSession(ctx4)) && looksAuthenticated(page4.url());
+      cookieCount = await captureAndPush(activeCtx, WORKER_URL, CAPTURE_TOKEN, log);
+      wv = await verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log);
+    }
+    if (!wv.ok) throw new Error(`el Worker no puede usar la sesión (${wv.detail})`);
+
     const savedTail = await saveTgc(activeCtx, STATE_FILE, log);
     diag.tgcSaved = !!savedTail;
     diag.tgcNewTail = savedTail || null;
@@ -430,7 +551,28 @@ async function keepAliveInPlace(env, session) {
       return { ok: false, needsFullLogin: true, reason: `sin sesión Bukeala en sitio (url=${page.url()})`, postNavUrl };
     }
 
+    // CRÍTICO: probar que la sesión SIRVE antes de empujarla. Sin esto se
+    // empujaban sesiones muertas reportadas como buenas (ver verifySessionWorks).
+    const verify = await verifySessionWorks(context, log);
+    if (!verify.ok) {
+      return {
+        ok: false, needsFullLogin: true,
+        reason: `sesión no válida en sitio (${verify.detail})`, postNavUrl,
+      };
+    }
+
     const cookieCount = await captureAndPush(context, WORKER_URL, CAPTURE_TOKEN, log);
+
+    // Comprobación FINAL con el Worker: ¿de verdad puede usar lo que empujamos?
+    // Si no, esta sesión de navegador ya no sirve → login completo.
+    const wv = await verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log);
+    if (!wv.ok) {
+      return {
+        ok: false, needsFullLogin: true,
+        reason: `push inservible para el Worker (${wv.detail})`, postNavUrl,
+      };
+    }
+
     const savedTail = await saveTgc(context, STATE_FILE, log);
     return {
       ok: true, cookieCount, via: "alive",

@@ -103,13 +103,18 @@ export async function updateCookiesFromResponse(env: Env, res: Response): Promis
   // captured the cookies that point to the right backend; we keep those.
   const STICKY_BLOCKLIST = new Set(["AWSALB", "AWSALBCORS", "AWSALBTG", "AWSALBTGCORS"]);
 
-  // CRÍTICO: NO agregar como cookie NUEVA estos nombres si llegan por
-  // Set-Cookie en una respuesta. El JSESSIONID correcto lo fija el login
-  // fresco (vía /capture). Si Bukeala/Reblaze emite un JSESSIONID nuevo en
-  // una ruta cualquiera y lo AGREGAMOS, terminamos con 2+ JSESSIONID y el
-  // cookieHeader manda el equivocado → 302 intermitente. Solo ACTUALIZAMOS
-  // el valor de uno que ya exista; nunca duplicamos.
-  const UPDATE_ONLY = new Set(["JSESSIONID"]);
+  // CRÍTICO: el JSESSIONID NO se toca NUNCA desde una respuesta.
+  //
+  // Antes se "actualizaba" el existente con el valor que llegara por
+  // Set-Cookie. Eso destruía la sesión: cuando Bukeala responde 302 (p. ej.
+  // /myBookings → /keraltyadscritos) adjunta un JSESSIONID ANÓNIMO nuevo; el
+  // Worker lo adoptaba y pisaba el bueno → todas las llamadas siguientes
+  // fallaban hasta el próximo push de la VM. Explica las sesiones que morían a
+  // los ~4-5 min y los blips de /agenda del 29/jul.
+  //
+  // Quién manda: la VM. Empuja un JSESSIONID válido cada ~10 min vía /capture
+  // (saveSession reemplaza la sesión completa). El Worker solo lo consume.
+  const NEVER_TOUCH = new Set(["JSESSIONID"]);
 
   let changed = false;
   for (const raw of setCookies) {
@@ -129,17 +134,8 @@ export async function updateCookiesFromResponse(env: Env, res: Response): Promis
       /Expires=Thu, 01 Jan 1970/i.test(raw);
     if (isDeletion) continue;
 
-    // Para JSESSIONID: actualizar TODAS las instancias existentes al mismo
-    // valor (mantiene una sola sesión Java coherente), pero nunca crear una
-    // nueva entrada si no existía.
-    if (UPDATE_ONLY.has(name)) {
-      let touched = false;
-      for (const c of session.cookies) {
-        if (c.name === name && c.value !== value) { c.value = value; touched = true; }
-      }
-      if (touched) changed = true;
-      continue;
-    }
+    // JSESSIONID: ignorar por completo (ni actualizar ni agregar).
+    if (NEVER_TOUCH.has(name)) continue;
 
     const existing = session.cookies.find((c) => c.name === name);
     if (existing) {

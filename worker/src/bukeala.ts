@@ -93,7 +93,10 @@ export class Bukeala {
     // headers. Critical for CAS renewal flow (new JSESSIONID arrives via
     // Set-Cookie). The blocklist in updateCookiesFromResponse prevents
     // AWSALB from being overwritten (would re-route to wrong sticky backend).
-    if (res.status !== 401 && res.status !== 403) {
+    // Solo adoptamos cookies de respuestas EXITOSAS (2xx). Un 3xx suele ser el
+    // redirect a login y trae cookies de una sesión anónima: adoptarlas
+    // corrompía la sesión buena (ver NEVER_TOUCH en kv.ts).
+    if (res.status >= 200 && res.status < 300) {
       await updateCookiesFromResponse(this.env, res);
     }
 
