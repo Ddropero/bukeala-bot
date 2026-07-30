@@ -141,12 +141,24 @@ async function sendSessionToWorker() {
     const ok = res.ok;
     const body = await res.json().catch(() => ({}));
     console.log(`[bukeala-bg] send result: ${res.status}`, body);
+
+    // Motivo legible. El 409 es el guardia anti-envenenamiento del Worker:
+    // NO es un fallo del sistema, es que este navegador no tiene sesión válida
+    // y el Worker conservó la buena (la de la VM).
+    const reason =
+      res.status === 409
+        ? "Tu navegador no tiene sesión válida de Bukeala. El Worker conservó la sesión buena (la de la VM). Loguéate en Bukeala en otra pestaña si quieres enviar la tuya."
+        : ok
+          ? null
+          : (body.detail || body.error || `HTTP ${res.status}`);
+
     await chrome.storage.local.set({
       lastAutoSendAt: new Date().toISOString(),
       lastAutoSendOk: ok,
       lastAutoSendCount: body.cookieCount ?? allCookies.length,
+      lastAutoSendError: reason,
     });
-    return { ok, count: allCookies.length, body };
+    return { ok, status: res.status, count: allCookies.length, body, reason };
   } catch (e) {
     console.log("[bukeala-bg] network error:", e.message);
     await chrome.storage.local.set({

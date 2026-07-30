@@ -59,8 +59,13 @@ $("sendBtn").addEventListener("click", async () => {
     if (r?.ok) {
       const j = r.body || {};
       setStatus(`✅ OK. ${j.cookieCount ?? "?"} cookies. Expira: ${j.expiresAt ?? "?"}`, "ok");
+    } else if (r?.status === 409) {
+      // Guardia del Worker: no es una falla, es protección. La sesión buena
+      // (la que mantiene la VM 24/7) sigue en pie.
+      setStatus(`🛡️ No se envió: ${r.reason}`, "");
     } else {
-      setStatus(`Error: ${r?.reason || "desconocido"}`, "err");
+      const detail = r?.reason || r?.body?.detail || r?.body?.error || "desconocido";
+      setStatus(`Error: ${detail}`, "err");
     }
   } catch (e) {
     setStatus(`Error: ${e.message}`, "err");
