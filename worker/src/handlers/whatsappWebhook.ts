@@ -38,6 +38,10 @@ import { transcribeAudio } from "../whisper";
 const TG = (token: string) => `https://api.telegram.org/bot${token}`;
 
 interface WAWebhookEntry {
+  /** ID de la WABA (WhatsApp Business Account) dueña del número. Meta lo manda
+   *  en CADA webhook: es la única fuente fiable, porque el token no permite
+   *  derivarlo desde el phone_number_id (ver getWabaId en waTemplates.ts). */
+  id?: string;
   changes?: Array<{
     field?: string;
     value?: {
@@ -120,6 +124,19 @@ export async function handleWhatsAppWebhook(c: Context<{ Bindings: Env }>) {
 async function processPayload(env: Env, payload: WAWebhookPayload): Promise<void> {
   if (payload.object !== "whatsapp_business_account") return;
   for (const entry of payload.entry ?? []) {
+    // Guardar el WABA id que Meta nos manda. Es el dato que faltaba para crear
+    // las plantillas en la WABA CORRECTA (la del número que envía). Sin él, las
+    // plantillas viven en otra WABA y Meta responde 132001 → la confirmación
+    // fuera de la ventana de 24h nunca llega.
+    if (entry.id) {
+      try {
+        const prev = await env.STATE.get("wa:wabaId");
+        if (prev !== entry.id) {
+          await env.STATE.put("wa:wabaId", entry.id, { expirationTtl: 60 * 60 * 24 * 365 });
+          console.log(`[wa-webhook] WABA id capturado: ${entry.id}`);
+        }
+      } catch { /* no bloquear el mensaje por esto */ }
+    }
     for (const change of entry.changes ?? []) {
       if (change.field !== "messages") continue;
       const value = change.value ?? {};

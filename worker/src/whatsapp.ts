@@ -166,7 +166,9 @@ export async function sendInteractiveList(
 /**
  * Send a custom template with parameters. Template must be pre-approved by Meta.
  * Example template "appointment_confirmation" with body params {patient_name}, {date}, {time}, {place}:
- *   sendTemplate(env, to, "appointment_confirmation", "es", [{type:"text",text:"Juan"},...])
+ *   sendTemplate(env, to, "appointment_confirmation", "es_CO", [{type:"text",text:"Juan"},...])
+ * OJO: el idioma de TODAS las plantillas aprobadas de esta WABA es **es_CO**,
+ * no "es". Con "es" Meta responde 132001 (no encuentra la plantilla).
  */
 export async function sendTemplate(
   env: Env,
@@ -226,9 +228,13 @@ export async function sendAppointmentConfirmation(
     `Si necesitas reprogramar, escríbenos por aquí. ¡Te esperamos!`;
   const txt = await sendText(env, to, body);
   if (txt.ok) return txt;
-  // Fuera de la ventana 24h el texto libre falla → intentamos plantilla (sirve
-  // solo si existe en la WABA del número; hoy falla, pero queda listo para cuando
-  // se creen las plantillas en la WABA correcta).
+  // Fuera de la ventana 24h el texto libre falla → plantilla.
+  //
+  // FIX 31/jul/2026: antes pedía `confirmar_cita` en idioma "es", y NINGUNA de
+  // las dos cosas existe → 132001 siempre, o sea que agendar desde Telegram
+  // para un paciente que no había escrito ese día NO enviaba confirmación.
+  // La WABA real del número (900708529661507, capturada del webhook) tiene
+  // `appointment_confirmation_v2` en **es_CO** con 4 params, APROBADA.
   console.log("[whatsapp] confirmación texto libre falló (¿fuera de 24h?), intento plantilla:", JSON.stringify((txt as any).data?.error ?? txt).slice(0, 160));
   const params: Array<{ type: "text"; text: string }> = [
     { type: "text", text: patientName },
@@ -236,7 +242,7 @@ export async function sendAppointmentConfirmation(
     { type: "text", text: timeText },
     { type: "text", text: place },
   ];
-  return sendTemplate(env, to, "confirmar_cita", "es", params);
+  return sendTemplate(env, to, "appointment_confirmation_v2", "es_CO", params);
 }
 
 /**
@@ -257,7 +263,7 @@ export async function sendAppointmentReminder(
     console.log("[whatsapp] reminder skipped: invalid phone", patientPhoneRaw);
     return { ok: false, reason: "invalid_phone" };
   }
-  return sendTemplate(env, to, "appointment_reminder", "es", [
+  return sendTemplate(env, to, "appointment_reminder", "es_CO", [
     { type: "text", text: patientName },
     { type: "text", text: dateText },
     { type: "text", text: timeText },
@@ -266,16 +272,19 @@ export async function sendAppointmentReminder(
 }
 
 /**
- * Pide al paciente que CONFIRME su cita con botones (Quick Reply).
+ * Pide al paciente que CONFIRME su cita.
  *
- * Usa el template `confirmar_cita` (es_CO) que debe crearse en Meta Business
- * Manager con 2 botones de respuesta rápida:
- *    "✅ Sí, confirmo"   y   "❌ No podré"
- * Body params: {{1}} name, {{2}} date, {{3}} time, {{4}} place
+ * ⚠️ SIN BOTONES HOY. La WABA del número (900708529661507) tiene 7 plantillas
+ * aprobadas y NINGUNA con Quick Reply — `confirmar_cita` nunca se creó ahí.
+ * Antes esta función pedía `confirmar_cita`/"es" y caía a
+ * `appointment_reminder`/"es": las DOS fallaban (nombre inexistente e idioma
+ * equivocado — el aprobado es es_CO), así que no se enviaba nada.
  *
- * FALLBACK: si el template todavía no está aprobado (o falla), cae al
- * `appointment_reminder` normal para que el paciente igual reciba el aviso.
- * El campo `mode` indica qué se envió: "confirm" | "reminder_fallback".
+ * Ahora manda `appointment_confirmation_v2` (es_CO, 4 params) y el paciente
+ * responde por texto; la IA del webhook interpreta la respuesta. Para tener
+ * botones reales hay que crear una plantilla con Quick Reply en ESA WABA
+ * (entonces `handleConfirmReply` los recibiría como type="button").
+ * `mode` indica qué se envió: "confirm" | "reminder_fallback".
  */
 export async function sendAppointmentConfirmRequest(
   env: Env,
@@ -295,10 +304,18 @@ export async function sendAppointmentConfirmRequest(
     { type: "text", text: timeText },
     { type: "text", text: place },
   ];
-  const r = await sendTemplate(env, to, "confirmar_cita", "es", params);
-  if (r.ok) return { ...r, mode: "confirm" };
-  // Template aún no aprobado → recordatorio normal como respaldo
-  const fb = await sendTemplate(env, to, "appointment_reminder", "es", params);
+  // 1º: plantilla CON botones. Creada el 31/jul/2026 en la WABA correcta y
+  //     en revisión de Meta — en cuanto la aprueben empieza a usarse SOLA,
+  //     sin redeploy. Mientras esté PENDING falla y caemos al paso 2.
+  const withButtons = await sendTemplate(env, to, "confirmar_cita", "es_CO", params);
+  if (withButtons.ok) return { ...withButtons, mode: "confirm" };
+
+  // 2º: sin botones (aprobada). El paciente responde por texto y la IA lo lee.
+  const plain = await sendTemplate(env, to, "appointment_confirmation_v2", "es_CO", params);
+  if (plain.ok) return { ...plain, mode: "confirm_sin_botones" };
+
+  // 3º: recordatorio normal (mismos 4 params, también es_CO).
+  const fb = await sendTemplate(env, to, "appointment_reminder", "es_CO", params);
   return { ...fb, mode: "reminder_fallback" };
 }
 
@@ -319,7 +336,7 @@ export async function sendAppointmentCanceled(
     console.log("[whatsapp] canceled-notice skipped: invalid phone", patientPhoneRaw);
     return { ok: false, reason: "invalid_phone" };
   }
-  return sendTemplate(env, to, "appointment_canceled", "es", [
+  return sendTemplate(env, to, "appointment_canceled", "es_CO", [
     { type: "text", text: patientName },
     { type: "text", text: dateText },
     { type: "text", text: timeText },
@@ -340,7 +357,7 @@ export async function sendAppointmentFollowup(
   if (!to || to.length < 10) {
     return { ok: false, reason: "invalid_phone" };
   }
-  return sendTemplate(env, to, "appointment_followup", "es", [
+  return sendTemplate(env, to, "appointment_followup", "es_CO", [
     { type: "text", text: patientName },
   ]);
 }
@@ -414,7 +431,7 @@ export async function sendPostSurgeryCheckin(
   if (!to || to.length < 10) {
     return { ok: false, reason: "invalid_phone" };
   }
-  return sendTemplate(env, to, "post_surgery_checkin", "es", [
+  return sendTemplate(env, to, "post_surgery_checkin", "es_CO", [
     { type: "text", text: patientName },
     { type: "text", text: String(daysSinceSurgery) },
   ]);

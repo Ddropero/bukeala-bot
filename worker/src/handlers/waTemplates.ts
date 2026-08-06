@@ -17,6 +17,16 @@ async function getWabaId(env: Env, override?: string): Promise<{ id: string | nu
   if (override) return { id: override, debug: { source: "override" } };
   const debug: any = {};
 
+  // Vía 0 (la buena): el WABA id que Meta manda en cada webhook, guardado por
+  // whatsappWebhook.ts. Es autoritativo — es LA WABA del número que envía — y
+  // no depende de permisos del token, que es justo lo que bloqueaba las vías
+  // 1 y 2 (el token no puede derivarlo ni enumerar negocios).
+  try {
+    const fromWebhook = await env.STATE.get("wa:wabaId");
+    if (fromWebhook) return { id: fromWebhook, debug: { source: "webhook" } };
+    debug.via0 = "sin wa:wabaId en KV (aún no ha llegado ningún mensaje entrante)";
+  } catch (e) { debug.via0err = (e as Error).message; }
+
   // Vía 1: campo whatsapp_business_account del phone
   try {
     const r1 = await fetch(
@@ -60,10 +70,24 @@ export async function listTemplates(
   const { id: waba, debug } = await getWabaId(env, override);
   if (!waba) return { waba: null, templates: [], debug };
   const res = await fetch(
-    `https://graph.facebook.com/${API_VERSION}/${waba}/message_templates?fields=name,status,category,language&limit=100&access_token=${encodeURIComponent(env.WA_TOKEN)}`,
+    // SIN `fields`: Meta devuelve por defecto name/language/status/category y
+    // **components** (con `fields=...,components` los omite — probado).
+    `https://graph.facebook.com/${API_VERSION}/${waba}/message_templates?limit=100&access_token=${encodeURIComponent(env.WA_TOKEN)}`,
   );
   const data = await res.json<any>().catch(() => ({}));
-  const templates = (data?.data ?? []).map((t: any) => ({ name: t.name, status: t.status, category: t.category, language: t.language }));
+  const templates = (data?.data ?? []).map((t: any) => {
+    const comps = t.components ?? [];
+    const body = comps.find((x: any) => x.type === "BODY");
+    const buttons = comps.find((x: any) => x.type === "BUTTONS");
+    // nº de parámetros {{n}} que espera el BODY — clave para no mandar de más
+    // o de menos (Meta rechaza con 132000 si no coinciden).
+    const params = body?.text ? (body.text.match(/\{\{\d+\}\}/g) ?? []).length : 0;
+    return {
+      name: t.name, status: t.status, category: t.category, language: t.language,
+      params,
+      buttons: (buttons?.buttons ?? []).map((b: any) => `${b.type}:${b.text}`),
+    };
+  });
   return { waba, templates, debug };
 }
 
@@ -88,8 +112,10 @@ function templateDefs() {
 
   return [
     {
+      // OJO: es_CO, no "es". TODAS las plantillas aprobadas de esta WABA están
+      // en es_CO; con "es" Meta responde 132001 (no encuentra la plantilla).
       name: "confirmar_cita",
-      language: "es",
+      language: "es_CO",
       category: "UTILITY",
       components: [
         {
@@ -102,7 +128,7 @@ function templateDefs() {
     },
     {
       name: "appointment_reminder",
-      language: "es",
+      language: "es_CO",
       category: "UTILITY",
       components: [
         {

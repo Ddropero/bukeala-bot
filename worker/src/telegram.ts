@@ -2539,7 +2539,33 @@ type AgendaBooking = {
   isPresential: boolean;
   cancelationReason?: string | null;
   bookingCode?: string;
+  // Contacto del paciente: Bukeala lo manda en campos distintos según el
+  // origen de la cita, por eso se leen todas las variantes.
+  email?: string;
+  customerEmail?: string;
+  phone?: string;
+  customerPhone?: string;
+  cellPhone?: string | { phoneNumber?: string } | null;
 };
+
+/** Teléfono del paciente, mirando todas las variantes que usa Bukeala. */
+function bookingPhone(bk: AgendaBooking): string {
+  if (typeof bk.cellPhone === "string" && bk.cellPhone.trim()) return bk.cellPhone.trim();
+  if (bk.cellPhone && typeof bk.cellPhone === "object" && bk.cellPhone.phoneNumber?.trim()) {
+    return bk.cellPhone.phoneNumber.trim();
+  }
+  if (bk.phone?.trim()) return bk.phone.trim();
+  if (bk.customerPhone?.trim()) return bk.customerPhone.trim();
+  return "";
+}
+
+/** Email del paciente (idem: varias variantes). */
+function bookingEmail(bk: AgendaBooking): string {
+  for (const c of [bk.email, bk.customerEmail]) {
+    if (typeof c === "string" && c.includes("@")) return c.trim();
+  }
+  return "";
+}
 
 export async function showAgenda(env: Env, chatId: string, dateDashed: string): Promise<void> {
   // dateDashed format: DD-MM-YYYY (with dashes, day first)
@@ -2584,6 +2610,15 @@ export async function showAgenda(env: Env, chatId: string, dateDashed: string): 
       lines.push(
         `${tag} <b>${slot.time}</b> — ${escapeHtml(slot.bk.name)}${doc}${presential}`,
       );
+      // Contacto en una 2ª línea: el teléfono va en <code> (tap = copiar) y el
+      // email tal cual. Se omite lo que no venga, para no ensuciar la agenda.
+      const tel = bookingPhone(slot.bk);
+      const mail = bookingEmail(slot.bk);
+      const contacto = [
+        tel ? `📞 <code>${escapeHtml(tel)}</code>` : "",
+        mail ? `✉️ ${escapeHtml(mail)}` : "",
+      ].filter(Boolean).join(" · ");
+      if (contacto) lines.push(`     ${contacto}`);
     } else {
       lines.push(`⚪ <b>${slot.time}</b> — Libre`);
     }

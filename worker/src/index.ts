@@ -489,6 +489,28 @@ app.get("/debug/session-stats", async (c) => {
   });
 });
 
+// Prueba de envío de WhatsApp que devuelve la respuesta CRUDA de Meta.
+// Sirve para diagnosticar 132001 y compañía sin adivinar: manda la
+// confirmación real y expone status + error tal cual los da Meta.
+//   GET /debug/wa-test?token=..&to=573..&name=..&date=..&time=..&place=..
+app.get("/debug/wa-test", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const to = c.req.query("to");
+  if (!to) return c.json({ error: "falta ?to=<numero>" }, 400);
+  const { sendAppointmentConfirmation } = await import("./whatsapp");
+  const r = await sendAppointmentConfirmation(
+    c.env,
+    to,
+    c.req.query("name") ?? "Paciente",
+    c.req.query("date") ?? "Lunes 04/08/26",
+    c.req.query("time") ?? "10:00 AM",
+    c.req.query("place") ?? "Calle 80 # 10-43, Cons 506",
+  );
+  return c.json({ enviado: r.ok, status: r.status, reason: r.reason, metaResponse: r.data });
+});
+
 app.get("/debug/:resource", handleDebug);
 
 // Keep-alive cron:
