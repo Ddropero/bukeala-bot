@@ -21,8 +21,8 @@ import type { Env } from "../env";
 import { Bukeala, SessionExpiredError } from "../bukeala";
 import { loadSession } from "../kv";
 import { listUsers, getDoctorRecipients } from "../users";
-import { buildAgendaHtml, type AgendaBookingDoc } from "../agendaDoc";
-import { uploadMedia, sendDocumentByMediaId } from "../whatsapp";
+import { buildAgendaHtml, buildAgendaText, type AgendaBookingDoc } from "../agendaDoc";
+import { sendText } from "../whatsapp";
 
 const AREA_ID = 1074;
 const COLOMBIA_OFFSET_MINUTES = -5 * 60;
@@ -93,7 +93,17 @@ async function notifyDoctors(env: Env, text: string): Promise<void> {
   }
 }
 
-export async function secretaryAgendaCron(env: Env): Promise<void> {
+/**
+ * @param opts.testWaOnly Si viene, es una PRUEBA: manda el documento por
+ *   WhatsApp solo a esos números y NO toca Telegram. Sirve para verificar la
+ *   cadena completa (agenda → HTML → upload → documento) sin escribirle a la
+ *   secretaria fuera de horario.
+ */
+export async function secretaryAgendaCron(
+  env: Env,
+  opts?: { testWaOnly?: string[] },
+): Promise<{ waSent: number; waErrors: string[]; citas: number } | void> {
+  const isTest = !!opts?.testWaOnly?.length;
   const s = await loadSession(env);
   if (!s) {
     console.log("[secretaryAgenda] no session — skip");
@@ -148,9 +158,9 @@ export async function secretaryAgendaCron(env: Env): Promise<void> {
     `${active.length} ${active.length === 1 ? "cita" : "citas"} · ✅ ${confirmedCount} ya confirmaron por WhatsApp\n\n` +
     `📞 Falta llamar a ${pending}. Abre el archivo: los "☐ llamar" son los que hay que confirmar (toca el teléfono para llamar directo).`;
 
-  // 3. Telegram — send to every secretary
+  // 3. Telegram — send to every secretary (en modo prueba NO se toca Telegram)
   const users = await listUsers(env);
-  const secretaries = users.filter((u) => u.role === "secretary");
+  const secretaries = isTest ? [] : users.filter((u) => u.role === "secretary");
   const tgErrors: string[] = [];
   let tgSent = 0;
   for (const u of secretaries) {
@@ -160,23 +170,29 @@ export async function secretaryAgendaCron(env: Env): Promise<void> {
   }
   console.log(`[secretaryAgenda] telegram → sent=${tgSent} errors=${tgErrors.length}`);
 
-  // 4. WhatsApp — upload media once, then send to each secretary number
+  // 4. WhatsApp — como TEXTO, no como documento.
+  //
+  // Meta RECHAZA text/html en el endpoint de media ("Param file must be a file
+  // with one of the following types…"), así que el envío fallaba siempre en el
+  // upload y la secretaria nunca recibió nada. En texto además los teléfonos
+  // quedan tocables para llamar, que es justo para lo que sirve esta agenda.
   const waErrors: string[] = [];
   let waSent = 0;
-  const upload = await uploadMedia(env, bytes, "text/html", filename);
-  if (!upload.ok || !upload.id) {
-    waErrors.push(`upload: ${upload.error ?? "unknown"}`);
-  } else {
-    for (const to of secretaryWaNumbers(env)) {
-      const r = await sendDocumentByMediaId(env, to, upload.id, filename, caption);
-      if (r.ok) waSent++;
-      else {
-        const msg = (r.data as any)?.error?.message ?? `HTTP ${r.status}`;
-        waErrors.push(`${to}: ${msg}`);
-      }
+  const waBody = buildAgendaText(bookings, friendly);
+  for (const to of (opts?.testWaOnly ?? secretaryWaNumbers(env))) {
+    const r = await sendText(env, to, waBody);
+    if (r.ok) waSent++;
+    else {
+      const msg = (r.data as any)?.error?.message ?? `HTTP ${r.status}`;
+      waErrors.push(`${to}: ${msg}`);
     }
   }
   console.log(`[secretaryAgenda] whatsapp → sent=${waSent} errors=${waErrors.length}`);
+
+  // En prueba: devolver el resultado al llamador y NO avisar a los doctores.
+  if (isTest) {
+    return { waSent, waErrors, citas: active.length };
+  }
 
   // 5. Summary to doctors so failures don't go silent
   const summary =

@@ -56,6 +56,49 @@ function timeKey(formatted: string): number {
   return h * 60 + min;
 }
 
+/**
+ * Versión en TEXTO de la agenda, para mandar por WhatsApp.
+ *
+ * Por qué texto y no el HTML: la Cloud API de Meta RECHAZA `text/html` como
+ * documento ("Param file must be a file with one of the following types…"),
+ * así que el envío a la secretaria fallaba SIEMPRE en el upload — nunca llegó
+ * nada. Además, en el celular un mensaje de texto es mejor que un adjunto:
+ * WhatsApp vuelve los teléfonos tocables para llamar directo.
+ */
+export function buildAgendaText(
+  bookings: AgendaBookingDoc[],
+  friendlyDate: string,
+): string {
+  const active = bookings
+    .filter((bk) => !bk.isCanceled && bk.stateCode !== "CANCELED" && !bk.isBusyTime)
+    .sort((a, b) => timeKey(a.startHourFormatted ?? "") - timeKey(b.startHourFormatted ?? ""));
+
+  if (active.length === 0) {
+    return `📅 *Agenda ${friendlyDate}*\n\nNo hay citas agendadas para mañana. 🎉`;
+  }
+
+  const lines = [
+    `📅 *Agenda ${friendlyDate}*`,
+    `${active.length} ${active.length === 1 ? "cita" : "citas"} · por favor confirmar llamando a cada paciente`,
+    "",
+  ];
+  active.forEach((bk, i) => {
+    const time = (bk.startHourFormatted ?? "—").trim();
+    const name = (bk.name ?? "—").trim();
+    const idType = bk.identificationTypeShortCode ?? "CC";
+    const idNum = (bk.identification ?? "").trim();
+    const phone = extractPhone(bk);
+    lines.push(`${i + 1}. *${time}* — ${name}`);
+    if (idNum) lines.push(`    ${idType} ${idNum}`);
+    // Sin formato: así WhatsApp lo detecta como teléfono y se puede tocar.
+    if (phone) lines.push(`    📞 ${phone}`);
+    else lines.push(`    📞 (sin teléfono registrado)`);
+  });
+  lines.push("");
+  lines.push("Marca ✅ a quien confirme. Si alguien cancela, avísale al Dr.");
+  return lines.join("\n");
+}
+
 export function buildAgendaHtml(
   bookings: AgendaBookingDoc[],
   friendlyDate: string,

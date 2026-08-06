@@ -511,6 +511,19 @@ app.get("/debug/wa-test", async (c) => {
   return c.json({ enviado: r.ok, status: r.status, reason: r.reason, metaResponse: r.data });
 });
 
+// Prueba manual del envío de la agenda a la secretaria por WhatsApp.
+// ?to=573... limita el envío a esos números (y no toca Telegram), para
+// verificar la cadena completa sin escribirle a la secretaria fuera de hora.
+app.get("/debug/agenda-secretaria", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const to = (c.req.query("to") ?? "").split(",").map((s) => s.replace(/\D/g, "")).filter((s) => s.length >= 10);
+  if (to.length === 0) return c.json({ error: "falta ?to=<numero[,numero]>" }, 400);
+  const r = await secretaryAgendaCron(c.env, { testWaOnly: to });
+  return c.json({ probado: to, resultado: r ?? "sin sesión de Bukeala" });
+});
+
 app.get("/debug/:resource", handleDebug);
 
 // Keep-alive cron:
