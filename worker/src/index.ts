@@ -9,6 +9,7 @@ import { handleIgDiscover } from "./handlers/instagramDiscover";
 import { handleGetProfile, handleUpdateProfilePicture, handlePhoneInfo } from "./handlers/whatsappProfile";
 import { handleListTemplates, handleCreateTemplates, handleCreateAgendaTemplate, handleCreateDocTemplate, handleCreateReminderTemplate } from "./handlers/waTemplates";
 import { handleDashboard } from "./handlers/dashboard";
+import { handleApiAgenda } from "./handlers/apiAgenda";
 import { handleNativeHostEvent, handleCheckRefresh, handleRefreshComplete, handleGetTgc } from "./handlers/nativeHostEvent";
 import { Bukeala, SessionExpiredError } from "./bukeala";
 import { loadSession } from "./kv";
@@ -109,6 +110,10 @@ app.get("/wa/templates/create", handleCreateTemplates);
 app.get("/wa/templates/create-agenda", handleCreateAgendaTemplate);
 // Plantilla genérica para enviarle un documento a un paciente fuera de 24h
 app.get("/wa/templates/create-doc", handleCreateDocTemplate);
+// API de lectura de la agenda para apps externas (Mayordomo).
+//   GET /api/agenda?token=..&date=DD-MM-YYYY&days=N
+app.get("/api/agenda", handleApiAgenda);
+
 // Plantilla de recordatorios personales del doctor (Mayordomo)
 app.get("/wa/templates/create-reminder", handleCreateReminderTemplate);
 
