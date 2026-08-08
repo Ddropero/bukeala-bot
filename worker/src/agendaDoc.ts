@@ -57,6 +57,38 @@ function timeKey(formatted: string): number {
 }
 
 /**
+ * Líneas de la agenda para el PDF (cabecera de documento de la plantilla de
+ * WhatsApp, que es la única vía fuera de la ventana de 24h).
+ */
+export function buildAgendaPdfDoc(
+  bookings: AgendaBookingDoc[],
+  friendlyDate: string,
+): { title: string; lines: Array<{ text: string; bold?: boolean }> } {
+  const active = bookings
+    .filter((bk) => !bk.isCanceled && bk.stateCode !== "CANCELED" && !bk.isBusyTime)
+    .sort((a, b) => timeKey(a.startHourFormatted ?? "") - timeKey(b.startHourFormatted ?? ""));
+
+  const title = `Agenda ${friendlyDate}`;
+  const lines: Array<{ text: string; bold?: boolean }> = [];
+  if (active.length === 0) {
+    lines.push({ text: "No hay citas agendadas para esta fecha." });
+    return { title, lines };
+  }
+  lines.push({ text: `${active.length} ${active.length === 1 ? "cita" : "citas"} - confirmar llamando a cada paciente`, bold: true });
+  lines.push({ text: "" });
+  active.forEach((bk, i) => {
+    const time = (bk.startHourFormatted ?? "--").trim();
+    const name = (bk.name ?? "--").trim();
+    const idType = bk.identificationTypeShortCode ?? "CC";
+    const idNum = (bk.identification ?? "").trim();
+    const phone = extractPhone(bk) || "sin telefono";
+    lines.push({ text: `${i + 1}.  ${time}   ${name}`, bold: true });
+    lines.push({ text: `      ${idType} ${idNum}   Tel: ${phone}   [ ] confirmo` });
+  });
+  return { title, lines };
+}
+
+/**
  * Versión en TEXTO de la agenda, para mandar por WhatsApp.
  *
  * Por qué texto y no el HTML: la Cloud API de Meta RECHAZA `text/html` como

@@ -7,7 +7,7 @@ import { verifyWhatsAppWebhook, handleWhatsAppWebhook } from "./handlers/whatsap
 import { verifyInstagramWebhook, handleInstagramWebhook } from "./handlers/instagramWebhook";
 import { handleIgDiscover } from "./handlers/instagramDiscover";
 import { handleGetProfile, handleUpdateProfilePicture, handlePhoneInfo } from "./handlers/whatsappProfile";
-import { handleListTemplates, handleCreateTemplates } from "./handlers/waTemplates";
+import { handleListTemplates, handleCreateTemplates, handleCreateAgendaTemplate } from "./handlers/waTemplates";
 import { handleDashboard } from "./handlers/dashboard";
 import { handleNativeHostEvent, handleCheckRefresh, handleRefreshComplete, handleGetTgc } from "./handlers/nativeHostEvent";
 import { Bukeala, SessionExpiredError } from "./bukeala";
@@ -105,6 +105,8 @@ app.post("/wa/profile-picture", handleUpdateProfilePicture);
 //   GET /wa/templates/create?token=.. → crea confirmar_cita + appointment_reminder
 app.get("/wa/templates", handleListTemplates);
 app.get("/wa/templates/create", handleCreateTemplates);
+// Plantilla con cabecera de DOCUMENTO para mandar la agenda fuera de 24h
+app.get("/wa/templates/create-agenda", handleCreateAgendaTemplate);
 app.get("/wa/phone-info", handlePhoneInfo);
 
 // Asset hosting mínimo: guardar/servir una imagen (ej. avatar) desde KV.
@@ -499,16 +501,66 @@ app.get("/debug/wa-test", async (c) => {
   }
   const to = c.req.query("to");
   if (!to) return c.json({ error: "falta ?to=<numero>" }, 400);
-  const { sendAppointmentConfirmation } = await import("./whatsapp");
-  const r = await sendAppointmentConfirmation(
-    c.env,
-    to,
-    c.req.query("name") ?? "Paciente",
-    c.req.query("date") ?? "Lunes 04/08/26",
-    c.req.query("time") ?? "10:00 AM",
-    c.req.query("place") ?? "Calle 80 # 10-43, Cons 506",
-  );
+  const name = c.req.query("name") ?? "Paciente";
+  const date = c.req.query("date") ?? "Lunes 04/08/26";
+  const time = c.req.query("time") ?? "10:00 AM";
+  const place = c.req.query("place") ?? "Calle 80 # 10-43, Cons 506";
+  const wa = await import("./whatsapp");
+
+  // ?mode=botones prueba la plantilla confirmar_cita (Quick Reply), que es el
+  // flujo de "confirmar cita"; sin él prueba la confirmación post-agendamiento.
+  if (c.req.query("mode") === "botones") {
+    const r = await wa.sendAppointmentConfirmRequest(c.env, to, name, date, time, place);
+    return c.json({ enviado: r.ok, via: (r as any).mode, status: (r as any).status, metaResponse: (r as any).data });
+  }
+  const r = await wa.sendAppointmentConfirmation(c.env, to, name, date, time, place);
   return c.json({ enviado: r.ok, status: r.status, reason: r.reason, metaResponse: r.data });
+});
+
+// Devuelve la agenda como PDF (para revisar el formato antes de enviarlo).
+//   GET /debug/agenda-pdf?token=..&date=DD-MM-YYYY
+app.get("/debug/agenda-pdf", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const date = c.req.query("date");
+  if (!date) return c.json({ error: "falta ?date=DD-MM-YYYY" }, 400);
+  const { Bukeala } = await import("./bukeala");
+  const { buildAgendaPdfDoc } = await import("./agendaDoc");
+  const { buildAgendaPdf } = await import("./agendaPdf");
+  const b = new Bukeala(c.env);
+  const res = await b.getAgenda(date, 1074, false);
+  const json = await res.json<any>().catch(() => null);
+  const bookings = json?.areas?.[0]?.bookings ?? [];
+  const friendly = json?.defaultDateFormatted ?? date;
+  const { title, lines } = buildAgendaPdfDoc(bookings, friendly);
+  const pdf = buildAgendaPdf(title, lines);
+  return new Response(pdf, {
+    headers: {
+      "content-type": "application/pdf",
+      "content-disposition": `inline; filename="agenda-${date}.pdf"`,
+    },
+  });
+});
+
+// Diagnóstico de la app de Meta: app_id y scopes del WA_TOKEN. El app_id hace
+// falta para la Resumable Upload API (subir el archivo de muestra que Meta
+// exige al crear una plantilla con cabecera de DOCUMENTO).
+app.get("/debug/wa-appinfo", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const t = encodeURIComponent(c.env.WA_TOKEN);
+  const res = await fetch(`https://graph.facebook.com/v21.0/debug_token?input_token=${t}&access_token=${t}`);
+  const d = await res.json<any>().catch(() => ({}));
+  return c.json({
+    appId: d?.data?.app_id,
+    app: d?.data?.application,
+    type: d?.data?.type,
+    expiresAt: d?.data?.expires_at,
+    scopes: d?.data?.scopes,
+    granular: d?.data?.granular_scopes,
+  });
 });
 
 // Diagnóstico: qué devuelve getAgenda para una fecha (sin enviar nada).

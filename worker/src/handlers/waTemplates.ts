@@ -141,6 +141,91 @@ function templateDefs() {
   ];
 }
 
+/**
+ * Sube un archivo de MUESTRA con la Resumable Upload API y devuelve el
+ * `header_handle` que Meta exige para crear una plantilla con cabecera de
+ * DOCUMENTO. Es un paso aparte del /media normal: este handle solo sirve para
+ * crear la plantilla, no para enviar mensajes.
+ */
+async function uploadSampleForHeader(
+  env: Env,
+  bytes: Uint8Array,
+  mime: string,
+): Promise<{ handle: string | null; debug: any }> {
+  const debug: any = {};
+  try {
+    // 1. app_id (el token es de sistema; debug_token lo expone)
+    const t = encodeURIComponent(env.WA_TOKEN);
+    const dbg = await fetch(`https://graph.facebook.com/${API_VERSION}/debug_token?input_token=${t}&access_token=${t}`);
+    const dbgJson = await dbg.json<any>().catch(() => ({}));
+    const appId = dbgJson?.data?.app_id;
+    debug.appId = appId;
+    if (!appId) return { handle: null, debug };
+
+    // 2. abrir sesión de subida
+    const startUrl =
+      `https://graph.facebook.com/${API_VERSION}/${appId}/uploads` +
+      `?file_length=${bytes.byteLength}&file_type=${encodeURIComponent(mime)}&access_token=${t}`;
+    const startRes = await fetch(startUrl, { method: "POST" });
+    const startJson = await startRes.json<any>().catch(() => ({}));
+    debug.start = startJson;
+    const uploadId = startJson?.id;
+    if (!uploadId) return { handle: null, debug };
+
+    // 3. subir los bytes (Authorization: OAuth, no Bearer — lo exige esta API)
+    const upRes = await fetch(`https://graph.facebook.com/${API_VERSION}/${uploadId}`, {
+      method: "POST",
+      headers: { Authorization: `OAuth ${env.WA_TOKEN}`, file_offset: "0" },
+      body: bytes,
+    });
+    const upJson = await upRes.json<any>().catch(() => ({}));
+    debug.upload = upJson;
+    return { handle: upJson?.h ?? null, debug };
+  } catch (e) {
+    debug.err = (e as Error).message;
+    return { handle: null, debug };
+  }
+}
+
+/**
+ * Crea la plantilla `agenda_secretaria`: cabecera de DOCUMENTO (el PDF de la
+ * agenda) + cuerpo corto. Es la ÚNICA forma de mandarle la agenda a la
+ * secretaria FUERA de la ventana de 24h, porque los parámetros de plantilla no
+ * admiten saltos de línea (o sea, la lista no cabe en un parámetro).
+ */
+export async function handleCreateAgendaTemplate(c: Context<{ Bindings: Env }>) {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) return c.json({ error: "unauthorized" }, 401);
+  const { id: waba, debug: wabaDebug } = await getWabaId(c.env, c.req.query("waba"));
+  if (!waba) return c.json({ error: "no se pudo derivar WABA id", debug: wabaDebug }, 500);
+
+  // PDF de muestra (contenido irrelevante, solo define el tipo de cabecera)
+  const { buildAgendaPdf } = await import("../agendaPdf");
+  const sample = buildAgendaPdf("Agenda de muestra", [{ text: "1.  08:00 AM   Paciente Ejemplo" }]);
+  const { handle, debug: upDebug } = await uploadSampleForHeader(c.env, sample, "application/pdf");
+  if (!handle) return c.json({ error: "no se pudo subir el PDF de muestra", debug: upDebug }, 500);
+
+  const body = {
+    name: "agenda_secretaria",
+    language: "es_CO",
+    category: "UTILITY",
+    components: [
+      { type: "HEADER", format: "DOCUMENT", example: { header_handle: [handle] } },
+      {
+        type: "BODY",
+        text: "Hola {{1}}, te envío la agenda del {{2}}. Son {{3}} citas: por favor confirma llamando a cada paciente y marca las que confirmen.",
+        example: { body_text: [["Laura", "miércoles 05/08/26", "7"]] },
+      },
+    ],
+  };
+  const res = await fetch(`https://graph.facebook.com/${API_VERSION}/${waba}/message_templates`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${c.env.WA_TOKEN}` },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json<any>().catch(() => ({}));
+  return c.json({ waba, ok: res.ok, status: res.status, respuesta: data });
+}
+
 export async function handleCreateTemplates(c: Context<{ Bindings: Env }>) {
   if (c.req.query("token") !== c.env.CAPTURE_TOKEN) return c.json({ error: "unauthorized" }, 401);
   const { id: waba, debug } = await getWabaId(c.env, c.req.query("waba"));
