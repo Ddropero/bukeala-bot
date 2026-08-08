@@ -164,6 +164,50 @@ export async function sendInteractiveList(
 }
 
 /**
+ * Envía un DOCUMENTO a un paciente resolviendo solo la ventana de 24h:
+ *
+ *  1. Documento directo (se ve mejor y admite pie de foto libre). Solo funciona
+ *     si el paciente escribió en las últimas 24h.
+ *  2. Si Meta lo rechaza por la ventana, plantilla `documento_paciente` con
+ *     cabecera de DOCUMENTO — la única vía fuera de la ventana.
+ *
+ * `mediaId` ya debe estar subido a WhatsApp (uploadWAMedia / uploadMedia).
+ * Devuelve `via` para saber por dónde salió.
+ */
+export async function sendDocumentSmart(
+  env: Env,
+  to: string,
+  mediaId: string,
+  filename: string,
+  descripcion: string,
+  kind: "document" | "image" = "document",
+): Promise<{ ok: boolean; via: string; status?: number; data?: any }> {
+  const { sendWAMedia } = await import("./whatsappMedia");
+  const direct = await sendWAMedia(env, to, kind, mediaId, descripcion || undefined, kind === "document" ? filename : undefined);
+  if (direct.ok) return { ok: true, via: "directo", status: direct.status, data: direct.data };
+
+  const err = direct.data?.error;
+  console.log(`[whatsapp] documento directo falló (${err?.code ?? "?"}: ${err?.message ?? "?"}) → intento plantilla`);
+
+  // Las imágenes no caben en la plantilla (su cabecera es DOCUMENT), así que
+  // fuera de ventana se manda igual como documento.
+  const res = await postWA(env, {
+    messaging_product: "whatsapp",
+    to,
+    type: "template",
+    template: {
+      name: "documento_paciente",
+      language: { code: "es_CO" },
+      components: [
+        { type: "header", parameters: [{ type: "document", document: { id: mediaId, filename } }] },
+        { type: "body", parameters: [{ type: "text", text: descripcion || "un documento" }] },
+      ],
+    },
+  });
+  return { ok: res.ok, via: res.ok ? "plantilla" : "falló", status: res.status, data: res.data };
+}
+
+/**
  * Send a custom template with parameters. Template must be pre-approved by Meta.
  * Example template "appointment_confirmation" with body params {patient_name}, {date}, {time}, {place}:
  *   sendTemplate(env, to, "appointment_confirmation", "es_CO", [{type:"text",text:"Juan"},...])

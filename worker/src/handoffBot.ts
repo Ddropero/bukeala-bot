@@ -25,7 +25,7 @@
  */
 import type { Context } from "hono";
 import type { Env } from "./env";
-import { sendText } from "./whatsapp";
+import { sendText, normalizeColombianPhone, sendDocumentSmart } from "./whatsapp";
 import { setMode } from "./claudeAi";
 import { getAllRecipients, isAllowed } from "./users";
 import { downloadTelegramFile, uploadWAMedia, sendWAMedia } from "./whatsappMedia";
@@ -345,12 +345,28 @@ export async function handleHandoffWebhook(c: Context<{ Bindings: Env }>): Promi
       await sendHandoffMessage(c.env, chatId, "🚫 No autorizado.");
       return c.json({ ok: true });
     }
-    const replyTo = await c.env.STATE.get(`handoff:replyTo:${chatId}`);
+    // Destino: si el pie de foto EMPIEZA por un teléfono, ese manda. Así el Dr.
+    // envía un documento a cualquier paciente sin abrir un hilo: adjunta el
+    // archivo y escribe el número (opcionalmente seguido del mensaje).
+    //   "3001234567 Sus resultados de laboratorio"
+    const rawCaption = String(update.message.caption ?? "").trim();
+    const phoneInCaption = rawCaption.match(/^\+?(\d[\d\s-]{9,})/);
+    let replyTo: string | null = null;
+    let captionRest = rawCaption;
+    if (phoneInCaption) {
+      const digits = phoneInCaption[1].replace(/\D/g, "");
+      if (digits.length >= 10) {
+        replyTo = normalizeColombianPhone(digits);
+        captionRest = rawCaption.slice(phoneInCaption[0].length).trim();
+      }
+    }
+    if (!replyTo) replyTo = await c.env.STATE.get(`handoff:replyTo:${chatId}`);
     if (!replyTo) {
       await sendHandoffMessage(
         c.env,
         chatId,
-        "❓ Toca '📤 Responder' en una alerta primero, o usa /r &lt;número&gt; antes de mandar la foto.",
+        "❓ Escribe el <b>teléfono al principio del pie de foto</b> (ej: <code>3001234567 Sus resultados</code>), " +
+          "o toca '📤 Responder' en una alerta, o usa /r &lt;número&gt; antes de mandar el archivo.",
       );
       return c.json({ ok: true });
     }
@@ -359,7 +375,7 @@ export async function handleHandoffWebhook(c: Context<{ Bindings: Env }>): Promi
       return c.json({ ok: true });
     }
 
-    const caption = String(update.message.caption ?? "").trim();
+    const caption = captionRest;
     let result: { ok: boolean; status?: number; data?: any } | null = null;
 
     try {
@@ -379,7 +395,13 @@ export async function handleHandoffWebhook(c: Context<{ Bindings: Env }>): Promi
         const mime = update.message.document.mime_type ?? file.mimeType;
         const mediaId = await uploadWAMedia(c.env, file.buffer, mime, filename);
         if (!mediaId) throw new Error("no se pudo subir documento a WhatsApp");
-        result = await sendWAMedia(c.env, replyTo, "document", mediaId, caption, filename);
+        // sendDocumentSmart resuelve la ventana de 24h: directo y, si Meta lo
+        // rechaza por la ventana, plantilla `documento_paciente`.
+        const smart = await sendDocumentSmart(c.env, replyTo, mediaId, filename, caption, "document");
+        result = { ok: smart.ok, status: smart.status, data: smart.data };
+        if (smart.ok && smart.via === "plantilla") {
+          await sendHandoffMessage(c.env, chatId, "ℹ️ Fuera de la ventana de 24h → enviado como plantilla con el documento adjunto.");
+        }
       } else if (update.message.voice) {
         const file = await downloadTelegramFile(c.env.TELEGRAM_HANDOFF_BOT_TOKEN, update.message.voice.file_id);
         if (!file) throw new Error("no se pudo descargar audio");

@@ -226,6 +226,45 @@ export async function handleCreateAgendaTemplate(c: Context<{ Bindings: Env }>) 
   return c.json({ waba, ok: res.ok, status: res.status, respuesta: data });
 }
 
+/**
+ * Crea `documento_paciente`: cabecera de DOCUMENTO + 1 párametro de
+ * descripción. Sirve para enviarle un archivo a un paciente FUERA de la
+ * ventana de 24h (dentro de la ventana se manda el documento directo, que se
+ * ve mejor). Pensada para usarse desde el bot y desde la app de historia
+ * clínica vía POST /wa/send-document.
+ */
+export async function handleCreateDocTemplate(c: Context<{ Bindings: Env }>) {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) return c.json({ error: "unauthorized" }, 401);
+  const { id: waba, debug: wabaDebug } = await getWabaId(c.env, c.req.query("waba"));
+  if (!waba) return c.json({ error: "no se pudo derivar WABA id", debug: wabaDebug }, 500);
+
+  const { buildAgendaPdf } = await import("../agendaPdf");
+  const sample = buildAgendaPdf("Documento de muestra", [{ text: "Contenido de ejemplo" }]);
+  const { handle, debug: upDebug } = await uploadSampleForHeader(c.env, sample, "application/pdf");
+  if (!handle) return c.json({ error: "no se pudo subir el PDF de muestra", debug: upDebug }, 500);
+
+  const body = {
+    name: "documento_paciente",
+    language: "es_CO",
+    category: "UTILITY",
+    components: [
+      { type: "HEADER", format: "DOCUMENT", example: { header_handle: [handle] } },
+      {
+        type: "BODY",
+        text: "Hola, el Dr. David Duque le envía este documento: {{1}}. Si tiene alguna duda, puede responder por este chat.",
+        example: { body_text: [["resultados de laboratorio"]] },
+      },
+    ],
+  };
+  const res = await fetch(`https://graph.facebook.com/${API_VERSION}/${waba}/message_templates`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${c.env.WA_TOKEN}` },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json<any>().catch(() => ({}));
+  return c.json({ waba, ok: res.ok, status: res.status, respuesta: data });
+}
+
 export async function handleCreateTemplates(c: Context<{ Bindings: Env }>) {
   if (c.req.query("token") !== c.env.CAPTURE_TOKEN) return c.json({ error: "unauthorized" }, 401);
   const { id: waba, debug } = await getWabaId(c.env, c.req.query("waba"));

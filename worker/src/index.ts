@@ -7,7 +7,7 @@ import { verifyWhatsAppWebhook, handleWhatsAppWebhook } from "./handlers/whatsap
 import { verifyInstagramWebhook, handleInstagramWebhook } from "./handlers/instagramWebhook";
 import { handleIgDiscover } from "./handlers/instagramDiscover";
 import { handleGetProfile, handleUpdateProfilePicture, handlePhoneInfo } from "./handlers/whatsappProfile";
-import { handleListTemplates, handleCreateTemplates, handleCreateAgendaTemplate } from "./handlers/waTemplates";
+import { handleListTemplates, handleCreateTemplates, handleCreateAgendaTemplate, handleCreateDocTemplate } from "./handlers/waTemplates";
 import { handleDashboard } from "./handlers/dashboard";
 import { handleNativeHostEvent, handleCheckRefresh, handleRefreshComplete, handleGetTgc } from "./handlers/nativeHostEvent";
 import { Bukeala, SessionExpiredError } from "./bukeala";
@@ -107,6 +107,50 @@ app.get("/wa/templates", handleListTemplates);
 app.get("/wa/templates/create", handleCreateTemplates);
 // Plantilla con cabecera de DOCUMENTO para mandar la agenda fuera de 24h
 app.get("/wa/templates/create-agenda", handleCreateAgendaTemplate);
+// Plantilla genérica para enviarle un documento a un paciente fuera de 24h
+app.get("/wa/templates/create-doc", handleCreateDocTemplate);
+
+/**
+ * Enviar un DOCUMENTO a un paciente por WhatsApp. Pensado para llamarse desde
+ * la app de historia clínica.
+ *
+ *   POST /wa/send-document?token=<CAPTURE_TOKEN>&to=3001234567
+ *        &filename=resultados.pdf&caption=Sus%20resultados
+ *   Content-Type: application/pdf   (o image/jpeg, image/png…)
+ *   body: el archivo en binario
+ *
+ * Resuelve solo la ventana de 24h: manda el documento directo y, si Meta lo
+ * rechaza por la ventana, cae a la plantilla `documento_paciente`.
+ * Responde { ok, via: "directo" | "plantilla", to }.
+ */
+app.post("/wa/send-document", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const rawTo = c.req.query("to") ?? "";
+  const { normalizeColombianPhone, sendDocumentSmart } = await import("./whatsapp");
+  const to = normalizeColombianPhone(rawTo);
+  if (!to || to.length < 10) return c.json({ error: "falta ?to=<telefono>" }, 400);
+
+  const mime = c.req.header("content-type") || "application/pdf";
+  const buf = await c.req.arrayBuffer();
+  if (!buf || buf.byteLength === 0) return c.json({ error: "body vacío: manda el archivo en binario" }, 400);
+  if (buf.byteLength > 15 * 1024 * 1024) return c.json({ error: "archivo > 15MB" }, 400);
+
+  const filename = c.req.query("filename") ?? (mime.includes("pdf") ? "documento.pdf" : "archivo");
+  const caption = c.req.query("caption") ?? "";
+
+  const { uploadWAMedia } = await import("./whatsappMedia");
+  const mediaId = await uploadWAMedia(c.env, buf, mime, filename);
+  if (!mediaId) return c.json({ error: "WhatsApp rechazó el archivo (¿tipo no permitido?)", mime }, 502);
+
+  const kind = mime.startsWith("image/") ? "image" as const : "document" as const;
+  const r = await sendDocumentSmart(c.env, to, mediaId, filename, caption, kind);
+  return c.json({
+    ok: r.ok, via: r.via, to, filename, bytes: buf.byteLength,
+    error: r.ok ? undefined : (r.data?.error?.message ?? `HTTP ${r.status}`),
+  });
+});
 app.get("/wa/phone-info", handlePhoneInfo);
 
 // Asset hosting mínimo: guardar/servir una imagen (ej. avatar) desde KV.
