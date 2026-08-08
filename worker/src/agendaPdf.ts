@@ -93,8 +93,14 @@ export function buildAgendaPdf(title: string, lines: Line[]): Uint8Array {
     objects[contentId] = `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`;
   });
 
-  // Serializar con tabla xref
-  let pdf = "%PDF-1.4\n";
+  // Serializar con tabla xref.
+  //
+  // El comentario con 4 bytes >127 tras la cabecera es el MARCADOR BINARIO que
+  // pide la especificación (§7.5.2). Sin él, los lectores estrictos tratan el
+  // archivo como texto: WhatsApp aceptaba el envío (HTTP 200) pero descartaba
+  // el PDF en silencio y nunca llegaba al paciente. Verificado comparando
+  // contra un PDF real, que sí lo trae (%\xF6\xE4\xFC\xDF).
+  let pdf = "%PDF-1.4\n%öäüß\n";
   const offsets: number[] = [];
   const maxId = objects.length - 1;
   for (let id = 1; id <= maxId; id++) {
