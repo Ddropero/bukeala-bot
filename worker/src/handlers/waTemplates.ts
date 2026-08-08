@@ -265,6 +265,48 @@ export async function handleCreateDocTemplate(c: Context<{ Bindings: Env }>) {
   return c.json({ waba, ok: res.ok, status: res.status, respuesta: data });
 }
 
+/**
+ * Crea `recordatorio_personal`: recordatorios del propio doctor (Mayordomo).
+ * Solo texto, 2 parámetros. Sin cabecera de media → no necesita el paso de
+ * subir archivo de muestra.
+ */
+export async function handleCreateReminderTemplate(c: Context<{ Bindings: Env }>) {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) return c.json({ error: "unauthorized" }, 401);
+  const { id: waba, debug } = await getWabaId(c.env, c.req.query("waba"));
+  if (!waba) return c.json({ error: "no se pudo derivar WABA id", debug }, 500);
+
+  const body = {
+    name: "recordatorio_personal",
+    language: "es_CO",
+    category: "UTILITY",
+    components: [
+      {
+        type: "BODY",
+        // Los saltos de línea van en el TEXTO de la plantilla (permitido);
+        // lo que no se permite es que un PARÁMETRO los traiga.
+        //
+        // OJO: Meta rechaza plantillas con "demasiadas variables en relación
+        // con su longitud" (error_subcode 2388293). Con solo "Recordatorio:
+        // {{1}} {{2}}" la rechazó; hace falta suficiente texto fijo alrededor.
+        text:
+          "Hola Dr. Duque, tiene un recordatorio pendiente en su agenda personal.\n\n" +
+          "Asunto: {{1}}\n\n" +
+          "Detalle: {{2}}\n\n" +
+          "Este mensaje fue generado automaticamente por su asistente Mayordomo. " +
+          "Puede responder por este chat si necesita algo mas.",
+        example: { body_text: [["Llamar al laboratorio", "Resultados de la paciente Perez pendientes desde ayer"]] },
+      },
+    ],
+  };
+  const res = await fetch(`https://graph.facebook.com/${API_VERSION}/${waba}/message_templates`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${c.env.WA_TOKEN}` },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json<any>().catch(() => ({}));
+  return c.json({ waba, ok: res.ok, status: res.status, respuesta: data });
+}
+
 export async function handleCreateTemplates(c: Context<{ Bindings: Env }>) {
   if (c.req.query("token") !== c.env.CAPTURE_TOKEN) return c.json({ error: "unauthorized" }, 401);
   const { id: waba, debug } = await getWabaId(c.env, c.req.query("waba"));

@@ -7,7 +7,7 @@ import { verifyWhatsAppWebhook, handleWhatsAppWebhook } from "./handlers/whatsap
 import { verifyInstagramWebhook, handleInstagramWebhook } from "./handlers/instagramWebhook";
 import { handleIgDiscover } from "./handlers/instagramDiscover";
 import { handleGetProfile, handleUpdateProfilePicture, handlePhoneInfo } from "./handlers/whatsappProfile";
-import { handleListTemplates, handleCreateTemplates, handleCreateAgendaTemplate, handleCreateDocTemplate } from "./handlers/waTemplates";
+import { handleListTemplates, handleCreateTemplates, handleCreateAgendaTemplate, handleCreateDocTemplate, handleCreateReminderTemplate } from "./handlers/waTemplates";
 import { handleDashboard } from "./handlers/dashboard";
 import { handleNativeHostEvent, handleCheckRefresh, handleRefreshComplete, handleGetTgc } from "./handlers/nativeHostEvent";
 import { Bukeala, SessionExpiredError } from "./bukeala";
@@ -109,6 +109,53 @@ app.get("/wa/templates/create", handleCreateTemplates);
 app.get("/wa/templates/create-agenda", handleCreateAgendaTemplate);
 // Plantilla genérica para enviarle un documento a un paciente fuera de 24h
 app.get("/wa/templates/create-doc", handleCreateDocTemplate);
+// Plantilla de recordatorios personales del doctor (Mayordomo)
+app.get("/wa/templates/create-reminder", handleCreateReminderTemplate);
+
+/**
+ * Recordatorio personal al WhatsApp del doctor. Pensado para MAYORDOMO.
+ *
+ *   POST /wa/notify-me?token=<CAPTURE_TOKEN>
+ *   Content-Type: application/json
+ *   { "titulo": "Llamar al laboratorio", "detalle": "Resultados pendientes" }
+ *
+ * También acepta los datos por query (?titulo=..&detalle=..) y un ?to= para
+ * mandarlo a otro número. Por defecto usa DOCTOR_WHATSAPP_NUMBER.
+ *
+ * Devuelve { ok, via: "texto" | "plantilla" }. "plantilla" significa que iba
+ * fuera de la ventana de 24h y salió por `recordatorio_personal` — que es lo
+ * que permite que un recordatorio llegue a cualquier hora.
+ */
+app.post("/wa/notify-me", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  let titulo = c.req.query("titulo") ?? "";
+  let detalle = c.req.query("detalle") ?? "";
+  let to = c.req.query("to") ?? "";
+  // Body JSON (lo normal desde Mayordomo); si no viene, se usan los query params.
+  try {
+    const body = (await c.req.json()) as any;
+    if (body?.titulo) titulo = String(body.titulo);
+    if (body?.detalle) detalle = String(body.detalle);
+    if (body?.to) to = String(body.to);
+  } catch { /* sin body: seguimos con query params */ }
+
+  if (!titulo.trim()) return c.json({ error: "falta 'titulo'" }, 400);
+  const dest = to || (c.env as any).DOCTOR_WHATSAPP_NUMBER || "";
+  if (!dest) {
+    return c.json({ error: "no hay destino: manda ?to= o configura el secret DOCTOR_WHATSAPP_NUMBER" }, 400);
+  }
+
+  const { sendPersonalReminder } = await import("./whatsapp");
+  const r = await sendPersonalReminder(c.env, dest, titulo.trim(), detalle.trim());
+  return c.json({
+    ok: r.ok,
+    via: r.via,
+    to: dest,
+    error: r.ok ? undefined : (r.data?.error?.message ?? `HTTP ${r.status}`),
+  });
+});
 
 /**
  * Enviar un DOCUMENTO a un paciente por WhatsApp. Pensado para llamarse desde

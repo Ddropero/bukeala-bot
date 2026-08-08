@@ -164,6 +164,37 @@ export async function sendInteractiveList(
 }
 
 /**
+ * Recordatorio PERSONAL al doctor (lo usa Mayordomo vía POST /wa/notify-me).
+ *
+ * Resuelve solo la ventana de 24h igual que los documentos:
+ *  1. Texto libre — se ve mejor y admite cualquier formato/longitud. Solo
+ *     funciona si el doctor le escribió al número del consultorio en 24h.
+ *  2. Plantilla `recordatorio_personal` — funciona SIEMPRE, a cualquier hora.
+ *     Es la que hace que esto sirva de verdad como recordatorio.
+ */
+export async function sendPersonalReminder(
+  env: Env,
+  toRaw: string,
+  titulo: string,
+  detalle: string,
+): Promise<{ ok: boolean; via: string; status?: number; data?: any }> {
+  const to = normalizeColombianPhone(toRaw);
+  if (!to || to.length < 10) return { ok: false, via: "none", data: { error: { message: "teléfono inválido" } } };
+
+  const libre = `🔔 ${titulo}${detalle ? `\n\n${detalle}` : ""}`;
+  const txt = await sendText(env, to, libre);
+  if (txt.ok) return { ok: true, via: "texto", status: txt.status, data: txt.data };
+
+  console.log("[whatsapp] recordatorio texto libre falló (¿fuera de 24h?) → plantilla");
+  const r = await sendTemplate(env, to, "recordatorio_personal", "es_CO", [
+    { type: "text", text: titulo.slice(0, 200) },
+    // Meta rechaza saltos de línea y tabs DENTRO de un parámetro.
+    { type: "text", text: (detalle || "Sin detalle").replace(/[\n\r\t]+/g, " ").slice(0, 600) },
+  ]);
+  return { ok: r.ok, via: r.ok ? "plantilla" : "falló", status: r.status, data: r.data };
+}
+
+/**
  * Envía un DOCUMENTO a un paciente resolviendo solo la ventana de 24h:
  *
  *  1. Documento directo (se ve mejor y admite pie de foto libre). Solo funciona

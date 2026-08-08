@@ -99,4 +99,6 @@ export type Env = {
   // Receives the daily agenda PDF/HTML at 1 PM Colombia the day before.
   // Optional — if unset, falls back to the hard-coded default.
   SECRETARY_WHATSAPP_NUMBERS?: string;
+  /** WhatsApp del doctor para recordatorios personales (Mayordomo). */
+  DOCTOR_WHATSAPP_NUMBER?: string;
 };
