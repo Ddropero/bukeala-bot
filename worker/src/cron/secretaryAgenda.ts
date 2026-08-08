@@ -94,15 +94,16 @@ async function notifyDoctors(env: Env, text: string): Promise<void> {
 }
 
 /**
- * @param opts.testWaOnly Si viene, es una PRUEBA: manda el documento por
- *   WhatsApp solo a esos números y NO toca Telegram. Sirve para verificar la
- *   cadena completa (agenda → HTML → upload → documento) sin escribirle a la
- *   secretaria fuera de horario.
+ * @param opts.testWaOnly Si viene, es una PRUEBA: manda la agenda por WhatsApp
+ *   solo a esos números y NO toca Telegram. Sirve para verificar la cadena
+ *   completa sin escribirle a la secretaria fuera de horario.
+ * @param opts.dateDashed Fecha DD-MM-YYYY a enviar en vez de "mañana" (para
+ *   revisar el formato con un día que sí tenga citas).
  */
 export async function secretaryAgendaCron(
   env: Env,
-  opts?: { testWaOnly?: string[] },
-): Promise<{ waSent: number; waErrors: string[]; citas: number } | void> {
+  opts?: { testWaOnly?: string[]; dateDashed?: string },
+): Promise<{ waSent: number; waErrors: string[]; citas: number; fecha?: string } | void> {
   const isTest = !!opts?.testWaOnly?.length;
   const s = await loadSession(env);
   if (!s) {
@@ -110,9 +111,13 @@ export async function secretaryAgendaCron(
     return;
   }
 
-  const tomorrow = tomorrowInColombia();
-  const dashed = dateToDdMmYyyyDashed(tomorrow);
-  const friendly = dateToFriendly(tomorrow);
+  let target = tomorrowInColombia();
+  if (opts?.dateDashed) {
+    const m = opts.dateDashed.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+    if (m) target = new Date(Date.UTC(+m[3], +m[2] - 1, +m[1]));
+  }
+  const dashed = opts?.dateDashed ?? dateToDdMmYyyyDashed(target);
+  const friendly = dateToFriendly(target);
   console.log(`[secretaryAgenda] fetching agenda for ${dashed}`);
 
   // 1. Fetch the agenda
@@ -191,7 +196,7 @@ export async function secretaryAgendaCron(
 
   // En prueba: devolver el resultado al llamador y NO avisar a los doctores.
   if (isTest) {
-    return { waSent, waErrors, citas: active.length };
+    return { waSent, waErrors, citas: active.length, fecha: friendly };
   }
 
   // 5. Summary to doctors so failures don't go silent

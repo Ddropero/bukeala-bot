@@ -511,6 +511,33 @@ app.get("/debug/wa-test", async (c) => {
   return c.json({ enviado: r.ok, status: r.status, reason: r.reason, metaResponse: r.data });
 });
 
+// Diagnóstico: qué devuelve getAgenda para una fecha (sin enviar nada).
+//   GET /debug/agenda-raw?token=..&date=DD-MM-YYYY
+app.get("/debug/agenda-raw", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const date = c.req.query("date");
+  if (!date) return c.json({ error: "falta ?date=DD-MM-YYYY" }, 400);
+  const { Bukeala } = await import("./bukeala");
+  const b = new Bukeala(c.env);
+  const res = await b.getAgenda(date, 1074, false);
+  const json = await res.json<any>().catch(() => null);
+  const areas = json?.areas ?? [];
+  return c.json({
+    httpStatus: res.status,
+    clavesTopLevel: json ? Object.keys(json) : null,
+    defaultDateFormatted: json?.defaultDateFormatted,
+    numAreas: areas.length,
+    areas: areas.map((a: any) => ({
+      areaId: a?.id ?? a?.areaId,
+      nombre: a?.name ?? a?.areaName,
+      numBookings: (a?.bookings ?? []).length,
+    })),
+    muestraBooking: areas?.[0]?.bookings?.[0] ?? null,
+  });
+});
+
 // Prueba manual del envío de la agenda a la secretaria por WhatsApp.
 // ?to=573... limita el envío a esos números (y no toca Telegram), para
 // verificar la cadena completa sin escribirle a la secretaria fuera de hora.
@@ -520,8 +547,10 @@ app.get("/debug/agenda-secretaria", async (c) => {
   }
   const to = (c.req.query("to") ?? "").split(",").map((s) => s.replace(/\D/g, "")).filter((s) => s.length >= 10);
   if (to.length === 0) return c.json({ error: "falta ?to=<numero[,numero]>" }, 400);
-  const r = await secretaryAgendaCron(c.env, { testWaOnly: to });
-  return c.json({ probado: to, resultado: r ?? "sin sesión de Bukeala" });
+  // ?date=DD-MM-YYYY para revisar el formato con un día que sí tenga citas.
+  const date = c.req.query("date");
+  const r = await secretaryAgendaCron(c.env, { testWaOnly: to, dateDashed: date });
+  return c.json({ probado: to, fecha: date ?? "mañana", resultado: r ?? "sin sesión de Bukeala" });
 });
 
 app.get("/debug/:resource", handleDebug);
