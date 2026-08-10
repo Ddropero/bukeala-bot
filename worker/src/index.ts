@@ -659,6 +659,74 @@ app.get("/debug/wa-appinfo", async (c) => {
   });
 });
 
+/**
+ * ¿Bukeala expone el TELÉFONO y el EMAIL del paciente en algún lado?
+ *
+ * La API de agenda NO los trae (solo `isValidColombianCellPhone`). Pero el
+ * formulario de agendamiento los pide, así que puede venir PRELLENADO con los
+ * datos del cliente — y para eso hay que SELECCIONAR al paciente primero
+ * (findCustomer/{tipo}/{id}) y solo después leer la página.
+ *
+ *   GET /debug/customer-contact?token=..&type=1&id=63438331
+ */
+app.get("/debug/customer-contact", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const idType = c.req.query("type") ?? "1";
+  const id = c.req.query("id");
+  if (!id) return c.json({ error: "falta ?id=<cedula>" }, 400);
+
+  const b = new Bukeala(c.env);
+  const out: any = { idType, id };
+  try {
+    const sel = await b.selectCustomer(idType, id);
+    out.selectStatus = sel.status;
+    await sel.text().catch(() => "");
+
+    const page = await b.findAvailabilityPage();
+    out.pageStatus = page.status;
+    const html = await page.text();
+    out.pageBytes = html.length;
+
+    // 1) inputs cuyo name/id huele a contacto, con su value
+    const inputs: string[] = [];
+    const re = /<input[^>]*>/gi;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html))) {
+      const tag = m[0];
+      if (!/(mail|phone|cel|tel|contact)/i.test(tag)) continue;
+      const name = (tag.match(/(?:name|id)\s*=\s*"([^"]*)"/i) ?? [])[1] ?? "?";
+      const value = (tag.match(/value\s*=\s*"([^"]*)"/i) ?? [])[1] ?? "";
+      inputs.push(`${name}="${value}"`);
+    }
+    out.inputsContacto = inputs.slice(0, 25);
+
+    // 2) cualquier email y cualquier celular colombiano en el HTML
+    out.emailsEnHtml = [...new Set(html.match(/[\w.+-]+@[\w-]+\.[\w.]{2,}/g) ?? [])]
+      .filter((e) => !/tuscitasmedicas|colsanitas|keralty|w3\.org|schema/i.test(e))
+      .slice(0, 10);
+    out.celularesEnHtml = [...new Set(html.match(/(?<!\d)3\d{9}(?!\d)/g) ?? [])].slice(0, 10);
+
+    // 3) el nombre del paciente, para confirmar que el select funcionó
+    out.nombreDetectado = (html.match(/<span\s+class="user-name">([^<]+)<\/span>/) ?? [])[1] ?? null;
+
+    // 4) TODO el bloque de datos del paciente: es donde el bot ya lee tipo de
+    //    documento y sexo, así que si el teléfono/email existen, están acá.
+    const bloque = html.match(/user-data[\s\S]{0,4000}/i);
+    if (bloque) {
+      const etiquetas = [...bloque[0].matchAll(/<span class="(?:label|title)">([^<]*)<\/span>/gi)].map((x) => x[1].trim());
+      const valores = [...bloque[0].matchAll(/<span class="content">([^<]*)<\/span>/gi)].map((x) => x[1].trim());
+      out.camposPaciente = { etiquetas: etiquetas.slice(0, 20), valores: valores.slice(0, 20) };
+    } else {
+      out.camposPaciente = null;
+    }
+  } catch (e) {
+    out.error = (e as Error).message;
+  }
+  return c.json(out);
+});
+
 // Diagnóstico: qué devuelve getAgenda para una fecha (sin enviar nada).
 //   GET /debug/agenda-raw?token=..&date=DD-MM-YYYY
 app.get("/debug/agenda-raw", async (c) => {
