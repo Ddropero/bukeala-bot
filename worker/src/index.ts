@@ -727,6 +727,51 @@ app.get("/debug/customer-contact", async (c) => {
   return c.json(out);
 });
 
+/**
+ * Directorio de contactos: sembrar y consultar. SIN enviar nada.
+ *   GET /debug/contactos?token=..&backfill=1   → siembra desde KV existente
+ *   GET /debug/contactos?token=..&cedula=..    → consulta uno
+ */
+app.get("/debug/contactos", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) return c.json({ error: "unauthorized" }, 401);
+  const { backfillContactos, getContacto } = await import("./pacientesContacto");
+  const out: any = {};
+  if (c.req.query("backfill")) out.backfill = await backfillContactos(c.env);
+  const cc = c.req.query("cedula");
+  if (cc) out.contacto = await getContacto(c.env, cc);
+  // Cuántos hay en total
+  let total = 0, cursor: string | undefined;
+  do {
+    const res: any = await c.env.STATE.list({ prefix: "paciente:contacto:", cursor });
+    total += (res.keys ?? []).length;
+    cursor = res.list_complete ? undefined : res.cursor;
+  } while (cursor);
+  out.totalEnDirectorio = total;
+  return c.json(out);
+});
+
+/**
+ * Vista previa del TEXTO que se le mandaría a la secretaria, sin enviarlo.
+ * Sirve para revisar el formato con contactos reales sin gastar mensajes.
+ *   GET /debug/agenda-preview?token=..&date=DD-MM-YYYY
+ */
+app.get("/debug/agenda-preview", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) return c.json({ error: "unauthorized" }, 401);
+  const date = c.req.query("date");
+  if (!date) return c.json({ error: "falta ?date=DD-MM-YYYY" }, 400);
+  const { buildAgendaText } = await import("./agendaDoc");
+  const { getContactos } = await import("./pacientesContacto");
+  const b = new Bukeala(c.env);
+  const res = await b.getAgenda(date, 1074, false);
+  const json = await res.json<any>().catch(() => null);
+  const bookings = json?.areas?.[0]?.bookings ?? [];
+  const activos = bookings.filter((bk: any) => !bk?.isCanceled && bk?.stateCode !== "CANCELED" && !bk?.isBusyTime);
+  const dir = await getContactos(c.env, activos.map((bk: any) => bk.identification ?? ""));
+  return new Response(buildAgendaText(bookings, json?.defaultDateFormatted ?? date, dir), {
+    headers: { "content-type": "text/plain; charset=utf-8" },
+  });
+});
+
 // Diagnóstico: qué devuelve getAgenda para una fecha (sin enviar nada).
 //   GET /debug/agenda-raw?token=..&date=DD-MM-YYYY
 app.get("/debug/agenda-raw", async (c) => {

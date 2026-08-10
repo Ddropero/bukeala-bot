@@ -761,6 +761,24 @@ async function toolFindSlots(
       expirationTtl: 60 * 60 * 24, // 24h: cubre cola pendiente larga
     });
 
+    // Directorio permanente cédula → contacto. Este es el momento en que el
+    // sistema conoce AMBOS datos: el paciente escribió (tenemos su número) y
+    // dio su cédula. Bukeala no da el teléfono, así que esta es la vía para que
+    // la agenda de la secretaria salga con números para llamar.
+    // Solo aplica a WhatsApp: en Instagram `fromPhone` es un id, no un número.
+    try {
+      const { guardarContacto } = await import("./pacientesContacto");
+      await guardarContacto(env, {
+        cedula,
+        telefono: channel.kvPrefix === "wa" ? fromPhone : undefined,
+        email: patientCtx.email ?? undefined,
+        nombre: patientCtx.name,
+        fuente: "whatsapp",
+      });
+    } catch (e) {
+      console.log("[agent] guardarContacto falló (no bloqueante):", (e as Error).message);
+    }
+
     await (await b.selectCustomer(foundType, cedula)).text();
 
     // 2) Componentes (cache global 7 días de la LISTA completa — ya NO solo

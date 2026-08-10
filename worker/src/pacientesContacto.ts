@@ -1,0 +1,200 @@
+/**
+ * Directorio de contacto de pacientes: cédula → teléfono / email.
+ *
+ * POR QUÉ EXISTE
+ * Bukeala NO devuelve el teléfono ni el email del paciente. Está probado
+ * (31/jul/2026): la ficha que entrega tras seleccionar al paciente trae solo
+ * tipo de documento, identificación, sexo, edad, fecha de nacimiento y plan.
+ * El flag `isValidColombianCellPhone` de la agenda delata que Bukeala SÍ los
+ * tiene, pero no los expone.
+ *
+ * Como la agenda de la secretaria existe para LLAMAR a los pacientes, sin
+ * teléfono no sirve. Así que el sistema arma su propio directorio con los datos
+ * que ya pasan por él:
+ *
+ *   - el paciente escribe por WhatsApp y da su cédula → cédula + su número
+ *   - una cita agendada por el bot pide email y celular al paciente
+ *   - un evento de Google Calendar los trae en la descripción
+ *
+ * Un paciente que agendó DIRECTO por Colsanitas y nunca escribió no va a estar
+ * aquí, y eso hay que decirlo en la agenda en vez de dejar el campo vacío: la
+ * secretaria necesita saber a quién le toca buscar el número a mano.
+ *
+ * Almacenamiento: una llave por cédula (`paciente:contacto:{cedula}`), sin
+ * tope. La lista `recent:patients` que ya existía guarda solo 15 y se va
+ * rotando — sirve como semilla, no como directorio.
+ */
+import type { Env } from "./env";
+
+export interface ContactoPaciente {
+  cedula: string;
+  telefono?: string;
+  email?: string;
+  nombre?: string;
+  /** De dónde salió el dato, para poder auditar y priorizar. */
+  fuente: "whatsapp" | "agendamiento" | "gcal" | "manual";
+  /** ISO. Si hay dos datos, gana el más nuevo. */
+  actualizado: string;
+}
+
+const clave = (cedula: string) => `paciente:contacto:${cedula.replace(/\D/g, "")}`;
+const TTL = 60 * 60 * 24 * 365 * 2; // 2 años
+
+/** Normaliza a E.164 colombiano sin "+". Devuelve "" si no parece teléfono. */
+function normalizarTel(raw?: string): string {
+  const d = (raw ?? "").replace(/\D/g, "");
+  if (!d) return "";
+  if (d.startsWith("57") && d.length >= 12) return d;
+  if (d.length === 10) return "57" + d;
+  return d.length >= 10 ? d : "";
+}
+
+/**
+ * ¿Este número es del EQUIPO (doctor, secretaria) y no de un paciente?
+ *
+ * Importa mucho: `wa:patientCtx:{tel}` guarda "el teléfono que estaba
+ * chateando" → "la cédula que consultó". Cuando el doctor consulta la cédula de
+ * un paciente desde su propio WhatsApp, sin este filtro el directorio concluye
+ * que ese teléfono es del paciente — y la secretaria termina llamando al doctor
+ * creyendo que llama a la paciente. Pasó en la primera siembra.
+ */
+function esNumeroDelEquipo(env: Env, tel: string): boolean {
+  const d = (tel ?? "").replace(/\D/g, "");
+  if (!d) return false;
+  const propios = [
+    (env as any).DOCTOR_WHATSAPP_NUMBER ?? "",
+    ...String((env as any).SECRETARY_WHATSAPP_NUMBERS ?? "").split(","),
+    (env as any).WA_PHONE_ID ?? "", // por si acaso
+  ]
+    .map((x) => String(x).replace(/\D/g, ""))
+    .filter((x) => x.length >= 10);
+  return propios.some((p) => p === d || p.endsWith(d) || d.endsWith(p));
+}
+
+export async function getContacto(env: Env, cedula: string): Promise<ContactoPaciente | null> {
+  if (!cedula) return null;
+  try {
+    const raw = await env.STATE.get(clave(cedula));
+    return raw ? (JSON.parse(raw) as ContactoPaciente) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Guarda o completa el contacto. NO borra lo que ya había: si llega un registro
+ * sin email pero el guardado sí tenía, se conserva. Así un dato bueno no se
+ * pierde porque una fuente posterior venga incompleta.
+ */
+export async function guardarContacto(
+  env: Env,
+  datos: { cedula: string; telefono?: string; email?: string; nombre?: string; fuente: ContactoPaciente["fuente"] },
+): Promise<void> {
+  const cedula = (datos.cedula ?? "").replace(/\D/g, "");
+  if (!cedula) return;
+  let tel = normalizarTel(datos.telefono);
+  // Nunca registrar un número del equipo como si fuera del paciente.
+  if (tel && esNumeroDelEquipo(env, tel)) {
+    console.log(`[contactos] ${cedula}: descarto tel del equipo (no es del paciente)`);
+    tel = "";
+  }
+  const email = (datos.email ?? "").includes("@") ? datos.email!.trim() : "";
+  const nombre = (datos.nombre ?? "").trim();
+  if (!tel && !email && !nombre) return; // nada que guardar
+
+  try {
+    const previo = await getContacto(env, cedula);
+    const merged: ContactoPaciente = {
+      cedula,
+      telefono: tel || previo?.telefono,
+      email: email || previo?.email,
+      nombre: nombre || previo?.nombre,
+      fuente: datos.fuente,
+      actualizado: new Date().toISOString(),
+    };
+    await env.STATE.put(clave(cedula), JSON.stringify(merged), { expirationTtl: TTL });
+    console.log(`[contactos] guardado ${cedula} (${datos.fuente}) tel=${merged.telefono ? "sí" : "no"} email=${merged.email ? "sí" : "no"}`);
+  } catch (e) {
+    console.log("[contactos] guardar falló:", (e as Error).message);
+  }
+}
+
+/** Busca varias cédulas de una. Devuelve un mapa cédula → contacto. */
+export async function getContactos(
+  env: Env,
+  cedulas: string[],
+): Promise<Record<string, ContactoPaciente>> {
+  const out: Record<string, ContactoPaciente> = {};
+  await Promise.all(
+    [...new Set(cedulas.map((c) => (c ?? "").replace(/\D/g, "")).filter(Boolean))].map(async (cc) => {
+      const c = await getContacto(env, cc);
+      if (c) out[cc] = c;
+    }),
+  );
+  return out;
+}
+
+/**
+ * Siembra el directorio con lo que ya está en KV:
+ *   - `recent:patients` (trae email y teléfono de los agendados por el bot)
+ *   - `wa:patientCtx:*` / `ig:patientCtx:*` (cédula ↔ número de quien escribió)
+ *
+ * Idempotente: se puede correr las veces que sea.
+ */
+export async function backfillContactos(env: Env): Promise<{ desdeRecientes: number; desdeChats: number }> {
+  let desdeRecientes = 0;
+  let desdeChats = 0;
+
+  try {
+    const raw = await env.STATE.get("recent:patients");
+    const lista = raw ? (JSON.parse(raw) as any[]) : [];
+    for (const p of lista) {
+      if (!p?.identification) continue;
+      if (!p.phone && !p.email) continue;
+      await guardarContacto(env, {
+        cedula: p.identification,
+        telefono: p.phone,
+        email: p.email,
+        nombre: p.name,
+        fuente: "agendamiento",
+      });
+      desdeRecientes++;
+    }
+  } catch (e) {
+    console.log("[contactos] backfill recientes falló:", (e as Error).message);
+  }
+
+  // El número del paciente es la ÚLTIMA parte de la llave: wa:patientCtx:{tel}
+  for (const prefix of ["wa:patientCtx:", "ig:patientCtx:"]) {
+    try {
+      let cursor: string | undefined;
+      do {
+        const res: any = await env.STATE.list({ prefix, cursor });
+        for (const k of res.keys ?? []) {
+          const tel = k.name.slice(prefix.length);
+          const raw = await env.STATE.get(k.name);
+          if (!raw) continue;
+          try {
+            const ctx = JSON.parse(raw);
+            if (!ctx?.cedula) continue;
+            await guardarContacto(env, {
+              cedula: ctx.cedula,
+              // En Instagram el "tel" de la llave es un id de IG, no un número.
+              telefono: prefix.startsWith("wa:") ? tel : undefined,
+              email: ctx.email,
+              nombre: ctx.nombre ?? ctx.name,
+              fuente: "whatsapp",
+            });
+            desdeChats++;
+          } catch { /* siguiente */ }
+        }
+        cursor = res.list_complete ? undefined : res.cursor;
+      } while (cursor);
+    } catch (e) {
+      console.log(`[contactos] backfill ${prefix} falló:`, (e as Error).message);
+    }
+  }
+
+  console.log(`[contactos] backfill: ${desdeRecientes} de recientes, ${desdeChats} de chats`);
+  return { desdeRecientes, desdeChats };
+}

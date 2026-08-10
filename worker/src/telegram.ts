@@ -276,6 +276,7 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
         "/remove_user &lt;chatId&gt;",
         "/doctor — cambiar doctor activo",
         "/estado — ¿Bukeala en línea? (ping real + captchas hoy + cola)",
+        "/agenda_secretaria [fecha] [yo] — agenda con teléfonos y emails",
         "/sesion_stats — estadísticas Native Host",
       );
     }
@@ -385,6 +386,59 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
       return;
     }
     return showAgenda(env, chatId, dateDashed);
+  }
+
+  // /agenda_secretaria [DD/MM/YYYY] [yo]  → manda la agenda CON CONTACTOS.
+  //
+  // Sin argumentos: la de mañana, a la secretaria (WhatsApp + Telegram), igual
+  // que el cron de la 1pm pero cuando lo pidas. Con "yo": solo a ti, para
+  // revisarla antes. El teléfono/email salen del directorio propio, porque
+  // Bukeala no los devuelve; a quien no tengamos se marca explícito.
+  if (text === "/agenda_secretaria" || text.startsWith("/agenda_secretaria ")) {
+    if (!(await isDoctor(env, chatId))) {
+      await sendMessage(env, chatId, "❌ Solo doctores.");
+      return;
+    }
+    const args = text.slice("/agenda_secretaria".length).trim().split(/\s+/).filter(Boolean);
+    const soloYo = args.some((a) => /^(yo|mi|prueba)$/i.test(a));
+    const fechaArg = args.find((a) => /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}$/.test(a));
+    const dateDashed = fechaArg ? parseAgendaArgToDashed(fechaArg) : undefined;
+    if (fechaArg && !dateDashed) {
+      await sendMessage(env, chatId, "Fecha inválida. Usa <code>DD/MM/YYYY</code>.");
+      return;
+    }
+
+    await sendMessage(env, chatId, "⏳ Armando la agenda…");
+    const { secretaryAgendaCron } = await import("./cron/secretaryAgenda");
+    const { getDoctorWhatsapp } = { getDoctorWhatsapp: () => (env as any).DOCTOR_WHATSAPP_NUMBER as string | undefined };
+    const destino = soloYo ? [getDoctorWhatsapp() ?? ""].filter(Boolean) : undefined;
+    if (soloYo && (!destino || destino.length === 0)) {
+      await sendMessage(env, chatId, "❌ No hay DOCTOR_WHATSAPP_NUMBER configurado para enviarte la prueba.");
+      return;
+    }
+    try {
+      const r = await secretaryAgendaCron(env, {
+        dateDashed: dateDashed ?? undefined,
+        testWaOnly: destino,
+      });
+      if (!r) {
+        await sendMessage(env, chatId, "❌ No hay sesión de Bukeala ahora mismo. Corre /sesion_renew y reintenta.");
+        return;
+      }
+      const quien = soloYo ? "a ti" : "a la secretaria";
+      await sendMessage(
+        env,
+        chatId,
+        `✅ Agenda de <b>${r.fecha ?? dateDashed ?? "mañana"}</b> enviada ${quien}.
+` +
+          `${r.citas} cita(s) · WhatsApp: ${r.waSent} enviado(s)` +
+          (r.waErrors.length ? `
+⚠️ ${escapeHtmlLocal(r.waErrors.slice(0, 2).join(" | "))}` : ""),
+      );
+    } catch (e) {
+      await sendMessage(env, chatId, `❌ Falló: ${escapeHtmlLocal((e as Error).message)}`);
+    }
+    return;
   }
 
   if (text === "/stats") {
@@ -2595,6 +2649,13 @@ export async function showAgenda(env: Env, chatId: string, dateDashed: string): 
   const occupied = slots.filter((s) => s.bk).length;
   const free = slots.length - occupied;
 
+  // Contactos del directorio para todas las cédulas del día, en un solo golpe.
+  const { getContactos } = await import("./pacientesContacto");
+  const contactos = await getContactos(
+    env,
+    slots.map((s) => s.bk?.identification ?? "").filter(Boolean),
+  );
+
   const lines: string[] = [
     `<b>Agenda ${friendly}</b>`,
     `${occupied}/${slots.length} ocupados · ${free} libres`,
@@ -2610,15 +2671,22 @@ export async function showAgenda(env: Env, chatId: string, dateDashed: string): 
       lines.push(
         `${tag} <b>${slot.time}</b> — ${escapeHtml(slot.bk.name)}${doc}${presential}`,
       );
-      // Contacto en una 2ª línea: el teléfono va en <code> (tap = copiar) y el
-      // email tal cual. Se omite lo que no venga, para no ensuciar la agenda.
-      const tel = bookingPhone(slot.bk);
-      const mail = bookingEmail(slot.bk);
-      const contacto = [
-        tel ? `📞 <code>${escapeHtml(tel)}</code>` : "",
-        mail ? `✉️ ${escapeHtml(mail)}` : "",
-      ].filter(Boolean).join(" · ");
-      if (contacto) lines.push(`     ${contacto}`);
+      // Contacto en una 2ª línea. Bukeala NO lo manda (probado), así que sale
+      // del directorio propio (`pacientesContacto`), que se llena con los
+      // pacientes que escriben por WhatsApp o que agenda el bot.
+      // A quien agendó DIRECTO por Colsanitas y nunca escribió no lo tenemos:
+      // se marca explícito para que la secretaria sepa a quién buscar a mano.
+      const cc = (slot.bk.identification ?? "").replace(/\D/g, "");
+      const dir = cc ? contactos[cc] : undefined;
+      const tel = bookingPhone(slot.bk) || dir?.telefono || "";
+      const mail = bookingEmail(slot.bk) || dir?.email || "";
+      const contacto = tel || mail
+        ? [
+            tel ? `📞 <code>${escapeHtml(tel)}</code>` : "",
+            mail ? `✉️ ${escapeHtml(mail)}` : "",
+          ].filter(Boolean).join(" · ")
+        : "📞 <i>sin contacto — buscar en Bukeala</i>";
+      lines.push(`     ${contacto}`);
     } else {
       lines.push(`⚪ <b>${slot.time}</b> — Libre`);
     }

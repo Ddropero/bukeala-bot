@@ -137,6 +137,11 @@ export async function secretaryAgendaCron(
   }
 
   const active = bookings.filter((bk) => !bk.isCanceled && bk.stateCode !== "CANCELED" && !bk.isBusyTime);
+
+  // Directorio propio de contactos: Bukeala no manda teléfono ni email, así que
+  // sin esto la lista sale sin números y no sirve para llamar.
+  const { getContactos } = await import("../pacientesContacto");
+  const dirContactos = await getContactos(env, active.map((bk) => bk.identification ?? ""));
   console.log(`[secretaryAgenda] ${active.length} active bookings for ${friendly}`);
 
   // 1b. Cargar el estado de confirmación por WhatsApp de cada cita
@@ -183,7 +188,7 @@ export async function secretaryAgendaCron(
   // quedan tocables para llamar, que es justo para lo que sirve esta agenda.
   const waErrors: string[] = [];
   let waSent = 0;
-  const waBody = buildAgendaText(bookings, friendly);
+  const waBody = buildAgendaText(bookings, friendly, dirContactos);
   for (const to of (opts?.testWaOnly ?? secretaryWaNumbers(env))) {
     const r = await sendText(env, to, waBody);
     if (r.ok) waSent++;

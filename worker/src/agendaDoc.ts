@@ -22,6 +22,7 @@ export type AgendaBookingDoc = {
   phone?: string;
   cellPhone?: string | { phoneNumber?: string } | null;
   customerPhone?: string;
+  email?: string;
 };
 
 function escapeHtml(s: string): string {
@@ -30,6 +31,20 @@ function escapeHtml(s: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+/** Directorio cédula → contacto que inyecta el llamador (ver pacientesContacto). */
+export type DirContactos = Record<string, { telefono?: string; email?: string }>;
+
+/** Contacto del paciente: primero lo que traiga Bukeala (casi nunca), luego el
+ *  directorio propio. Bukeala NO devuelve teléfono ni email — probado. */
+function contactoDe(bk: AgendaBookingDoc, dir?: DirContactos): { tel: string; email: string } {
+  const cc = (bk.identification ?? "").replace(/\D/g, "");
+  const d = cc && dir ? dir[cc] : undefined;
+  return {
+    tel: extractPhone(bk) || d?.telefono || "",
+    email: (bk.email ?? "") || d?.email || "",
+  };
 }
 
 function extractPhone(bk: AgendaBookingDoc): string {
@@ -63,6 +78,7 @@ function timeKey(formatted: string): number {
 export function buildAgendaPdfDoc(
   bookings: AgendaBookingDoc[],
   friendlyDate: string,
+  dir?: DirContactos,
 ): { title: string; lines: Array<{ text: string; bold?: boolean }> } {
   const active = bookings
     .filter((bk) => !bk.isCanceled && bk.stateCode !== "CANCELED" && !bk.isBusyTime)
@@ -81,9 +97,10 @@ export function buildAgendaPdfDoc(
     const name = (bk.name ?? "--").trim();
     const idType = bk.identificationTypeShortCode ?? "CC";
     const idNum = (bk.identification ?? "").trim();
-    const phone = extractPhone(bk) || "sin telefono";
+    const { tel, email } = contactoDe(bk, dir);
     lines.push({ text: `${i + 1}.  ${time}   ${name}`, bold: true });
-    lines.push({ text: `      ${idType} ${idNum}   Tel: ${phone}   [ ] confirmo` });
+    lines.push({ text: `      ${idType} ${idNum}   Tel: ${tel || "SIN TELEFONO - buscar en Bukeala"}   [ ] confirmo` });
+    if (email) lines.push({ text: `      ${email}` });
   });
   return { title, lines };
 }
@@ -100,6 +117,7 @@ export function buildAgendaPdfDoc(
 export function buildAgendaText(
   bookings: AgendaBookingDoc[],
   friendlyDate: string,
+  dir?: DirContactos,
 ): string {
   const active = bookings
     .filter((bk) => !bk.isCanceled && bk.stateCode !== "CANCELED" && !bk.isBusyTime)
@@ -119,12 +137,13 @@ export function buildAgendaText(
     const name = (bk.name ?? "—").trim();
     const idType = bk.identificationTypeShortCode ?? "CC";
     const idNum = (bk.identification ?? "").trim();
-    const phone = extractPhone(bk);
+    const { tel, email } = contactoDe(bk, dir);
     lines.push(`${i + 1}. *${time}* — ${name}`);
     if (idNum) lines.push(`    ${idType} ${idNum}`);
     // Sin formato: así WhatsApp lo detecta como teléfono y se puede tocar.
-    if (phone) lines.push(`    📞 ${phone}`);
-    else lines.push(`    📞 (sin teléfono registrado)`);
+    if (tel) lines.push(`    📞 ${tel}`);
+    else lines.push(`    📞 sin teléfono — buscar en Bukeala`);
+    if (email) lines.push(`    ✉️ ${email}`);
   });
   lines.push("");
   lines.push("Marca ✅ a quien confirme. Si alguien cancela, avísale al Dr.");
