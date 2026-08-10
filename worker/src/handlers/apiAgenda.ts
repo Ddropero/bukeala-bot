@@ -62,6 +62,12 @@ export async function handleApiAgenda(c: Context<{ Bindings: Env }>) {
     return c.json({ error: "unauthorized" }, 401);
   }
 
+  // ?fuente=bukeala|gcal → capa de fuentes normalizada (ver src/fuentes/).
+  // Sin el parámetro se usa el camino histórico de abajo, intacto: así el
+  // cambio no puede romper lo que ya consume este endpoint.
+  const fuenteParam = c.req.query("fuente");
+  if (fuenteParam) return await agendaPorFuente(c, fuenteParam);
+
   const dateParam = c.req.query("date");
   let start: Date;
   if (dateParam) {
@@ -143,6 +149,65 @@ export async function handleApiAgenda(c: Context<{ Bindings: Env }>) {
   }
 
   return c.json({ ok: true, dias });
+}
+
+/**
+ * Misma respuesta, pero leyendo de una FuenteAgenda. Es el camino que usarán
+ * los clientes nuevos: el mismo JSON venga de Bukeala o de Google Calendar.
+ */
+async function agendaPorFuente(c: Context<{ Bindings: Env }>, nombre: string) {
+  const { resolverFuente, fuentesDisponibles, FuenteNoDisponible } = await import("../fuentes");
+  const fuente = resolverFuente(c.env, nombre);
+  if (!fuente) {
+    return c.json(
+      { error: "fuente_no_disponible", pedida: nombre, disponibles: fuentesDisponibles(c.env) },
+      400,
+    );
+  }
+
+  const dateParam = c.req.query("date");
+  let start: Date;
+  if (dateParam) {
+    const parsed = parseDashed(dateParam);
+    if (!parsed) return c.json({ error: "date debe ser DD-MM-YYYY" }, 400);
+    start = parsed;
+  } else {
+    start = todayInColombia();
+  }
+  const daysRaw = parseInt(c.req.query("days") ?? "1", 10);
+  const days = Number.isFinite(daysRaw) ? Math.min(Math.max(daysRaw, 1), MAX_DAYS) : 1;
+
+  const dias: unknown[] = [];
+  for (let i = 0; i < days; i++) {
+    const dashed = toDashed(new Date(start.getTime() + i * 86400000));
+    try {
+      const dia = await fuente.citasDelDia(c.env, dashed);
+      // La confirmación por WhatsApp la guarda este Worker, no la fuente.
+      const citas = [] as any[];
+      for (const cita of dia.citas) {
+        let confirmacionWa: "si" | "no" | null = null;
+        if (cita.id) {
+          const v = await c.env.STATE.get(`wa:citaConfirm:${cita.id}`);
+          if (v === "si" || v === "no") confirmacionWa = v;
+        }
+        citas.push({ ...cita, confirmacionWa });
+      }
+      dias.push({
+        fecha: dia.fecha,
+        fechaLegible: dia.fechaLegible,
+        total: citas.length,
+        confirmadas: citas.filter((x) => x.confirmacionWa === "si" || x.estado === "confirmada").length,
+        sinConfirmar: citas.filter((x) => x.confirmacionWa === null && x.estado !== "confirmada").length,
+        citas,
+      });
+    } catch (e) {
+      if (e instanceof FuenteNoDisponible) {
+        return c.json({ error: "fuente_caida", fuente: fuente.nombre, detalle: e.message, fecha: dashed }, 503);
+      }
+      return c.json({ error: "fuente_error", fuente: fuente.nombre, detalle: (e as Error).message }, 502);
+    }
+  }
+  return c.json({ ok: true, fuente: fuente.nombre, dias });
 }
 
 /** "08:20 AM" → minutos desde medianoche (para ordenar). */
