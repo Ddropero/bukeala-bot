@@ -9,6 +9,7 @@ import { handleIgDiscover } from "./handlers/instagramDiscover";
 import { handleGetProfile, handleUpdateProfilePicture, handlePhoneInfo } from "./handlers/whatsappProfile";
 import { handleListTemplates, handleCreateTemplates, handleCreateAgendaTemplate, handleCreateDocTemplate, handleCreateReminderTemplate } from "./handlers/waTemplates";
 import { handleDashboard } from "./handlers/dashboard";
+import { handlePanel } from "./handlers/panel";
 import { handleApiAgenda } from "./handlers/apiAgenda";
 import { handleNativeHostEvent, handleCheckRefresh, handleRefreshComplete, handleGetTgc } from "./handlers/nativeHostEvent";
 import { Bukeala, SessionExpiredError } from "./bukeala";
@@ -484,6 +485,8 @@ app.get("/wa.me", (c) => {
 // Dashboard web — vista en vivo de hoy/mañana/WA/cotizaciones
 //   /dashboard?token=<CAPTURE_TOKEN>  → HTML auto-refresh cada 30s
 app.get("/dashboard", handleDashboard);
+// Panel visual en vivo (versión "vendible" del dashboard). Datos reales.
+app.get("/panel", handlePanel);
 
 app.get("/qr", (c) => {
   const size = c.req.query("size") ?? "600x600";
@@ -710,6 +713,25 @@ app.get("/debug/customer-contact", async (c) => {
 
     // 3) el nombre del paciente, para confirmar que el select funcionó
     out.nombreDetectado = (html.match(/<span\s+class="user-name">([^<]+)<\/span>/) ?? [])[1] ?? null;
+
+    // 3b) La pantalla de "mis citas" del paciente: otra vista, otro HTML — a
+    //     veces los portales muestran ahí el contacto de contacto de la cita.
+    try {
+      const mb = await b.myBookings(false);
+      const mbHtml = await mb.text();
+      out.myBookings = {
+        status: mb.status,
+        bytes: mbHtml.length,
+        emails: [...new Set(mbHtml.match(/[\w.+-]+@[\w-]+\.[\w.]{2,}/g) ?? [])]
+          .filter((e) => !/tuscitasmedicas|colsanitas|keralty|w3\.org|schema|googleapis/i.test(e))
+          .slice(0, 8),
+        celulares: [...new Set(mbHtml.match(/(?<!\d)3\d{9}(?!\d)/g) ?? [])].slice(0, 8),
+        // etiquetas visibles, para ver qué campos muestra esa pantalla
+        etiquetas: [...new Set([...mbHtml.matchAll(/<p class="([a-z-]+)">/gi)].map((m2) => m2[1]))].slice(0, 20),
+      };
+    } catch (e) {
+      out.myBookings = { error: (e as Error).message };
+    }
 
     // 4) TODO el bloque de datos del paciente: es donde el bot ya lee tipo de
     //    documento y sexo, así que si el teléfono/email existen, están acá.

@@ -119,6 +119,67 @@ export async function guardarContacto(
   }
 }
 
+/**
+ * Cosecha el EMAIL del paciente desde Bukeala.
+ *
+ * Único dato de contacto que Bukeala sí deja ver, y solo en la pantalla de "mis
+ * citas" del paciente (tras seleccionarlo). Probado el 31/jul/2026: apareció en
+ * 1 de 4 pacientes — o sea, solo cuando el paciente lo tiene registrado. El
+ * TELÉFONO no aparece en ninguna pantalla (agenda, ficha, ni mis citas).
+ *
+ * OJO: `selectCustomer` cambia el paciente seleccionado en la sesión del
+ * backoffice. Llamarlo en lote está bien para un cron, pero no en medio de un
+ * flujo de agendamiento en curso.
+ */
+export async function cosecharEmail(
+  env: Env,
+  cedula: string,
+  idTypeNum = "1",
+): Promise<string> {
+  try {
+    const { Bukeala } = await import("./bukeala");
+    const b = new Bukeala(env);
+    await (await b.selectCustomer(idTypeNum, cedula)).text().catch(() => "");
+    const res = await b.myBookings(false);
+    const html = await res.text();
+    const candidatos = [...new Set(html.match(/[\w.+-]+@[\w-]+\.[\w.]{2,}/g) ?? [])].filter(
+      // Ruido fijo de la plantilla del portal + el correo del propio consultorio.
+      (e) => !/tuscitasmedicas|colsanitas|keralty|w3\.org|schema|googleapis|hbritanico|davidduque/i.test(e),
+    );
+    return candidatos[0] ?? "";
+  } catch (e) {
+    console.log(`[contactos] cosechar email ${cedula} falló:`, (e as Error).message);
+    return "";
+  }
+}
+
+/**
+ * Para las cédulas SIN email en el directorio, intenta cosecharlo de Bukeala.
+ * Secuencial a propósito (cada paciente son 2 llamadas al portal) y con tope,
+ * para no alargar un cron ni castigar la sesión.
+ */
+export async function completarEmailsFaltantes(
+  env: Env,
+  cedulas: string[],
+  tope = 12,
+): Promise<number> {
+  let nuevos = 0;
+  const pendientes: string[] = [];
+  for (const raw of [...new Set(cedulas.map((c) => (c ?? "").replace(/\D/g, "")).filter(Boolean))]) {
+    const actual = await getContacto(env, raw);
+    if (!actual?.email) pendientes.push(raw);
+  }
+  for (const cc of pendientes.slice(0, tope)) {
+    const email = await cosecharEmail(env, cc);
+    if (email) {
+      await guardarContacto(env, { cedula: cc, email, fuente: "manual" });
+      nuevos++;
+    }
+  }
+  console.log(`[contactos] emails cosechados: ${nuevos}/${pendientes.length} pendientes`);
+  return nuevos;
+}
+
 /** Busca varias cédulas de una. Devuelve un mapa cédula → contacto. */
 export async function getContactos(
   env: Env,

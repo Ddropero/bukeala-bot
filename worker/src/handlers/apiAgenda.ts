@@ -45,7 +45,10 @@ type ApiCita = {
   hora: string;
   horaFin: string;
   nombre: string;
+  paciente: string;
   cedula: string;
+  telefono: string;
+  email: string;
   estado: string;
   estadoDesc: string;
   plan: string | null;
@@ -109,6 +112,11 @@ export async function handleApiAgenda(c: Context<{ Bindings: Env }>) {
       (bk) => !bk?.isCanceled && bk?.stateCode !== "CANCELED" && !bk?.isBusyTime,
     );
 
+    // Directorio propio de contactos (Bukeala no da teléfono/email). Un solo
+    // batch para todas las cédulas del día.
+    const { getContactos } = await import("../pacientesContacto");
+    const dir = await getContactos(c.env, activas.map((bk: any) => bk?.identification ?? ""));
+
     const citas: ApiCita[] = [];
     for (const bk of activas) {
       const id = bk?.id ?? null;
@@ -119,12 +127,19 @@ export async function handleApiAgenda(c: Context<{ Bindings: Env }>) {
       }
       const tipoDoc = (bk?.identificationTypeShortCode ?? "").trim();
       const numDoc = (bk?.identification ?? "").trim();
+      const ct = numDoc ? dir[numDoc.replace(/\D/g, "")] : undefined;
+      const nombre = (bk?.name ?? "").trim();
       citas.push({
         id,
         hora: (bk?.startHourFormatted ?? "").trim(),
         horaFin: (bk?.endHourFormatted ?? "").trim(),
-        nombre: (bk?.name ?? "").trim(),
+        nombre,
+        // `paciente` = alias de `nombre`, para que el panel y los clientes nuevos
+        // lean el mismo campo venga del path histórico o de la capa de fuentes.
+        paciente: nombre,
         cedula: [tipoDoc, numDoc].filter(Boolean).join(" "),
+        telefono: ct?.telefono ?? "",
+        email: ct?.email ?? "",
         estado: bk?.stateCode ?? "",
         estadoDesc: bk?.stateDesc ?? "",
         plan: bk?.planName ?? null,
