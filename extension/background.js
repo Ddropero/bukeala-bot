@@ -402,8 +402,101 @@ async function stopAutoMode() {
   console.log("[bukeala-bg] auto-mode alarm cleared");
 }
 
+// ============================================================
+// Órdenes remotas (Worker → extensión): renovar SIN abrir el popup
+// ============================================================
+// Antes, para renovar había que abrir el popup EN este navegador y pulsar el
+// botón — ni el bot de Telegram ni el asistente pueden hacer ese clic. Ahora
+// el Worker mantiene una cola (KV ext:sendRequest, la llena /renovar_navegador
+// o POST /extension/request-send) y este sondeo la recoge y ejecuta la MISMA
+// secuencia del botón manual. 1 min es el período mínimo de chrome.alarms en
+// MV3; cada sondeo además deja heartbeat en el Worker ("navegador vivo").
+const REMOTE_ALARM_NAME = "bukeala-remote-send-poll";
+const REMOTE_POLL_PERIOD_MIN = 1;
+
+async function startRemotePoll() {
+  await chrome.alarms.create(REMOTE_ALARM_NAME, { periodInMinutes: REMOTE_POLL_PERIOD_MIN });
+  console.log(`[bukeala-bg] remote-poll alarm created (every ${REMOTE_POLL_PERIOD_MIN}min)`);
+}
+
+// Reporta al Worker cómo terminó la orden (él le confirma al Dr. por Telegram).
+// Nunca lanza: si el reporte falla, la orden expira sola en el Worker (TTL).
+async function reportRemoteSendResult(base, captureToken, result) {
+  try {
+    await fetch(`${base}/extension/send-complete?token=${encodeURIComponent(captureToken)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(result),
+    });
+  } catch (e) {
+    console.log("[bukeala-bg] send-complete error:", e.message);
+  }
+}
+
+async function remoteSendTick() {
+  const stored = await chrome.storage.local.get(["workerUrl", "captureToken"]);
+  const base = workerBaseFrom(stored.workerUrl);
+  const captureToken = stored.captureToken;
+  if (!base || !captureToken) return; // sin config no hay a quién preguntarle
+
+  // ¿Hay orden pendiente? cb=<random> + no-store porque las respuestas GET de
+  // /extension pueden quedar cacheadas en el edge de Cloudflare, y un
+  // "pending:true" cacheado dispararía renovaciones fantasma.
+  let pending = false;
+  let requestedAt = null;
+  try {
+    const cb = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const url = `${base}/extension/check-send?token=${encodeURIComponent(captureToken)}&cb=${cb}`;
+    const r = await fetch(url, { method: "GET", cache: "no-store" });
+    const j = await r.json().catch(() => ({}));
+    pending = !!j.pending;
+    requestedAt = j.requestedAt || null;
+  } catch (e) {
+    // Red caída o Worker inaccesible: nada que hacer hasta el próximo tick.
+    console.log("[bukeala-bg] check-send error:", e.message);
+    return;
+  }
+  if (!pending) return;
+
+  console.log(`[bukeala-bg] orden remota de renovación recibida (pedida ${requestedAt || "?"})`);
+  await chrome.storage.local.set({ lastRemoteOrderAt: new Date().toISOString() });
+
+  // Secuencia COMPLETA de renovación — la misma del botón del popup
+  // (manual_send): refrescar el TGC en CAS, tocar el JSESSIONID y enviar.
+  // Una orden explícita se ejecuta aunque autoMode esté apagado: apagado
+  // significa "no envíes solo", no "desobedece órdenes directas".
+  await casHeartbeat();
+  const ping = await appointPing();
+
+  // MISMA guardia anti-envenenamiento de autoTick: si ESTE navegador no está
+  // autenticado, enviar sus cookies muertas pisaría la sesión buena del
+  // Worker. No se envía y se reporta el motivo para que el bot le diga al Dr.
+  // que hace falta login humano (reCAPTCHA + anti-bot Radware: no se
+  // automatiza). authenticated === null (error de red) → sí se envía, como en
+  // autoTick: el Worker revalida antes de reemplazar.
+  if (ping.authenticated === false) {
+    console.log("[bukeala-bg] orden remota: navegador sin sesión → NO se envía");
+    await maybeNotifySessionDown("El bot pidió renovar, pero tu sesión de Bukeala expiró. Clic para volver a entrar.");
+    await reportRemoteSendResult(base, captureToken, {
+      ok: false,
+      reason: "navegador sin sesión — requiere login humano",
+      cookieCount: 0,
+    });
+    return;
+  }
+
+  const r = await sendSessionToWorker();
+  if (r && r.ok) await clearSessionDownNotification(); // envío logrado → quita el aviso
+  await reportRemoteSendResult(base, captureToken, {
+    ok: !!(r && r.ok),
+    reason: (r && r.reason) || undefined,
+    cookieCount: (r && r.count) || 0,
+  });
+}
+
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_NAME) autoTick();
+  if (alarm.name === REMOTE_ALARM_NAME) remoteSendTick();
 });
 
 chrome.runtime.onInstalled.addListener(async () => {
@@ -414,12 +507,18 @@ chrome.runtime.onInstalled.addListener(async () => {
   // alguna vez estorba, se apaga desde el popup (dura hasta la próxima recarga).
   await chrome.storage.local.set({ autoMode: true });
   await startAutoMode();
+  // El sondeo de órdenes remotas arranca SIEMPRE, independiente de autoMode:
+  // una orden explícita (/renovar_navegador) debe funcionar aunque el envío
+  // automático esté apagado. La guardia anti-envenenamiento sigue aplicando.
+  await startRemotePoll();
   console.log("[bukeala-bg] auto-mode ACTIVADO por defecto al (re)instalar");
 });
 
 chrome.runtime.onStartup.addListener(async () => {
   const stored = await chrome.storage.local.get(["autoMode"]);
   if (stored.autoMode) await startAutoMode();
+  // Ver arriba: el sondeo remoto no depende del interruptor de auto-modo.
+  await startRemotePoll();
 });
 
 // Messages from popup

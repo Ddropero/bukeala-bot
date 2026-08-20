@@ -72,6 +72,7 @@ import {
 import { suggestReply, appendHistory, getMode, setMode, type WaMode } from "./claudeAi";
 import { loadPendingRequests, clearPendingRequests, processPendingRequests } from "./claudeBookingAgent";
 import { getNativeHostEvents, requestRefresh } from "./handlers/nativeHostEvent";
+import { requestExtensionSend, getExtensionLastSeenMin } from "./handlers/extensionCommand";
 import { isAllowed, isDoctor, getRole, getUserName, listUsers, addUser, removeUser, type Role } from "./users";
 
 const TG = (token: string) => `https://api.telegram.org/bot${token}`;
@@ -262,6 +263,7 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
       "",
       "<b>🔄 Sesión Bukeala</b>",
       "/sesion_renew — pedir nuevo login (cualquiera, abre ventana en PC)",
+      "/renovar_navegador — ordenar al navegador del Dr. re-enviar sesión (solo doctor)",
       "/sesion_blackout — heatmap disponibilidad por hora (detecta mantenimientos)",
       "",
       "<b>👤 Cuenta</b>",
@@ -650,6 +652,38 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
       chatId,
       "🔔 <b>Solicitud enviada</b>\n\nEl Native Host la procesará en los próximos 30 segundos.\n\n• Si tienes 2Captcha activo: login automático (~30 seg, sin tu intervención)\n• Si no: se abre Chromium en el PC para login manual\n\n<i>Te aviso aquí cuando termine.</i>",
     );
+    return;
+  }
+
+  // /renovar_navegador — ordena a la EXTENSIÓN (el navegador del Dr.) que
+  // re-envíe la sesión, sin que nadie abra el popup ni haga clic. La extensión
+  // sondea /extension/check-send cada ~1 min (chrome.alarms) y al ver la orden
+  // corre la renovación completa (CAS heartbeat + captura + envío). OJO: si el
+  // navegador NO tiene sesión válida, la extensión NO envía (guardia
+  // anti-envenenamiento) y el Worker avisa aquí que hace falta login humano.
+  if (text === "/renovar_navegador") {
+    if (!(await isDoctor(env, chatId))) {
+      await sendMessage(env, chatId, "❌ Solo doctores.");
+      return;
+    }
+    await requestExtensionSend(env, chatId);
+    const lines = [
+      "🖥️ <b>Orden enviada al navegador</b>",
+      "",
+      "Le pedí a tu navegador que renueve la sesión; en ~1 min te confirmo aquí.",
+    ];
+    // Advertir ANTES de prometer: si la extensión no sondea hace rato, el
+    // navegador probablemente está cerrado y la orden expirará sin efecto.
+    const lastSeenMin = await getExtensionLastSeenMin(env);
+    if (lastSeenMin === null) {
+      lines.push(
+        "",
+        "⚠️ Tu navegador nunca ha reportado — puede estar cerrado, o la extensión aún no tiene la versión con sondeo remoto (recárgala en brave://extensions).",
+      );
+    } else if (lastSeenMin > 5) {
+      lines.push("", `⚠️ Tu navegador no ha reportado hace ${lastSeenMin} min — puede estar cerrado.`);
+    }
+    await sendMessage(env, chatId, lines.join("\n"));
     return;
   }
 

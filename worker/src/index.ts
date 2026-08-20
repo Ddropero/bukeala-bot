@@ -12,6 +12,12 @@ import { handleDashboard } from "./handlers/dashboard";
 import { handlePanel } from "./handlers/panel";
 import { handleApiAgenda } from "./handlers/apiAgenda";
 import { handleNativeHostEvent, handleCheckRefresh, handleRefreshComplete, handleGetTgc } from "./handlers/nativeHostEvent";
+import {
+  handleExtensionRequestSend,
+  handleExtensionCheckSend,
+  handleExtensionSendComplete,
+  handleExtensionStatus,
+} from "./handlers/extensionCommand";
 import { Bukeala, SessionExpiredError } from "./bukeala";
 import { loadSession } from "./kv";
 import { dailySummary } from "./cron/dailySummary";
@@ -59,6 +65,19 @@ app.post("/native-host/refresh-complete", handleRefreshComplete);
 // TGC rescue: la VM recupera el TGC de la última sesión en KV tras un reboot
 // (evita gastar captcha para re-bootstrapear). Solo devuelve cookies TGC.
 app.get("/native-host/tgc", handleGetTgc);
+
+// Cola de órdenes para la EXTENSIÓN del navegador del Dr. — renovación remota
+// SIN abrir el popup. Mismo patrón que /native-host/check-refresh pero con
+// llaves KV propias (ext:*), porque la VM y la extensión son ejecutores
+// distintos. Ver handlers/extensionCommand.ts para el porqué de cada pieza.
+//   POST /extension/request-send  → encolar orden (Telegram /renovar_navegador o curl)
+//   GET  /extension/check-send    → la extensión sondea cada ~1 min
+//   POST /extension/send-complete → la extensión reporta el resultado
+//   GET  /extension/status        → diagnóstico (último resultado + heartbeat)
+app.post("/extension/request-send", handleExtensionRequestSend);
+app.get("/extension/check-send", handleExtensionCheckSend);
+app.post("/extension/send-complete", handleExtensionSendComplete);
+app.get("/extension/status", handleExtensionStatus);
 
 // Telegram webhook (Telegram → Worker)
 app.post("/tg/webhook", handleTelegramWebhook);

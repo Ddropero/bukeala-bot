@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Bukeala Session Sender v5",
-  "version": "5.0.0",
-  "description": "v5: CAS heartbeat + auto-envío de sesión cada 5 min para mantener token vivo 24/7.",
+  "version": "5.1.0",
+  "description": "v5.1: CAS heartbeat + auto-envío cada 5 min + órdenes remotas (/renovar_navegador renueva sin abrir el popup).",
   "permissions": ["cookies", "storage", "activeTab", "alarms", "tabs", "notifications"],
   "host_permissions": [
     "<all_urls>"
