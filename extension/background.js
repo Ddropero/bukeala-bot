@@ -225,8 +225,14 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 chrome.runtime.onInstalled.addListener(async () => {
-  const stored = await chrome.storage.local.get(["autoMode"]);
-  if (stored.autoMode) await startAutoMode();
+  // Reactivación por defecto (ago 2026): tras el bloqueo anti-bot de Radware,
+  // el login automático de la VM ya no pasa; la sesión se siembra desde ESTE
+  // navegador humano, así que el auto-envío pasa a ser el sostén principal.
+  // Por eso al (re)instalar o RECARGAR la extensión arranca ENCENDIDO. Si
+  // alguna vez estorba, se apaga desde el popup (dura hasta la próxima recarga).
+  await chrome.storage.local.set({ autoMode: true });
+  await startAutoMode();
+  console.log("[bukeala-bg] auto-mode ACTIVADO por defecto al (re)instalar");
 });
 
 chrome.runtime.onStartup.addListener(async () => {
