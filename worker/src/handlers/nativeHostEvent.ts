@@ -160,6 +160,44 @@ export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
     }
   }
 
+  // Alerta INMEDIATA cuando aparece el anti-bot Radware (perfdrive). Es el
+  // fallo del 19-20 ago 2026: el login automático de la VM es desviado a
+  // validate.perfdrive.com y bloqueado. NO se arregla solo — necesita que el
+  // Dr. haga login humano en Bukeala y capture con la extensión. Sin esta
+  // alerta, la caída solo se notó 7 h después. Throttle 90 min (la acción es
+  // manual y el TGT dura ~6 h, así que a lo sumo un par de avisos por corte).
+  const txt = ((event.message ?? "") + " " + (event.postNavUrl ?? "")).toLowerCase();
+  if (event.type === "error" && /perfdrive|botmanager|validate\.perfdrive/.test(txt)) {
+    const lastRaw = await c.env.STATE.get("nativeHost:radwareAlertAt");
+    const now = Date.now();
+    if (!lastRaw || now - parseInt(lastRaw, 10) > 90 * 60 * 1000) {
+      await c.env.STATE.put("nativeHost:radwareAlertAt", String(now), { expirationTtl: 60 * 60 * 12 });
+      try {
+        const doctors = await getDoctorRecipients(c.env);
+        for (const chat of doctors) {
+          await fetch(`${TG(c.env.TELEGRAM_BOT_TOKEN)}/sendMessage`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              chat_id: chat,
+              text:
+                "🟠 <b>Bukeala bloqueó el login automático</b> (anti-bot Radware)\n\n" +
+                "La VM no puede renovar sola: Colsanitas desvía el login a su sistema " +
+                "anti-bot. Esto <b>necesita tu login humano</b>:\n\n" +
+                "1. Entra a Bukeala en tu Chrome (tú sí pasas el anti-bot)\n" +
+                "2. Abre la extensión → <b>Enviar sesión ahora</b>\n\n" +
+                "<i>La VM tomará esa sesión y la mantendrá viva ~6 h. Reintentar el " +
+                "login automático solo empeora las cosas, así que la VM ya no lo hace.</i>",
+              parse_mode: "HTML",
+            }),
+          }).catch(() => {});
+        }
+      } catch (e) {
+        console.log("[native-host-event] radware alert failed:", (e as Error).message);
+      }
+    }
+  }
+
   // On a successful refresh, kick off pending-queue processing in the background
   if (event.type === "ok") {
     c.executionCtx.waitUntil(

@@ -915,7 +915,12 @@ async function main() {
   let fatalReason = null;             // p.ej. ZERO_BALANCE → backoff largo (requiere humano)
   const RETRY_DELAY_MS = 90 * 1000;   // tras un fallo normal, reintentar en 90s
   // Errores que NO se arreglan reintentando (requieren acción humana, p.ej. recargar saldo):
-  const FATAL_PATTERNS = [/ZERO_BALANCE/i];
+  // perfdrive/botmanager = anti-bot Radware (Colsanitas, ago 2026): el login
+  // automático NO pasa y reintentarlo solo entrena su modelo contra la cuenta.
+  // Tratarlo como fatal → backoff largo (15/30/60 min) en vez de martillar
+  // cada 90s. Se resuelve cuando el Dr. re-siembra la sesión desde su Chrome
+  // (login humano) y el navegador vivo la renueva en sitio, sin login.
+  const FATAL_PATTERNS = [/ZERO_BALANCE/i, /perfdrive/i, /botmanager/i, /no produjo sesión de Bukeala/i];
 
   // Delay del próximo reintento tras fallo. Normal: 90s. Fallos repetidos
   // (5+): 10 min — martillar cada 90s nos ganó "Too Many Requests" de
