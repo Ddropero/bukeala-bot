@@ -3,7 +3,7 @@
   "name": "Bukeala Session Sender v5",
   "version": "5.0.0",
   "description": "v5: CAS heartbeat + auto-envío de sesión cada 5 min para mantener token vivo 24/7.",
-  "permissions": ["cookies", "storage", "activeTab", "alarms", "tabs"],
+  "permissions": ["cookies", "storage", "activeTab", "alarms", "tabs", "notifications"],
   "host_permissions": [
     "<all_urls>"
   ],
@@ -12,6 +12,10 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Bukeala session"
+    "default_title": "Bukeala session",
+    "default_icon": "icon.png"
+  },
+  "icons": {
+    "128": "icon.png"
   }
 }

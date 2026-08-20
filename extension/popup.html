@@ -20,39 +20,76 @@
         background: #2563eb; color: white; cursor: pointer; font-weight: 600;
       }
       button:disabled { background: #9aa6b6; cursor: not-allowed; }
+      button.secundario { background: #059669; }
       #status { margin-top: 10px; font-size: 12px; min-height: 1em; }
       .ok { color: #059669; }
       .err { color: #dc2626; }
       .hint { font-size: 11px; opacity: .7; margin-top: 4px; }
+
+      /* Estado grande VIVA / CAÍDA */
+      .estado {
+        margin: 4px 0 2px; padding: 12px; border-radius: 6px;
+        font-size: 16px; font-weight: 700; text-align: center;
+      }
+      .estado.viva   { background: #dcfce7; color: #065f46; }
+      .estado.caida  { background: #fee2e2; color: #991b1b; }
+      .estado.cargando { background: #eef2f7; color: #475569; font-weight: 600; }
+      #detalle { font-size: 11px; opacity: .7; margin: 4px 0 0; text-align: center; }
+
+      /* Zona de acción cuando la sesión está caída */
+      .accion-login {
+        margin-top: 12px; padding: 10px; border: 1px solid #fca5a5;
+        border-radius: 6px; background: #fff1f2;
+      }
+      .accion-login .msg { font-size: 12px; color: #991b1b; font-weight: 600; }
+
+      details { margin-top: 14px; }
+      summary { font-size: 12px; cursor: pointer; opacity: .8; }
       .auto-row {
         display: flex; align-items: center; gap: 8px;
-        padding: 8px; margin-top: 12px;
+        padding: 8px; margin-top: 10px;
         border: 1px solid #ddd; border-radius: 4px;
       }
       .auto-row input[type=checkbox] { margin: 0; }
       .auto-row label { margin: 0; font-size: 12px; opacity: 1; flex: 1; cursor: pointer; }
-      #lastAuto { font-size: 11px; opacity: .6; margin-top: 6px; }
+      #lastAuto { font-size: 11px; opacity: .6; margin-top: 8px; }
     </style>
   </head>
   <body>
     <h1>Sesión Bukeala</h1>
 
-    <label>Worker URL (endpoint /capture)</label>
-    <input id="workerUrl" type="text" placeholder="https://...workers.dev/capture" />
+    <!-- Estado grande, sin jerga -->
+    <div id="estado" class="estado cargando">Consultando estado…</div>
+    <div id="detalle"></div>
 
-    <label>Capture token</label>
-    <input id="captureToken" type="password" placeholder="CAPTURE_TOKEN" />
+    <!-- Acción principal -->
+    <button id="sendBtn">Renovar / enviar sesión ahora</button>
 
-    <button id="sendBtn">Enviar sesión ahora</button>
-
-    <div class="auto-row">
-      <input type="checkbox" id="autoMode" />
-      <label for="autoMode">Auto-enviar cada 5 min (solo si este navegador tiene sesión de Bukeala)</label>
+    <!-- Zona visible solo si la sesión está caída -->
+    <div id="accionLogin" class="accion-login" hidden>
+      <div class="msg">Entra a Bukeala y vuelve a iniciar sesión.</div>
+      <button id="loginBtn" class="secundario">Abrir Bukeala para iniciar sesión</button>
     </div>
 
     <div id="status"></div>
     <div id="lastAuto"></div>
-    <div class="hint">Antes de enviar: estar logueado en Bukeala en otra pestaña.</div>
+
+    <!-- Configuración (secundaria) -->
+    <details>
+      <summary>Configuración</summary>
+
+      <label>Worker URL (endpoint /capture)</label>
+      <input id="workerUrl" type="text" placeholder="https://...workers.dev/capture" />
+
+      <label>Capture token</label>
+      <input id="captureToken" type="password" placeholder="CAPTURE_TOKEN" />
+
+      <div class="auto-row">
+        <input type="checkbox" id="autoMode" />
+        <label for="autoMode">Auto-enviar cada 5 min (solo si este navegador tiene sesión de Bukeala)</label>
+      </div>
+      <div class="hint">Antes de enviar manualmente: estar logueado en Bukeala en otra pestaña.</div>
+    </details>
 
     <script src="popup.js"></script>
   </body>

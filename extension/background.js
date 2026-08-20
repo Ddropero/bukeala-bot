@@ -24,6 +24,23 @@ const SERVICE_URL = "https://appoint.tuscitasmedicas.com/keraltyadscritos/cas/lo
 const APPOINT_PING_URL =
   "https://appoint.tuscitasmedicas.com/keraltyadscritos/findAvailability";
 
+// URL de login HUMANO: el mismo flujo CAS→Bukeala que usa casHeartbeat. Es la
+// que el médico debe abrir para meter usuario+contraseña+reCAPTCHA en SU Chrome
+// real (el único que pasa el anti-bot de Radware). No la inventamos: se arma
+// con las constantes de arriba para no desincronizarnos del heartbeat.
+const CAS_FULL_LOGIN_URL = `${CAS_LOGIN_URL}?service=${encodeURIComponent(SERVICE_URL)}`;
+
+// Vigilancia + aviso accionable.
+const NOTIF_ID = "bukeala-session-down";
+const NOTIFY_COOLDOWN_MIN = 40; // anti-spam: no molestar más de 1 vez cada ~40 min
+
+// Captura inmediata tras el login: cookie de sesión de Bukeala.
+const SESSION_COOKIE_NAME = "JSESSIONID";
+const SESSION_COOKIE_DOMAIN = "tuscitasmedicas.com";
+const CAPTURE_DEBOUNCE_MS = 4000; // coalesce los eventos de carga en un solo envío
+
+// URL a la que mandamos al doctor cuando toca re-login: el
+
 // ============================================================
 // CAS heartbeat — keep TGC alive
 // ============================================================
@@ -152,12 +169,15 @@ async function sendSessionToWorker() {
           ? null
           : (body.detail || body.error || `HTTP ${res.status}`);
 
-    await chrome.storage.local.set({
+    const patch = {
       lastAutoSendAt: new Date().toISOString(),
       lastAutoSendOk: ok,
       lastAutoSendCount: body.cookieCount ?? allCookies.length,
       lastAutoSendError: reason,
-    });
+    };
+    // Marca el ÚLTIMO envío exitoso (lo muestra el popup: "hace N min").
+    if (ok) patch.lastSuccessAt = new Date().toISOString();
+    await chrome.storage.local.set(patch);
     return { ok, status: res.status, count: allCookies.length, body, reason };
   } catch (e) {
     console.log("[bukeala-bg] network error:", e.message);
@@ -169,6 +189,151 @@ async function sendSessionToWorker() {
     return { ok: false, reason: "network_error" };
   }
 }
+
+// ============================================================
+// Vigilancia del estado real + aviso accionable
+// ============================================================
+
+// La workerUrl guardada termina en /capture; la base es todo menos ese sufijo.
+function workerBaseFrom(workerUrl) {
+  return String(workerUrl || "").replace(/\/capture\/?$/, "");
+}
+
+// Veredicto AUTORITATIVO del Worker: ¿la sesión que ÉL tiene sirve ahora mismo?
+// GET /debug/measure (sin action = probe) → { alive: bool, ... } SIN renovar.
+// { known:false } si falta config o falla la red: en ese caso no concluimos nada.
+async function checkWorkerAlive() {
+  const stored = await chrome.storage.local.get(["workerUrl", "captureToken"]);
+  const base = workerBaseFrom(stored.workerUrl);
+  if (!base || !stored.captureToken) return { known: false };
+  try {
+    const url =
+      `${base}/debug/measure?token=${encodeURIComponent(stored.captureToken)}&_=${Date.now()}`;
+    const r = await fetch(url, { method: "GET" });
+    const j = await r.json().catch(() => ({}));
+    await chrome.storage.local.set({
+      lastMeasureAt: new Date().toISOString(),
+      lastMeasureAlive: !!j.alive,
+    });
+    return { known: true, alive: !!j.alive, raw: j };
+  } catch (e) {
+    console.log("[bukeala-bg] measure error:", e.message);
+    return { known: false, error: e.message };
+  }
+}
+
+// Abre (o enfoca si ya existe) la pestaña de login del CAS. NO automatiza NADA
+// del login: solo lo deja a un clic; el usuario+clave+reCAPTCHA los hace el humano.
+async function openBukealaLogin() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    const hit = tabs.find((t) => {
+      const u = t.url || "";
+      return u.includes("app01.colsanitas.com/cas/login") ||
+             u.includes("appoint.tuscitasmedicas.com");
+    });
+    if (hit && hit.id != null) {
+      await chrome.tabs.update(hit.id, { active: true });
+      if (hit.windowId != null) {
+        try { await chrome.windows.update(hit.windowId, { focused: true }); } catch (_) {}
+      }
+      return;
+    }
+    await chrome.tabs.create({ url: CAS_FULL_LOGIN_URL });
+  } catch (e) {
+    console.log("[bukeala-bg] openBukealaLogin error:", e.message);
+  }
+}
+
+// Aviso accionable con anti-spam DURO. El estado vive en chrome.storage.local
+// porque el service worker se duerme y perdería cualquier variable en memoria:
+//   - notifyPending: ya avisamos y el médico aún no ha hecho nada → no repetir.
+//   - lastNotifyAt: no más de un aviso cada NOTIFY_COOLDOWN_MIN.
+async function maybeNotifySessionDown(mensaje) {
+  const now = Date.now();
+  const st = await chrome.storage.local.get(["lastNotifyAt", "notifyPending"]);
+  if (st.notifyPending) return;
+  if (st.lastNotifyAt && now - st.lastNotifyAt < NOTIFY_COOLDOWN_MIN * 60000) return;
+  try {
+    await chrome.notifications.create(NOTIF_ID, {
+      type: "basic",
+      iconUrl: "icon.png",
+      title: "Sesión de Bukeala expirada",
+      message: mensaje || "Clic aquí para volver a iniciar sesión en Bukeala.",
+      priority: 2,
+      requireInteraction: true, // es accionable: que no se auto-descarte sola
+    });
+    await chrome.storage.local.set({ lastNotifyAt: now, notifyPending: true });
+    console.log("[bukeala-bg] aviso de sesión caída mostrado");
+  } catch (e) {
+    console.log("[bukeala-bg] notifications.create error:", e.message);
+  }
+}
+
+// La sesión volvió a estar sana → retirar el aviso y rearmar para la próxima caída.
+async function clearSessionDownNotification() {
+  try { await chrome.notifications.clear(NOTIF_ID); } catch (_) {}
+  const st = await chrome.storage.local.get(["notifyPending"]);
+  if (st.notifyPending) await chrome.storage.local.set({ notifyPending: false });
+}
+
+// Clic en el aviso → abrir el login y rearmar. Dejamos lastNotifyAt intacto:
+// el cooldown evita re-avisar de inmediato mientras el médico se loguea.
+chrome.notifications.onClicked.addListener(async (id) => {
+  if (id !== NOTIF_ID) return;
+  await openBukealaLogin();
+  try { await chrome.notifications.clear(NOTIF_ID); } catch (_) {}
+  await chrome.storage.local.set({ notifyPending: false });
+});
+
+// ============================================================
+// Captura inmediata tras el login (segundos, no 5 min)
+// ============================================================
+// El timer vive en memoria a propósito: es solo un debounce de segundos, dentro
+// de la ventana que Chrome mantiene vivo el SW tras un evento. Si aun así el SW
+// muriera antes de disparar, el tick de 5 min recoge la sesión igualmente.
+let captureTimer = null;
+
+function scheduleImmediateCapture(motivo) {
+  if (captureTimer) clearTimeout(captureTimer);
+  captureTimer = setTimeout(async () => {
+    captureTimer = null;
+    const stored = await chrome.storage.local.get(["autoMode"]);
+    if (!stored.autoMode) return; // respeta el interruptor del médico
+    console.log(`[bukeala-bg] captura inmediata (${motivo})`);
+    // MISMA guardia anti-envenenamiento que autoTick: enviar SOLO si este
+    // navegador quedó autenticado. authenticated===false → no enviar (no pisar
+    // la sesión buena); null por error de red → sí (el Worker revalida antes).
+    const ping = await appointPing();
+    if (ping.authenticated === false) {
+      console.log("[bukeala-bg] captura inmediata: navegador sin sesión válida → no se envía");
+      return;
+    }
+    const r = await sendSessionToWorker();
+    if (r && r.ok) await clearSessionDownNotification(); // login logrado → quita el aviso
+  }, CAPTURE_DEBOUNCE_MS);
+}
+
+// Disparador principal: cambió la cookie de sesión de Bukeala (lo típico tras
+// completar el login CAS→Bukeala). Con el permiso "cookies" el evento llega
+// incluso para JSESSIONID, que es HttpOnly.
+chrome.cookies.onChanged.addListener((info) => {
+  if (info.removed) return;
+  const ck = info.cookie || {};
+  const dom = (ck.domain || "").toLowerCase();
+  if (ck.name === SESSION_COOKIE_NAME && dom.includes(SESSION_COOKIE_DOMAIN)) {
+    scheduleImmediateCapture("cookie JSESSIONID de Bukeala");
+  }
+});
+
+// Respaldo: una pestaña terminó de cargar en el host de citas de Bukeala.
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "complete") return;
+  const u = (tab && tab.url) || "";
+  if (u.includes("appoint.tuscitasmedicas.com")) {
+    scheduleImmediateCapture("pestaña de Bukeala cargada");
+  }
+});
 
 // ============================================================
 // Tick: heartbeat + ping + capture & send
@@ -184,6 +349,8 @@ async function autoTick() {
   await casHeartbeat();
   // 2. Touch JSESSIONID at appoint host so cookies are fresh.
   const ping = await appointPing();
+  // 2b. Veredicto autoritativo del Worker (para el estado del popup y el aviso).
+  const worker = await checkWorkerAlive();
 
   // 3. Enviar SOLO si este navegador está realmente autenticado.
   //
@@ -203,11 +370,26 @@ async function autoTick() {
       lastAutoSendOk: false,
       lastAutoSendError: "navegador sin sesión de Bukeala — no se envió",
     });
+    // Navegador sin sesión = hace falta un login HUMANO (usuario+clave+reCAPTCHA):
+    // eso no se automatiza, así que avisamos de forma accionable (con anti-spam).
+    //
+    // Sólo disparamos el aviso por este caso (navegador caído), NO por
+    // worker.alive===false a secas: si el navegador SÍ está autenticado pero el
+    // Worker está caído, el envío de más abajo lo repara solo — avisar ahí sería
+    // un falso positivo (el médico ya está logueado y no tendría nada que hacer).
+    await maybeNotifySessionDown("Tu sesión de Bukeala expiró. Clic para volver a entrar.");
     return;
   }
 
   // 4. Capture all cookies and send to worker (which decrypts + uses them).
   await sendSessionToWorker();
+
+  // 5. Navegador autenticado (o red incierta): el sistema puede auto-repararse
+  // con el envío de arriba. Si hay evidencia de salud, retiramos el aviso
+  // pendiente para rearmar la vigilancia de cara a la próxima caída real.
+  if (ping.authenticated === true || worker.alive === true) {
+    await clearSessionDownNotification();
+  }
 }
 
 async function startAutoMode() {
@@ -248,6 +430,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const heartbeat = await casHeartbeat();
       await appointPing();
       const r = await sendSessionToWorker();
+      if (r?.ok) await clearSessionDownNotification(); // envío logrado → quita el aviso
       sendResponse({ ...r, heartbeat });
       return;
     }
@@ -255,6 +438,19 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       await chrome.storage.local.set({ autoMode: !!msg.enabled });
       if (msg.enabled) await startAutoMode();
       else await stopAutoMode();
+      sendResponse({ ok: true });
+      return;
+    }
+    if (msg?.type === "check_alive") {
+      // El popup pregunta el veredicto del Worker para pintar VIVA/CAÍDA.
+      const r = await checkWorkerAlive();
+      sendResponse(r);
+      return;
+    }
+    if (msg?.type === "open_login") {
+      // El popup pide abrir la pestaña de login (sesión caída).
+      await openBukealaLogin();
+      await chrome.storage.local.set({ notifyPending: false });
       sendResponse({ ok: true });
       return;
     }

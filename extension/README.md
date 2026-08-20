@@ -9,7 +9,7 @@ Captura todas las cookies de los dominios `tuscitasmedicas.com` y `colsanitas.co
 3. Clic en "Cargar descomprimida" y selecciona la carpeta `extension/`.
 4. La extensión aparece en la barra. Fíjala (alfiler).
 
-> Nota: falta el archivo `icon.png`. Pon cualquier PNG cuadrado de 128px en `extension/icon.png` o elimina la sección `icons` del `manifest.json`.
+> La primera vez que se muestre un aviso de sesión, Chrome puede pedir permiso de **notificaciones**: acéptalo (es el permiso `notifications` del `manifest.json`).
 
 ## Uso
 
