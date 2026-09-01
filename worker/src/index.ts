@@ -29,6 +29,7 @@ import { weeklyReport } from "./cron/weeklyReport";
 import { quoteFollowup } from "./cron/quoteFollowup";
 import { secretaryAgendaCron } from "./cron/secretaryAgenda";
 import { eveningReminderCron } from "./cron/eveningReminder";
+import { espejoCalendarCron } from "./cron/espejoCalendar";
 import { getDoctorRecipients } from "./users";
 import { processPendingRequests, loadPendingRequests } from "./claudeBookingAgent";
 import { requestRefresh } from "./handlers/nativeHostEvent";
@@ -855,6 +856,33 @@ app.get("/debug/agenda-secretaria", async (c) => {
   return c.json({ probado: to, fecha: date ?? "mañana", resultado: r ?? "sin sesión de Bukeala" });
 });
 
+// Espejo Bukeala → Google Calendar a demanda (mismo código que el cron de
+// cada 2h). Devuelve el resumen en JSON; sirve para probar con curl.
+//   ?dias=N    ventana desde hoy (1–60, default 14)
+//   ?forzar=1  salta el tope de cancelaciones (solo si sabes que son reales)
+// no-store: las respuestas GET pueden quedar cacheadas en el edge y aquí cada
+// llamada ES una sincronización distinta.
+//   ?autoprueba=1  NO toca Bukeala ni el calendario del Dr.: ejercita la
+//                  sincronización con citas sintéticas en un calendario
+//                  temporal del service account (ver cron/espejoCalendarPrueba.ts)
+app.get("/debug/espejo-calendar", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  if (c.req.query("autoprueba") === "1") {
+    const { autoPruebaEspejo } = await import("./cron/espejoCalendarPrueba");
+    const rep = await autoPruebaEspejo(c.env);
+    return c.json(rep, rep.ok ? 200 : 500, { "Cache-Control": "no-store" });
+  }
+  const diasRaw = parseInt(c.req.query("dias") ?? "", 10);
+  const r = await espejoCalendarCron(c.env, {
+    dias: Number.isFinite(diasRaw) ? diasRaw : undefined,
+    forzarCancelaciones: c.req.query("forzar") === "1",
+    origen: "manual",
+  });
+  return c.json(r, 200, { "Cache-Control": "no-store" });
+});
+
 app.get("/debug/:resource", handleDebug);
 
 // Keep-alive cron:
@@ -1072,6 +1100,11 @@ export default {
     } else if (event.cron === "0 14 * * *") {
       // 9am Bogotá diario: follow-up cotizaciones de hace 48h
       ctx.waitUntil(quoteFollowup(env));
+    } else if (event.cron === "0 12,14,16,18,20,22 * * *") {
+      // Cada 2h en horario de oficina (7am–5pm Bogotá): espejo de la agenda de
+      // Bukeala hacia Google Calendar (14 días). Si Bukeala no responde, aborta
+      // sin cancelar nada — ver cron/espejoCalendar.ts.
+      ctx.waitUntil(espejoCalendarCron(env, { origen: "cron" }));
     } else {
       // Default: keepAlive (cada 3 min)
       ctx.waitUntil(keepAlive(env));

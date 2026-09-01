@@ -38,11 +38,23 @@ export interface GCalEvent {
   start: { dateTime: string; timeZone: string };
   end: { dateTime: string; timeZone: string };
   attendees?: { email: string; displayName?: string }[];
-  reminders?: { useDefault: boolean };
+  reminders?: { useDefault: boolean; overrides?: { method: "popup" | "email"; minutes: number }[] };
+  /**
+   * Propiedades que el usuario no ve en la UI de Calendar. `private` es visible
+   * solo para la cuenta que las escribió (nuestro service account): ahí guarda
+   * el espejo de Bukeala el id de la cita y su huella, y por ahí se buscan
+   * (`privateExtendedProperty=clave=valor` en events.list).
+   */
+  extendedProperties?: { private?: Record<string, string>; shared?: Record<string, string> };
+  /** "opaque" (ocupa, cuenta en freeBusy) | "transparent" (libre). */
+  transparency?: "opaque" | "transparent";
+  colorId?: string;
   // Campos solo de lectura (vienen del API):
   recurringEventId?: string;  // si está presente, es instancia de evento recurrente
   status?: string;            // "confirmed", "cancelled", etc.
   location?: string;
+  updated?: string;           // ISO de la última modificación (la haga quien la haga)
+  htmlLink?: string;
 }
 
 export interface BusyPeriod {
@@ -251,6 +263,115 @@ export async function listEvents(
   }
   const data = await res.json<any>();
   return data.items || [];
+}
+
+/**
+ * Lista eventos con filtros finos y PAGINACIÓN completa. Es lo que usa el
+ * espejo de Bukeala: busca por propiedad privada (`privateExtendedProperty`)
+ * y, con `showDeleted`, también los eventos ya cancelados — necesario para
+ * restaurar uno en vez de duplicarlo si la cita vuelve a estar activa.
+ *
+ * `listEvents` de arriba se deja intacta (la usan popCuc y la fuente gcal).
+ */
+export interface ListEventsOpts {
+  timeMin?: string;
+  timeMax?: string;
+  /** Cada par se manda como `privateExtendedProperty=clave=valor` (AND entre ellos). */
+  privateProps?: Record<string, string>;
+  showDeleted?: boolean;
+}
+
+export async function listEventsFiltrado(
+  env: Env,
+  calendarId: string,
+  opts: ListEventsOpts = {},
+): Promise<GCalEvent[]> {
+  const items: GCalEvent[] = [];
+  let pageToken: string | undefined;
+  do {
+    const params = new URLSearchParams({
+      singleEvents: "true",
+      maxResults: "2500",
+      timeZone: "America/Bogota",
+    });
+    if (opts.timeMin) params.set("timeMin", opts.timeMin);
+    if (opts.timeMax) params.set("timeMax", opts.timeMax);
+    if (opts.showDeleted) params.set("showDeleted", "true");
+    for (const [k, v] of Object.entries(opts.privateProps ?? {})) {
+      params.append("privateExtendedProperty", `${k}=${v}`);
+    }
+    if (pageToken) params.set("pageToken", pageToken);
+
+    const res = await gcalFetch(
+      env,
+      `/calendars/${encodeURIComponent(calendarId)}/events?${params.toString()}`,
+    );
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error(`List events (filtrado) failed (${res.status}): ${t.slice(0, 200)}`);
+    }
+    const data = await res.json<any>();
+    items.push(...((data.items ?? []) as GCalEvent[]));
+    pageToken = data.nextPageToken || undefined;
+  } while (pageToken);
+  return items;
+}
+
+/**
+ * Modifica SOLO los campos enviados (semántica PATCH). Por eso el espejo la
+ * prefiere sobre un PUT: lo que el Dr. haya tocado a mano y no mandemos
+ * (color, recordatorios, invitados, ubicación) se queda como está.
+ * Con `status: "confirmed"` también restaura un evento cancelado.
+ */
+export async function patchEvent(
+  env: Env,
+  calendarId: string,
+  eventId: string,
+  cambios: Partial<GCalEvent>,
+): Promise<GCalEvent> {
+  const res = await gcalFetch(
+    env,
+    `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
+    { method: "PATCH", body: JSON.stringify(cambios) },
+  );
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Patch event failed (${res.status}): ${t.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+/**
+ * Crea un calendario SECUNDARIO propiedad del service account. Lo usa la
+ * autoprueba del espejo para escribir en un sitio aislado: el calendario del
+ * Dr. nunca entra en una prueba.
+ */
+export async function createCalendar(env: Env, summary: string): Promise<{ id: string }> {
+  const res = await gcalFetch(env, "/calendars", {
+    method: "POST",
+    body: JSON.stringify({ summary, timeZone: "America/Bogota" }),
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Create calendar failed (${res.status}): ${t.slice(0, 200)}`);
+  }
+  const data = await res.json<any>();
+  if (!data?.id) throw new Error("Create calendar: respuesta sin id");
+  return { id: data.id };
+}
+
+/**
+ * Borra un calendario secundario del service account (el de la autoprueba).
+ * Google rechaza borrar el calendario primario, y los compartidos por el Dr.
+ * no son "propiedad" del service account: no hay forma de que esto le borre
+ * el suyo.
+ */
+export async function deleteCalendar(env: Env, calendarId: string): Promise<void> {
+  const res = await gcalFetch(env, `/calendars/${encodeURIComponent(calendarId)}`, { method: "DELETE" });
+  if (!res.ok && res.status !== 404) {
+    const t = await res.text();
+    throw new Error(`Delete calendar failed (${res.status}): ${t.slice(0, 200)}`);
+  }
 }
 
 /**

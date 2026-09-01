@@ -443,6 +443,43 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     return;
   }
 
+  // /espejo_calendar [dias] [forzar] [estado] — espejo Bukeala → Google Calendar
+  // a demanda (lo mismo que hace el cron cada 2h). "forzar" salta el tope de
+  // cancelaciones cuando el Dr. confirma que son reales; "estado" muestra la
+  // última corrida sin sincronizar. Solo doctores: escribe en su calendario.
+  if (text === "/espejo_calendar" || text.startsWith("/espejo_calendar ") || text.startsWith("/espejo_calendar@")) {
+    if (!(await isDoctor(env, chatId))) {
+      await sendMessage(env, chatId, "❌ Solo doctores.");
+      return;
+    }
+    const args = text.replace(/^\/espejo_calendar(@\w+)?/, "").trim().split(/\s+/).filter(Boolean);
+    const { espejoCalendarCron, formatearResumenEspejo, ultimaCorridaEspejo } = await import("./cron/espejoCalendar");
+    if (args.some((a) => /^estado$/i.test(a))) {
+      const u = await ultimaCorridaEspejo(env);
+      await sendMessage(
+        env,
+        chatId,
+        u ? `Última corrida: ${u.corridaEn}
+${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.",
+      );
+      return;
+    }
+    const forzar = args.some((a) => /^forzar$/i.test(a));
+    const diasArg = args.find((a) => /^\d{1,2}$/.test(a));
+    await sendMessage(env, chatId, `🪞 Sincronizando Bukeala → Google Calendar${forzar ? " (forzando cancelaciones)" : ""}…`);
+    try {
+      const r = await espejoCalendarCron(env, {
+        dias: diasArg ? parseInt(diasArg, 10) : undefined,
+        forzarCancelaciones: forzar,
+        origen: "manual",
+      });
+      await sendMessage(env, chatId, formatearResumenEspejo(r));
+    } catch (e) {
+      await sendMessage(env, chatId, `❌ Falló el espejo: ${escapeHtmlLocal((e as Error).message)}`);
+    }
+    return;
+  }
+
   if (text === "/stats") {
     return showWeeklyStats(env, chatId);
   }
