@@ -57,8 +57,12 @@ function normalizarTel(raw?: string): string {
  * un paciente desde su propio WhatsApp, sin este filtro el directorio concluye
  * que ese teléfono es del paciente — y la secretaria termina llamando al doctor
  * creyendo que llama a la paciente. Pasó en la primera siembra.
+ *
+ * Exportada porque el webhook de WhatsApp usa EXACTAMENTE este criterio para
+ * desviar a Laura y al Dr. a su propio flujo (waEquipoFlow.ts): un solo sitio
+ * decide quién es "equipo", así no se desalinean.
  */
-function esNumeroDelEquipo(env: Env, tel: string): boolean {
+export function esNumeroDelEquipo(env: Env, tel: string): boolean {
   const d = (tel ?? "").replace(/\D/g, "");
   if (!d) return false;
   const propios = [

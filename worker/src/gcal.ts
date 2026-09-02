@@ -342,6 +342,25 @@ export async function patchEvent(
 }
 
 /**
+ * Borra un evento de verdad (`events.delete`). El espejo NO usa esto a
+ * propósito (cancela con `status: "cancelled"` para poder restaurar); existe
+ * para limpiar eventos de PRUEBA que el flujo de la asistente crea en el
+ * calendario real (ver waEquipoFlow.ts → pruebaEquipo). 404/410 cuentan como
+ * borrado: el objetivo es que no exista, no que lo hayamos borrado nosotros.
+ */
+export async function deleteEvent(env: Env, calendarId: string, eventId: string): Promise<void> {
+  const res = await gcalFetch(
+    env,
+    `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok && res.status !== 404 && res.status !== 410) {
+    const t = await res.text();
+    throw new Error(`Delete event failed (${res.status}): ${t.slice(0, 200)}`);
+  }
+}
+
+/**
  * Crea un calendario SECUNDARIO propiedad del service account. Lo usa la
  * autoprueba del espejo para escribir en un sitio aislado: el calendario del
  * Dr. nunca entra en una prueba.

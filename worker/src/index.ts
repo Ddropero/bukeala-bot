@@ -883,6 +883,30 @@ app.get("/debug/espejo-calendar", async (c) => {
   return c.json(r, 200, { "Cache-Control": "no-store" });
 });
 
+// Prueba del flujo de Laura (waEquipoFlow.ts) SIN tocar el chat de WhatsApp:
+//   ?dry=1         extracción con Claude sobre un texto fijo → JSON extraído
+//   ?dry=1&texto=… lo mismo sobre un texto propio (url-encoded)
+//   ?crear=1       crea "PRUEBA BORRAR - Particular" mañana 7:00 en Calendar → id + htmlLink
+//   ?borrar=<id>   borra ese evento (deleteEvent)
+// no-store: cada llamada crea/borra algo distinto; no puede quedar cacheada.
+app.get("/debug/equipo-prueba", async (c) => {
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const { pruebaEquipo } = await import("./waEquipoFlow");
+  try {
+    const r = await pruebaEquipo(c.env, {
+      dry: c.req.query("dry") === "1",
+      crear: c.req.query("crear") === "1",
+      borrar: c.req.query("borrar") || undefined,
+      texto: c.req.query("texto") || undefined,
+    });
+    return c.json(r, r.ok ? 200 : 500, { "Cache-Control": "no-store" });
+  } catch (e) {
+    return c.json({ ok: false, error: (e as Error).message }, 500, { "Cache-Control": "no-store" });
+  }
+});
+
 app.get("/debug/:resource", handleDebug);
 
 // Keep-alive cron:

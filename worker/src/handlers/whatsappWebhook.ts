@@ -34,6 +34,8 @@ import {
 } from "../whatsappMedia";
 import { resolveTopicTarget } from "../forumTopics";
 import { transcribeAudio } from "../whisper";
+import { esNumeroDelEquipo } from "../pacientesContacto";
+import { flujoEquipo } from "../waEquipoFlow";
 
 const TG = (token: string) => `https://api.telegram.org/bot${token}`;
 
@@ -159,6 +161,19 @@ async function handleInboundMessage(
 ): Promise<void> {
   const from = msg.from ?? "";
   const senderName = ctx?.contacts?.[0]?.profile?.name ?? "Desconocido";
+
+  // ---- EQUIPO (Laura / Dr.) → flujo propio, NUNCA la IA de pacientes ----
+  // Hasta el 2-sep-2026 este webhook trataba a cualquier número como paciente:
+  // si Laura escribía, la atendía runBookingAgent y su mensaje quedaba en el
+  // historial de pacientes. El desvío va ANTES de los botones de consentimiento,
+  // del pop cuc, de wa:contact y de appendHistory a propósito: un número del
+  // equipo no debe dejar rastro en nada de pacientes. Mismo criterio de
+  // "equipo" que el directorio de contactos (DOCTOR_WHATSAPP_NUMBER +
+  // SECRETARY_WHATSAPP_NUMBERS, comparando por dígitos con endsWith).
+  if (from && esNumeroDelEquipo(env, from)) {
+    await flujoEquipo(env, from, msg, senderName);
+    return;
+  }
 
   // ---- Handle interactive button replies (consent) ----
   // These come BEFORE we extract text, since they have a special structure.
