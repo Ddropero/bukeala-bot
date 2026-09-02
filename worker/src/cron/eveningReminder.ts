@@ -64,30 +64,20 @@ function extractPhone(bk: AgendaBookingDoc): string {
 }
 
 export async function eveningReminderCron(env: Env): Promise<void> {
-  const s = await loadSession(env);
-  if (!s) {
-    console.log("[eveningReminder] no session — skip");
-    return;
-  }
-  const b = new Bukeala(env);
+  // Lee de Google Calendar (EPS + particular); ya no exige sesion de Bukeala.
   const tomorrow = tomorrowInBogota();
   const dashed = dateToDdMmYyyyDashed(tomorrow);
   const friendly = dateToFriendly(tomorrow);
   console.log(`[eveningReminder] fetching agenda for ${dashed}`);
 
-  let bookings: AgendaBookingDoc[] = [];
-  try {
-    const res = await b.getAgenda(dashed, AREA_ID, /* includeCanceled */ false);
-    const j = await res.json<any>().catch(() => null);
-    bookings = (j?.areas?.[0]?.bookings ?? []) as AgendaBookingDoc[];
-  } catch (e) {
-    if (e instanceof SessionExpiredError) {
-      console.log("[eveningReminder] session expired — skip");
-      return;
-    }
-    console.log("[eveningReminder] fetch failed:", (e as Error).message);
+  const { leerAgendaDelDia } = await import("../agendaFuente");
+  const lectura = await leerAgendaDelDia(env, dashed);
+  if (lectura.error) {
+    console.log("[eveningReminder] ninguna fuente respondio:", lectura.error);
     return;
   }
+  const bookings: AgendaBookingDoc[] = lectura.bookings;
+  console.log(`[eveningReminder] fuente=${lectura.fuente}, ${bookings.length} citas`);
 
   const active = bookings.filter((bk) => !bk.isCanceled && bk.stateCode !== "CANCELED" && !bk.isBusyTime);
   console.log(`[eveningReminder] found ${active.length} active bookings for ${dashed}`);
@@ -100,10 +90,9 @@ export async function eveningReminderCron(env: Env): Promise<void> {
     const reservationCode = String(bk.id ?? "");
     const name = bk.name ?? "Paciente";
     const time12h = bk.startHourFormatted ?? "";
-    const rawPhone = extractPhone(bk);
-
-    if (!rawPhone) { skippedCount++; continue; }
-    const phone = normalizeColombianPhone(rawPhone);
+    // Sin telefono no se manda nada (guardia contra eventos que no son pacientes).
+    const { telefonoDeCita } = await import("../agendaFuente");
+    const phone = (await telefonoDeCita(env, bk)) || normalizeColombianPhone(extractPhone(bk));
     if (!phone || phone.length < 10) { skippedCount++; continue; }
 
     // Throttle propio (distinto al de la mañana, para permitir doble toque)

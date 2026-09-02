@@ -803,13 +803,13 @@ app.get("/debug/agenda-preview", async (c) => {
   if (!date) return c.json({ error: "falta ?date=DD-MM-YYYY" }, 400);
   const { buildAgendaText } = await import("./agendaDoc");
   const { getContactos } = await import("./pacientesContacto");
-  const b = new Bukeala(c.env);
-  const res = await b.getAgenda(date, 1074, false);
-  const json = await res.json<any>().catch(() => null);
-  const bookings = json?.areas?.[0]?.bookings ?? [];
+  // Misma fuente que usan los crons: Calendar (EPS + particular), no Bukeala.
+  const { leerAgendaDelDia } = await import("./agendaFuente");
+  const lectura = await leerAgendaDelDia(c.env, date);
+  const bookings = lectura.bookings;
   const activos = bookings.filter((bk: any) => !bk?.isCanceled && bk?.stateCode !== "CANCELED" && !bk?.isBusyTime);
   const dir = await getContactos(c.env, activos.map((bk: any) => bk.identification ?? ""));
-  return new Response(buildAgendaText(bookings, json?.defaultDateFormatted ?? date, dir), {
+  return new Response(buildAgendaText(bookings, date, dir), {
     headers: { "content-type": "text/plain; charset=utf-8" },
   });
 });

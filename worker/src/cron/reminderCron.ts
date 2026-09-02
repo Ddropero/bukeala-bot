@@ -55,30 +55,22 @@ function extractPhone(bk: AgendaBookingDoc): string {
 }
 
 export async function reminderCron(env: Env): Promise<void> {
-  const s = await loadSession(env);
-  if (!s) {
-    console.log("[reminderCron] no session, skip");
-    return;
-  }
-  const b = new Bukeala(env);
+  // Ya NO exige sesion de Bukeala: la agenda del dia se lee de Google Calendar
+  // (fuente completa: EPS + particular). Si Calendar falla, agendaFuente cae a
+  // Bukeala solo.
   const tomorrow = tomorrowInBogota();
   const dashed = dateToDdMmYyyyDashed(tomorrow);
   const friendly = dateToFriendly(tomorrow);
   console.log(`[reminderCron] fetching agenda for ${dashed}`);
 
-  let bookings: AgendaBookingDoc[] = [];
-  try {
-    const res = await b.getAgenda(dashed, AREA_ID, /* includeCanceled */ false);
-    const j = await res.json<any>().catch(() => null);
-    bookings = (j?.areas?.[0]?.bookings ?? []) as AgendaBookingDoc[];
-  } catch (e) {
-    if (e instanceof SessionExpiredError) {
-      console.log("[reminderCron] session expired");
-      return;
-    }
-    console.log("[reminderCron] fetch failed:", (e as Error).message);
+  const { leerAgendaDelDia } = await import("../agendaFuente");
+  const lectura = await leerAgendaDelDia(env, dashed);
+  if (lectura.error) {
+    console.log("[reminderCron] ninguna fuente respondio:", lectura.error);
     return;
   }
+  const bookings: AgendaBookingDoc[] = lectura.bookings;
+  console.log(`[reminderCron] fuente=${lectura.fuente}, ${bookings.length} citas`);
 
   const active = bookings.filter((bk) => !bk.isCanceled && bk.stateCode !== "CANCELED" && !bk.isBusyTime);
   console.log(`[reminderCron] found ${active.length} active bookings for ${dashed}`);
@@ -91,10 +83,11 @@ export async function reminderCron(env: Env): Promise<void> {
     const reservationCode = String(bk.id ?? "");
     const name = bk.name ?? "Paciente";
     const time12h = bk.startHourFormatted ?? "";
-    const rawPhone = extractPhone(bk);
-
-    if (!rawPhone) { skippedCount++; continue; }
-    const phone = normalizeColombianPhone(rawPhone);
+    // Telefono: del evento/cita y, si no hay, del directorio propio por cedula.
+    // Sin telefono NO se manda nada — es el guardia que impide que un evento
+    // que no es un paciente ("Cirugia con Vanesa") dispare un WhatsApp.
+    const { telefonoDeCita } = await import("../agendaFuente");
+    const phone = (await telefonoDeCita(env, bk)) || normalizeColombianPhone(extractPhone(bk));
     if (!phone || phone.length < 10) { skippedCount++; continue; }
 
     // Throttle: did we already send a reminder for this booking?

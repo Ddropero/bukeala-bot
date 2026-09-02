@@ -120,21 +120,19 @@ export async function secretaryAgendaCron(
   const friendly = dateToFriendly(target);
   console.log(`[secretaryAgenda] fetching agenda for ${dashed}`);
 
-  // 1. Fetch the agenda
-  let bookings: AgendaBookingDoc[] = [];
-  try {
-    const b = new Bukeala(env);
-    const res = await b.getAgenda(dashed, AREA_ID, /* includeCanceled */ false);
-    const json = await res.json<any>().catch(() => null);
-    bookings = (json?.areas?.[0]?.bookings ?? []) as AgendaBookingDoc[];
-  } catch (e) {
-    if (e instanceof SessionExpiredError) {
-      console.log("[secretaryAgenda] session expired — skip (keepAlive will notify)");
-      return;
-    }
-    console.log("[secretaryAgenda] getAgenda failed:", (e as Error).message);
+  // 1. Leer la agenda del DIA COMPLETO desde Google Calendar.
+  //    Antes se leia solo de Bukeala y Laura recibia unicamente las citas de
+  //    Colsanitas: el 1-sep-2026 eso eran 1 de 7 citas reales. Calendar tiene
+  //    EPS + particular (el espejo copia Bukeala alli) y no depende de que la
+  //    sesion de Bukeala este viva.
+  const { leerAgendaDelDia } = await import("../agendaFuente");
+  const lectura = await leerAgendaDelDia(env, dashed);
+  const bookings: AgendaBookingDoc[] = lectura.bookings;
+  if (lectura.error) {
+    console.log("[secretaryAgenda] ninguna fuente respondio:", lectura.error);
     return;
   }
+  console.log(`[secretaryAgenda] fuente=${lectura.fuente}, ${bookings.length} citas`);
 
   const active = bookings.filter((bk) => !bk.isCanceled && bk.stateCode !== "CANCELED" && !bk.isBusyTime);
 
