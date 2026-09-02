@@ -167,6 +167,16 @@ export async function handleCapture(c: Context<{ Bindings: Env }>) {
       console.log("[capture] processPendingRequests failed:", err.message);
     }),
   );
+  // Cola de comandos de Telegram que fallaron con la sesión caída (misma señal
+  // que la cola WA, con su propio try/catch). Import dinámico para no cargar
+  // telegram.ts en el arranque de este handler.
+  c.executionCtx.waitUntil(
+    import("../tgPendingCommands")
+      .then(({ procesarComandosPendientes }) => procesarComandosPendientes(c.env))
+      .catch((err) => {
+        console.log("[capture] procesarComandosPendientes failed:", (err as Error).message);
+      }),
+  );
 
   const expirations = cleaned.map((c) => c.expires).filter((x): x is number => typeof x === "number");
   const minExp = expirations.length ? Math.min(...expirations) : null;

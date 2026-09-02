@@ -73,7 +73,8 @@ import { suggestReply, appendHistory, getMode, setMode, type WaMode } from "./cl
 import { loadPendingRequests, clearPendingRequests, processPendingRequests } from "./claudeBookingAgent";
 import { getNativeHostEvents, requestRefresh } from "./handlers/nativeHostEvent";
 import { requestExtensionSend, getExtensionLastSeenMin } from "./handlers/extensionCommand";
-import { isAllowed, isDoctor, getRole, getUserName, listUsers, addUser, removeUser, type Role } from "./users";
+import { isAllowed, isDoctor, getRole, getUserName, listUsers, addUser, removeUser, getDoctorRecipients, type Role } from "./users";
+import { encolarComando, cargarComandosPendientes } from "./tgPendingCommands";
 
 const TG = (token: string) => `https://api.telegram.org/bot${token}`;
 
@@ -91,6 +92,145 @@ export const sendMessage = (env: Env, chat_id: string, text: string, extra: obje
 
 const answerCallback = (env: Env, callback_query_id: string, text?: string) =>
   tg(env, "answerCallbackQuery", { callback_query_id, text: text ?? "" });
+
+// ====================================================================
+// Menú con botones, lenguaje natural y tono (amable + asertivo)
+// ====================================================================
+//
+// POR QUÉ: el bot lo usan el doctor y secretarias desde el celular. Un /start
+// con 42 comandos y un "Comando no reconocido" seco obligaban a memorizar la
+// barra. Los botones y los alias ("hoy", "mañana", "agenda mie") llevan a las
+// MISMAS funciones que los comandos: cada botón se traduce a su comando y pasa
+// por onText, así no hay lógica duplicada.
+
+/** Botón del menú (callback `menu:<clave>`) → comando equivalente. */
+const MENU_ACCIONES: Record<string, string> = {
+  hoy: "/hoy",
+  manana: "/manana",
+  buscar: "/buscar_paciente",
+  agendar: "/buscar",
+  wa: "/inbox",
+  estado: "/estado",
+  semana: "/semana",
+  comandos: "/comandos",
+};
+
+/** `menu:hoy` → "/hoy"; cualquier otro callback → undefined. */
+function menuCallbackACommand(data: unknown): string | undefined {
+  if (typeof data !== "string" || !data.startsWith("menu:")) return undefined;
+  return MENU_ACCIONES[data.slice("menu:".length)];
+}
+
+/** Teclado principal. La secretaria no necesita el estado técnico: ve la semana. */
+function tecladoMenu(isDoc: boolean) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "📅 Hoy", callback_data: "menu:hoy" },
+        { text: "📅 Mañana", callback_data: "menu:manana" },
+      ],
+      [
+        { text: "🔎 Buscar paciente", callback_data: "menu:buscar" },
+        { text: "➕ Agendar", callback_data: "menu:agendar" },
+      ],
+      [
+        { text: "💬 WhatsApp", callback_data: "menu:wa" },
+        isDoc
+          ? { text: "⚙️ Estado", callback_data: "menu:estado" }
+          : { text: "🗓 Semana", callback_data: "menu:semana" },
+      ],
+    ],
+  };
+}
+
+/** Teclado del "no te entendí": lo más pedido + la lista completa. */
+function tecladoFallback() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "📅 Hoy", callback_data: "menu:hoy" },
+        { text: "📅 Mañana", callback_data: "menu:manana" },
+      ],
+      [
+        { text: "🔎 Buscar paciente", callback_data: "menu:buscar" },
+        { text: "📋 Todos los comandos", callback_data: "menu:comandos" },
+      ],
+    ],
+  };
+}
+
+/**
+ * Lenguaje natural mínimo, sin barra: "hoy", "mañana", "agenda mie", "hola"…
+ * Devuelve el comando equivalente o null si no reconoce nada. Se compara sin
+ * tildes ni signos para que "Mañana!" y "manana" den lo mismo. OJO: onText
+ * solo lo aplica cuando NO hay una conversación a medias (una cédula, o un
+ * "hola" para un paciente por WhatsApp, no son comandos).
+ */
+export function aliasNatural(text: string): string | null {
+  const t = text
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/^[¡!¿?.,\s]+|[¡!¿?.,\s]+$/g, "")
+    .replace(/\s+/g, " ");
+  if (!t || t.startsWith("/")) return null;
+
+  const tabla: Array<[RegExp, string]> = [
+    [/^(hola+|buenas|buenos dias|buenas tardes|buenas noches|hey|hi|hello|que mas|inicio|start)$/, "/start"],
+    [/^(ayuda|help|menu|opciones|botones)$/, "/menu"],
+    [/^(comandos|lista de comandos|todos los comandos)$/, "/comandos"],
+    [/^(hoy|agenda|agenda (de )?hoy|citas (de )?hoy)$/, "/hoy"],
+    [/^(manana|agenda (de )?manana|citas (de )?manana)$/, "/manana"],
+    [/^(semana|esta semana|la semana|resumen( de la)? semana|agenda (de la )?semana)$/, "/semana"],
+    [/^(estado|como va|como vas|como esta bukeala|esta bukeala|bukeala|sesion|estado bukeala)$/, "/estado"],
+    [/^(cancelar|cancelar (una )?cita)$/, "/cancelar"],
+    [/^(agendar|agendar (una )?cita|nueva cita|buscar cupo|cupos)$/, "/buscar"],
+    [/^(buscar paciente|paciente)$/, "/buscar_paciente"],
+  ];
+  for (const [re, cmd] of tabla) if (re.test(t)) return cmd;
+
+  // "agenda <fecha>" / "agenda mie" / "agenda miércoles" → /agenda <resto>
+  const m = t.match(/^agenda (?:del? |de la )?(.+)$/);
+  if (m) {
+    const resto = m[1].trim();
+    const dia = resto.match(/^(lun|mar|mie|jue|vie|sab|dom)[a-z]*$/);
+    return `/agenda ${dia ? dia[1] : resto}`;
+  }
+  return null;
+}
+
+/** Rol para humanos (nada de "secretary"). */
+function rolHumano(role: Role | null): string {
+  return role === "doctor" ? "doctor" : role === "secretary" ? "secretaria/o" : "sin rol";
+}
+
+/**
+ * Respuesta única para lo que solo puede hacer el doctor. En vez de un
+ * "❌ Solo doctores" seco, dice quién sí puede y ofrece avisarle con un botón.
+ * La acción se guarda en KV (10 min) porque callback_data solo admite 64 bytes.
+ * Nunca se llega aquí si quien pregunta ES el doctor.
+ */
+async function soloDoctor(env: Env, chatId: string, accion: string, comando?: string): Promise<void> {
+  await env.STATE.put(
+    `tg:pedir:${chatId}`,
+    JSON.stringify({ accion, comando: comando ?? "" }),
+    { expirationTtl: 60 * 10 },
+  );
+  await sendMessage(
+    env,
+    chatId,
+    `Esto solo lo puede hacer el Dr. David (${escapeHtmlLocal(accion)}).\n¿Le aviso para que lo haga?`,
+    {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "🔔 Sí, avísale", callback_data: "pedir:si" },
+          { text: "Ahora no", callback_data: "pedir:no" },
+        ]],
+      },
+    },
+  );
+}
 
 // ====================================================================
 // Cancelation reasons — extraidos de la respuesta real de Bukeala
@@ -149,15 +289,26 @@ export async function handleUpdate(env: Env, update: any): Promise<void> {
       // (instrucción obsoleta: así se veía "caído sin remedio" durante un blip
       // de sesión de 4-7 min, p. ej. el del 29/jul 07:42 Bogotá).
       await clearState(env, chatId);
-      await wakeSessionAndNotify(env, chatId);
+      // Qué se puede repetir solo: un comando con barra (o un alias natural
+      // que resuelva a uno). Un dato suelto (cédula, email) no se puede
+      // repetir sin el estado que acabamos de limpiar, así que no se encola.
+      const crudo =
+        typeof message?.text === "string" ? message.text.trim() : menuCallbackACommand(callback?.data);
+      const reintento = crudo ? (aliasNatural(crudo) ?? crudo) : undefined;
+      await wakeSessionAndNotify(env, chatId, reintento?.startsWith("/") ? reintento : undefined);
       return;
     }
     console.error("handler error", err, (err as Error).stack);
-    await sendMessage(env, chatId, "❌ Error: " + (err as Error).message);
+    await sendMessage(
+      env,
+      chatId,
+      "❌ Error: " + escapeHtmlLocal((err as Error).message) +
+        "\n<i>Prueba de nuevo en un momento. Si se repite, mira /estado.</i>",
+    );
   }
 }
 
-async function onText(env: Env, chatId: string, text: string): Promise<void> {
+export async function onText(env: Env, chatId: string, text: string): Promise<void> {
   // POP CUC — agenda interna Clínica Colombia (cualquier usuario autorizado en TG)
   {
     const { handlePopCuc, loadPopCucList, clearPopCucList } = await import("./popCuc");
@@ -194,8 +345,7 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     // /cuc_clear — limpiar lista (solo doctor)
     if (text === "/cuc_clear") {
       if (!(await isDoctor(env, chatId))) {
-        await sendMessage(env, chatId, "❌ Solo doctores.");
-        return;
+        return soloDoctor(env, chatId, "vaciar la lista pop cuc", text);
       }
       const n = await clearPopCucList(env);
       await sendMessage(env, chatId, `🗑️ Lista pop cuc vaciada (${n} entradas borradas).`);
@@ -211,13 +361,69 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     }
   }
 
-  if (text === "/start") {
-    await clearState(env, chatId);
+  // ---- Conversación a medias: el texto es un dato, no un comando ----------
+  // Se leen aquí (una vez) el modo escritura de WhatsApp y el estado del
+  // flujo; más abajo se reutilizan. Mientras el bot espera texto libre
+  // (cédula, email, celular) o un mensaje para un paciente, NO se aplican los
+  // alias: "hola" ahí es un saludo al paciente, no un /start.
+  const writingTo = await env.STATE.get(`mainbot:waReplyTo:${chatId}`);
+  const state = await loadState(env, chatId);
+  const esperaTextoLibre =
+    !!writingTo ||
+    state.step === "awaiting_customer_id" ||
+    state.step === "awaiting_email" ||
+    state.step === "awaiting_phone" ||
+    state.step === "awaiting_lookup_id";
+  if (!esperaTextoLibre && !text.startsWith("/")) {
+    const alias = aliasNatural(text);
+    if (alias) text = alias;
+  }
+
+  if (text === "/start" || text === "/menu") {
+    // /start arranca de cero; /menu solo muestra los botones sin tumbar un flujo.
+    if (text === "/start") await clearState(env, chatId);
     const role = await getRole(env, chatId);
     const name = await getUserName(env, chatId);
     const isDoc = role === "doctor";
+    // El doctor principal se llama "Doctor" en users.ts; para él, su nombre real.
+    const nombre = name === "Doctor" ? "Dr. David" : name;
+    const saludo = nombre && nombre !== "Desconocido" ? `Hola, ${escapeHtmlLocal(nombre)} 👋` : "Hola 👋";
+    const texto =
+      text === "/menu"
+        ? "¿Qué necesitas? 👇"
+        : [
+            saludo,
+            "",
+            isDoc
+              ? "Soy tu asistente de agenda. Te muestro la agenda de hoy o de mañana, busco pacientes, agendo o cancelo citas y vigilo que Bukeala esté en línea."
+              : "Soy el asistente de agenda del Dr. David. Te muestro la agenda de hoy o de mañana, busco pacientes y agendo o cancelo citas.",
+            "",
+            "Toca un botón, o escríbeme en palabras: «hoy», «mañana», «agenda mie».",
+            "Para ver todo lo que sé hacer: /comandos",
+          ].join("\n");
+    await sendMessage(env, chatId, texto, { reply_markup: tecladoMenu(isDoc) });
+    return;
+  }
+
+  // /buscar_paciente — entrada paso a paso al lookup por cédula. Es lo que abre
+  // el botón "🔎 Buscar paciente": pide la cédula y luego usa quickLookupPatient,
+  // la MISMA función de /p (la búsqueda por nombre sigue sin endpoint en Bukeala).
+  if (text === "/buscar_paciente") {
+    await clearState(env, chatId);
+    await saveState(env, chatId, { step: "awaiting_lookup_id" });
+    await sendMessage(
+      env,
+      chatId,
+      "🔎 ¿A quién buscas? Mándame la cédula (solo números).\n<i>Por nombre todavía no se puede; por ahora es por cédula. Para salir: /cancelar_flujo</i>",
+    );
+    return;
+  }
+
+  if (text === "/comandos") {
+    const isDoc = await isDoctor(env, chatId);
     const lines = [
-      `<b>Bukeala bot</b> · Hola ${escapeHtmlLocal(name)} 👋`,
+      "<b>Todos los comandos</b>",
+      "/menu — botones rápidos · /start — saludo",
       "",
       "<b>📅 Agendar / consultar</b>",
       "/buscar — agendar nueva cita",
@@ -238,6 +444,7 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
       "",
       "<b>👥 Pacientes</b>",
       "/p &lt;cédula&gt; — lookup directo del paciente",
+      "/buscar_paciente — lo mismo, paso a paso (te pido la cédula)",
       "/recientes — últimos 15 pacientes (botones agendar / citas / WA)",
       "",
       "<b>💬 WhatsApp pacientes</b>",
@@ -280,6 +487,7 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
         "/estado — ¿Bukeala en línea? (ping real + captchas hoy + cola)",
         "/agenda_secretaria [fecha] [yo] — agenda con teléfonos y emails",
         "/sesion_stats — estadísticas Native Host",
+        "/pendientes_tg — comandos de Telegram en espera (Bukeala caída)",
       );
     }
     lines.push("", "/cancelar_flujo — abortar conversación");
@@ -289,14 +497,29 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
 
   if (text === "/cancelar_flujo") {
     await clearState(env, chatId);
-    await sendMessage(env, chatId, "Listo, flujo cancelado. /start para empezar.");
+    await sendMessage(env, chatId, "Listo, cancelé lo que estábamos haciendo 👍 /menu para empezar de nuevo.");
     return;
   }
 
   if (text === "/sesion" || text === "/estado") {
+    // Primero lo humano (¿está en línea?, ¿hace cuánto se renovó?); lo técnico
+    // solo para el doctor, debajo de "Detalle técnico". Si está caída se pide
+    // la renovación aquí mismo: así "ya la estoy renovando" es verdad y el
+    // aviso de "✅ renovada" le llega a este chat.
+    const esDoc = await isDoctor(env, chatId);
     const s = await loadSession(env);
     if (!s) {
-      await sendMessage(env, chatId, "🔴 <b>Sin sesión en KV.</b>\nCorre /sesion_renew o captura con la extensión.");
+      try { await requestRefresh(env, chatId); } catch { /* best effort */ }
+      const lines = [
+        "Bukeala: caída 🔴 — ya la estoy renovando",
+        "Última renovación: no tengo ninguna sesión guardada",
+        "",
+        "<i>Te aviso aquí cuando vuelva. Si en 2-3 min no pasa nada: /sesion_renew</i>",
+      ];
+      if (esDoc) {
+        lines.push("", "<i>Detalle técnico</i>", "Sin sesión en KV (SESSIONS): la VM o la extensión deben capturar una nueva.");
+      }
+      await sendMessage(env, chatId, lines.join("\n"));
       return;
     }
     const ageMin = Math.round((Date.now() - new Date(s.capturedAt).getTime()) / 60000);
@@ -326,7 +549,7 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     if (last) {
       const agoMin = Math.round((Date.now() - new Date(last.at).getTime()) / 60000);
       const via = last.via ? ` vía ${last.via}${last.tgcSource === "worker" ? " (TGC rescatado del Worker)" : ""}` : "";
-      vmLine = `VM: ${last.type === "ok" ? "✅ renovó" : "❌ falló"} hace ${agoMin} min${via}`;
+      vmLine = `VM: ${last.type === "ok" ? "✅ renovó" : "❌ falló"} hace ${agoMin} min${via}${last.type === "ok" ? "" : " — si se repite: /sesion_renew"}`;
     }
     const day = new Date().toISOString().slice(0, 10);
     const [aliveC, tgcC, capC, fallC, errC, pendingRaw] = await Promise.all([
@@ -342,16 +565,28 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     const captchasHoy = (parseInt(capC ?? "0", 10) || 0) + (parseInt(fallC ?? "0", 10) || 0);
     // Gratis = navegador vivo (alive) + reuso de TGC. Ambas evitan el captcha.
     const gratisHoy = (parseInt(aliveC ?? "0", 10) || 0) + (parseInt(tgcC ?? "0", 10) || 0);
+    const colaTg = (await cargarComandosPendientes(env)).length;
 
+    if (!alive) {
+      try { await requestRefresh(env, chatId); } catch { /* best effort */ }
+    }
     const lines = [
-      alive ? "🟢 <b>Bukeala EN LÍNEA</b> (ping real OK)" : "🔴 <b>Bukeala CAÍDA</b>",
-      `Ping: ${pingNote}`,
-      `Sesión: capturada hace ${ageMin} min · ${s.cookies.length} cookies`,
-      vmLine,
-      `Hoy: ${gratisHoy} renovaciones sin captcha · ${captchasHoy} con captcha · ${parseInt(errC ?? "0", 10) || 0} errores`,
-      pendingCount > 0 ? `⏳ Cola: ${pendingCount} paciente(s) esperando` : "Cola: vacía",
+      alive ? "Bukeala: en línea ✅" : "Bukeala: caída 🔴 — ya la estoy renovando",
+      `Última renovación: hace ${ageMin} min`,
     ];
-    if (!alive) lines.push("", "Para renovar ya: /sesion_renew");
+    if (!alive) lines.push("", "<i>Te aviso aquí cuando vuelva. Si en 2-3 min no pasa nada: /sesion_renew</i>");
+    if (esDoc) {
+      lines.push(
+        "",
+        "<i>Detalle técnico</i>",
+        `Ping: ${pingNote}`,
+        `Sesión: capturada hace ${ageMin} min · ${s.cookies.length} cookies`,
+        vmLine,
+        `Hoy: ${gratisHoy} renovaciones sin captcha · ${captchasHoy} con captcha · ${parseInt(errC ?? "0", 10) || 0} errores`,
+        pendingCount > 0 ? `Cola WhatsApp: ${pendingCount} paciente(s) esperando` : "Cola WhatsApp: vacía",
+        colaTg > 0 ? `Cola Telegram: ${colaTg} comando(s) esperando (/pendientes_tg)` : "Cola Telegram: vacía",
+      );
+    }
     await sendMessage(env, chatId, lines.join("\n"));
     return;
   }
@@ -375,6 +610,7 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     return handleManana(env, chatId);
   }
   if (text === "/semana") {
+    await sendMessage(env, chatId, "⏳ Consultando la semana…");
     return handleSemana(env, chatId);
   }
   if (text.startsWith("/agenda ")) {
@@ -384,7 +620,7 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     if (fromAbbrev) return showAgenda(env, chatId, fromAbbrev);
     const dateDashed = parseAgendaArgToDashed(arg);
     if (!dateDashed) {
-      await sendMessage(env, chatId, "Fecha inválida. Usa <code>DD/MM/YYYY</code> o abreviatura de día (lun/mar/mie/...).");
+      await sendMessage(env, chatId, "Casi 🙂 Dime la fecha así: <code>DD/MM/YYYY</code> (ej. <code>13/05/2026</code>) o el día: lun, mar, mie, jue, vie, sab, dom.");
       return;
     }
     return showAgenda(env, chatId, dateDashed);
@@ -398,15 +634,14 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
   // Bukeala no los devuelve; a quien no tengamos se marca explícito.
   if (text === "/agenda_secretaria" || text.startsWith("/agenda_secretaria ")) {
     if (!(await isDoctor(env, chatId))) {
-      await sendMessage(env, chatId, "❌ Solo doctores.");
-      return;
+      return soloDoctor(env, chatId, "mandar la agenda con contactos a la secretaria", text);
     }
     const args = text.slice("/agenda_secretaria".length).trim().split(/\s+/).filter(Boolean);
     const soloYo = args.some((a) => /^(yo|mi|prueba)$/i.test(a));
     const fechaArg = args.find((a) => /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}$/.test(a));
     const dateDashed = fechaArg ? parseAgendaArgToDashed(fechaArg) : undefined;
     if (fechaArg && !dateDashed) {
-      await sendMessage(env, chatId, "Fecha inválida. Usa <code>DD/MM/YYYY</code>.");
+      await sendMessage(env, chatId, "Casi 🙂 Dime la fecha así: <code>DD/MM/YYYY</code>.");
       return;
     }
 
@@ -415,7 +650,7 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
     const { getDoctorWhatsapp } = { getDoctorWhatsapp: () => (env as any).DOCTOR_WHATSAPP_NUMBER as string | undefined };
     const destino = soloYo ? [getDoctorWhatsapp() ?? ""].filter(Boolean) : undefined;
     if (soloYo && (!destino || destino.length === 0)) {
-      await sendMessage(env, chatId, "❌ No hay DOCTOR_WHATSAPP_NUMBER configurado para enviarte la prueba.");
+      await sendMessage(env, chatId, "❌ No hay DOCTOR_WHATSAPP_NUMBER configurado para enviarte la prueba.\n<i>Configúralo con <code>wrangler secret put DOCTOR_WHATSAPP_NUMBER</code>, o corre el comando sin «yo» para mandarla a la secretaria.</i>");
       return;
     }
     try {
@@ -424,7 +659,9 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
         testWaOnly: destino,
       });
       if (!r) {
-        await sendMessage(env, chatId, "❌ No hay sesión de Bukeala ahora mismo. Corre /sesion_renew y reintenta.");
+        // Sin sesión: pedir la renovación y avisar (no se encola: mandar la
+        // agenda a la secretaria no debe repetirse solo).
+        await wakeSessionAndNotify(env, chatId);
         return;
       }
       const quien = soloYo ? "a ti" : "a la secretaria";
@@ -438,7 +675,7 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
 ⚠️ ${escapeHtmlLocal(r.waErrors.slice(0, 2).join(" | "))}` : ""),
       );
     } catch (e) {
-      await sendMessage(env, chatId, `❌ Falló: ${escapeHtmlLocal((e as Error).message)}`);
+      await sendMessage(env, chatId, `❌ No pude armar la agenda: ${escapeHtmlLocal((e as Error).message)}\n<i>Prueba de nuevo en un minuto; si sigue igual, mira /estado.</i>`);
     }
     return;
   }
@@ -449,8 +686,7 @@ async function onText(env: Env, chatId: string, text: string): Promise<void> {
   // última corrida sin sincronizar. Solo doctores: escribe en su calendario.
   if (text === "/espejo_calendar" || text.startsWith("/espejo_calendar ") || text.startsWith("/espejo_calendar@")) {
     if (!(await isDoctor(env, chatId))) {
-      await sendMessage(env, chatId, "❌ Solo doctores.");
-      return;
+      return soloDoctor(env, chatId, "sincronizar Bukeala con su Google Calendar", text);
     }
     const args = text.replace(/^\/espejo_calendar(@\w+)?/, "").trim().split(/\s+/).filter(Boolean);
     const { espejoCalendarCron, formatearResumenEspejo, ultimaCorridaEspejo } = await import("./cron/espejoCalendar");
@@ -475,7 +711,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
       });
       await sendMessage(env, chatId, formatearResumenEspejo(r));
     } catch (e) {
-      await sendMessage(env, chatId, `❌ Falló el espejo: ${escapeHtmlLocal((e as Error).message)}`);
+      await sendMessage(env, chatId, `❌ Falló el espejo: ${escapeHtmlLocal((e as Error).message)}\n<i>Mira la última corrida con <code>/espejo_calendar estado</code> y vuelve a intentar.</i>`);
     }
     return;
   }
@@ -486,10 +722,11 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
 
   if (text.startsWith("/buscar_nombre ")) {
     const pattern = text.slice("/buscar_nombre ".length).trim();
+    await sendMessage(env, chatId, "⏳ Buscando…");
     return searchByName(env, chatId, pattern);
   }
   if (text === "/buscar_nombre") {
-    await sendMessage(env, chatId, "Uso: <code>/buscar_nombre &lt;texto&gt;</code> (mínimo 3 caracteres)");
+    await sendMessage(env, chatId, "Casi 🙂 Así se usa:\n<code>/buscar_nombre &lt;texto&gt;</code> (mínimo 3 caracteres)");
     return;
   }
 
@@ -501,8 +738,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
   if (text === "/abrir_agenda" || text.startsWith("/abrir_agenda ") ||
       text === "/abrir_agenda@agendadavid_bot" || text.startsWith("/abrir_agenda@")) {
     if (!(await isDoctor(env, chatId))) {
-      await sendMessage(env, chatId, "❌ Solo doctores pueden abrir agenda.");
-      return;
+      return soloDoctor(env, chatId, "abrir cupos en la agenda", text);
     }
     const argsText = text.replace(/^\/abrir_agenda(@\S+)?/, "").trim();
     const { handleAbrirAgenda } = await import("./commands/abrirAgenda");
@@ -516,8 +752,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
   if (text === "/cancelar_agenda" || text.startsWith("/cancelar_agenda ") ||
       text.startsWith("/cancelar_agenda@")) {
     if (!(await isDoctor(env, chatId))) {
-      await sendMessage(env, chatId, "❌ Solo doctores pueden cancelar agenda.");
-      return;
+      return soloDoctor(env, chatId, "cancelar agendas y avisar a los pacientes", text);
     }
     const argsText = text.replace(/^\/cancelar_agenda(@\S+)?/, "").trim();
     const { handleCancelarAgenda } = await import("./commands/cancelarAgenda");
@@ -531,8 +766,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
   if (text === "/bloquear_dia" || text.startsWith("/bloquear_dia ") ||
       text.startsWith("/bloquear_dia@")) {
     if (!(await isDoctor(env, chatId))) {
-      await sendMessage(env, chatId, "❌ Solo doctores pueden bloquear días.");
-      return;
+      return soloDoctor(env, chatId, "bloquear un día de la agenda", text);
     }
     const argsText = text.replace(/^\/bloquear_dia(@\S+)?/, "").trim();
     const { handleBloquearDia } = await import("./commands/bloquearDia");
@@ -560,7 +794,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
       await sendMessage(env, chatId, `✅ Enviado. Message ID: <code>${id ?? "?"}</code>\nRevisa tu WhatsApp.`);
     } else {
       const err = r.data?.error?.message ?? JSON.stringify(r.data).slice(0, 300);
-      await sendMessage(env, chatId, `❌ Error ${r.status}: ${err}`);
+      await sendMessage(env, chatId, `❌ Error ${r.status}: ${escapeHtmlLocal(String(err))}\n<i>Revisa el número (+57 y 10 dígitos) y vuelve a intentar.</i>`);
     }
     return;
   }
@@ -572,7 +806,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
     const rest = text.slice("/wa_reply ".length).trim();
     const sp = rest.indexOf(" ");
     if (sp < 0) {
-      await sendMessage(env, chatId, "Uso: <code>/wa_reply &lt;número&gt; &lt;mensaje&gt;</code>");
+      await sendMessage(env, chatId, "Casi 🙂 Así se usa:\n<code>/wa_reply &lt;número&gt; &lt;mensaje&gt;</code>");
       return;
     }
     const numRaw = rest.slice(0, sp).trim();
@@ -603,11 +837,11 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
   if (text === "/whoami") {
     const role = await getRole(env, chatId);
     const name = await getUserName(env, chatId);
-    await sendMessage(
-      env,
-      chatId,
-      `<b>👤 Tu identidad</b>\n\nNombre: <b>${escapeHtmlLocal(name)}</b>\nRol: <b>${role ?? "—"}</b>\nChatId: <code>${chatId}</code>`,
-    );
+    // Sin jerga: rol en español; el chatId (dato técnico, sirve para
+    // /add_user) solo se lo mostramos al doctor.
+    const lines = [`Eres <b>${escapeHtmlLocal(name)}</b> (${rolHumano(role)})`];
+    if (role === "doctor") lines.push(`<i>Tu chatId: ${chatId}</i>`);
+    await sendMessage(env, chatId, lines.join("\n"));
     return;
   }
 
@@ -629,8 +863,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
   // /add_user <chatId> <doctor|secretary> <nombre> — add a new user (doctors only)
   if (text.startsWith("/add_user ")) {
     if (!(await isDoctor(env, chatId))) {
-      await sendMessage(env, chatId, "❌ Solo los doctores pueden agregar usuarios.");
-      return;
+      return soloDoctor(env, chatId, "agregar usuarios al bot", text);
     }
     const rest = text.slice("/add_user ".length).trim();
     const parts = rest.split(/\s+/);
@@ -638,7 +871,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
       await sendMessage(
         env,
         chatId,
-        "Uso: <code>/add_user &lt;chatId&gt; &lt;doctor|secretary&gt; &lt;nombre&gt;</code>\n\nEjemplo: <code>/add_user 987654321 secretary María Gómez</code>",
+        "Casi 🙂 Así se usa:\n<code>/add_user &lt;chatId&gt; &lt;doctor|secretary&gt; &lt;nombre&gt;</code>\n\nEjemplo: <code>/add_user 987654321 secretary María Gómez</code>",
       );
       return;
     }
@@ -664,7 +897,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
         // ignore — the user might not have started a chat with the bot yet
       }
     } else {
-      await sendMessage(env, chatId, `❌ ${result.message}`);
+      await sendMessage(env, chatId, `❌ ${escapeHtmlLocal(result.message)}\n<i>Revisa el chatId (solo números) y el rol (doctor o secretary). Los actuales: /list_users</i>`);
     }
     return;
   }
@@ -672,12 +905,11 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
   // /remove_user <chatId> — remove a user (doctors only)
   if (text.startsWith("/remove_user ")) {
     if (!(await isDoctor(env, chatId))) {
-      await sendMessage(env, chatId, "❌ Solo los doctores pueden remover usuarios.");
-      return;
+      return soloDoctor(env, chatId, "quitar usuarios del bot", text);
     }
     const targetId = text.slice("/remove_user ".length).trim();
     const result = await removeUser(env, targetId);
-    await sendMessage(env, chatId, result.ok ? `✅ ${result.message}` : `❌ ${result.message}`);
+    await sendMessage(env, chatId, result.ok ? `✅ ${result.message}` : `❌ ${escapeHtmlLocal(result.message)}\n<i>Mira los chatId con /list_users.</i>`);
     return;
   }
 
@@ -700,8 +932,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
   // anti-envenenamiento) y el Worker avisa aquí que hace falta login humano.
   if (text === "/renovar_navegador") {
     if (!(await isDoctor(env, chatId))) {
-      await sendMessage(env, chatId, "❌ Solo doctores.");
-      return;
+      return soloDoctor(env, chatId, "renovar la sesión desde su navegador", text);
     }
     await requestExtensionSend(env, chatId);
     const lines = [
@@ -825,8 +1056,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
   // /sesion_blackout_reset — borra contadores (para empezar tracking desde cero)
   if (text === "/sesion_blackout_reset") {
     if (!(await isDoctor(env, chatId))) {
-      await sendMessage(env, chatId, "❌ Solo doctores.");
-      return;
+      return soloDoctor(env, chatId, "reiniciar los contadores de disponibilidad", text);
     }
     for (let h = 0; h < 24; h++) {
       await env.STATE.delete(`bukeala:hourOk:${h}`);
@@ -842,7 +1072,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
     const rest = text.slice("/wa_recordar ".length).trim();
     const parts = rest.split("|").map((s) => s.trim());
     if (parts.length < 5) {
-      await sendMessage(env, chatId, "Uso: <code>/wa_recordar &lt;num&gt; | &lt;nombre&gt; | &lt;fecha&gt; | &lt;hora&gt; | &lt;lugar&gt;</code>\n\nEjemplo: <code>/wa_recordar 3001234567 | Juan Pérez | Miércoles 14/05/26 | 9:00 AM | Calle 80 # 10-43, Cons 506</code>");
+      await sendMessage(env, chatId, "Casi 🙂 Así se usa:\n<code>/wa_recordar &lt;num&gt; | &lt;nombre&gt; | &lt;fecha&gt; | &lt;hora&gt; | &lt;lugar&gt;</code>\n\nEjemplo: <code>/wa_recordar 3001234567 | Juan Pérez | Miércoles 14/05/26 | 9:00 AM | Calle 80 # 10-43, Cons 506</code>");
       return;
     }
     const [num, name, date, time, place] = parts;
@@ -851,7 +1081,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
       await sendMessage(env, chatId, `✅ Recordatorio enviado a <code>${normalizeColombianPhone(num)}</code>`);
     } else {
       const err = r.data?.error?.message ?? r.reason ?? "unknown";
-      await sendMessage(env, chatId, `❌ Error: ${escapeHtmlLocal(err)}`);
+      await sendMessage(env, chatId, `❌ No se pudo enviar el recordatorio: ${escapeHtmlLocal(err)}\n<i>Revisa el número (10 dígitos) y que la plantilla exista; si el error es 132001, mira /wa_templates.</i>`);
     }
     return;
   }
@@ -861,12 +1091,12 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
     const rest = text.slice("/wa_cancelar_aviso ".length).trim();
     const parts = rest.split("|").map((s) => s.trim());
     if (parts.length < 4) {
-      await sendMessage(env, chatId, "Uso: <code>/wa_cancelar_aviso &lt;num&gt; | &lt;nombre&gt; | &lt;fecha&gt; | &lt;hora&gt;</code>");
+      await sendMessage(env, chatId, "Casi 🙂 Así se usa:\n<code>/wa_cancelar_aviso &lt;num&gt; | &lt;nombre&gt; | &lt;fecha&gt; | &lt;hora&gt;</code>");
       return;
     }
     const [num, name, date, time] = parts;
     const r = await sendAppointmentCanceled(env, num, name, date, time);
-    await sendMessage(env, chatId, r.ok ? `✅ Aviso de cancelación enviado a <code>${normalizeColombianPhone(num)}</code>` : `❌ Error: ${escapeHtmlLocal(r.data?.error?.message ?? r.reason ?? "unknown")}`);
+    await sendMessage(env, chatId, r.ok ? `✅ Aviso de cancelación enviado a <code>${normalizeColombianPhone(num)}</code>` : `❌ No se pudo enviar: ${escapeHtmlLocal(r.data?.error?.message ?? r.reason ?? "unknown")}\n<i>Revisa el número (10 dígitos) y que el paciente tenga WhatsApp.</i>`);
     return;
   }
 
@@ -875,12 +1105,12 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
     const rest = text.slice("/wa_followup ".length).trim();
     const parts = rest.split("|").map((s) => s.trim());
     if (parts.length < 2) {
-      await sendMessage(env, chatId, "Uso: <code>/wa_followup &lt;num&gt; | &lt;nombre&gt;</code>");
+      await sendMessage(env, chatId, "Casi 🙂 Así se usa:\n<code>/wa_followup &lt;num&gt; | &lt;nombre&gt;</code>");
       return;
     }
     const [num, name] = parts;
     const r = await sendAppointmentFollowup(env, num, name);
-    await sendMessage(env, chatId, r.ok ? `✅ Follow-up enviado a <code>${normalizeColombianPhone(num)}</code>` : `❌ Error: ${escapeHtmlLocal(r.data?.error?.message ?? r.reason ?? "unknown")}`);
+    await sendMessage(env, chatId, r.ok ? `✅ Follow-up enviado a <code>${normalizeColombianPhone(num)}</code>` : `❌ No se pudo enviar: ${escapeHtmlLocal(r.data?.error?.message ?? r.reason ?? "unknown")}\n<i>Revisa el número (10 dígitos) y que el paciente tenga WhatsApp.</i>`);
     return;
   }
 
@@ -890,7 +1120,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
     const { listTemplates } = await import("./handlers/waTemplates");
     const { waba, templates, debug } = await listTemplates(env);
     if (!waba) {
-      await sendMessage(env, chatId, `❌ No pude derivar el WABA del envío.\n<code>${escapeHtmlLocal(JSON.stringify(debug).slice(0, 600))}</code>`);
+      await sendMessage(env, chatId, `❌ No pude derivar el WABA del envío.\n<code>${escapeHtmlLocal(JSON.stringify(debug).slice(0, 600))}</code>\n<i>Revisa WA_PHONE_ID y el token de Meta (WA_TOKEN).</i>`);
       return;
     }
     const lines = templates.map((t) => `• <b>${t.name}</b> | idioma <code>${t.language}</code> | ${t.status}`);
@@ -908,12 +1138,12 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
     const rest = text.slice("/wa_confirmar ".length).trim();
     const parts = rest.split("|").map((s) => s.trim());
     if (parts.length < 5) {
-      await sendMessage(env, chatId, "Uso: <code>/wa_confirmar &lt;num&gt; | &lt;nombre&gt; | &lt;fecha&gt; | &lt;hora&gt; | &lt;lugar&gt;</code>\n\nEj: <code>/wa_confirmar 573204933887 | David | Lunes 07/07 | 9:00 AM | Calle 80 #10-43</code>");
+      await sendMessage(env, chatId, "Casi 🙂 Así se usa:\n<code>/wa_confirmar &lt;num&gt; | &lt;nombre&gt; | &lt;fecha&gt; | &lt;hora&gt; | &lt;lugar&gt;</code>\n\nEj: <code>/wa_confirmar 573204933887 | David | Lunes 07/07 | 9:00 AM | Calle 80 #10-43</code>");
       return;
     }
     const [num, name, date, time, place] = parts;
     const r = await sendAppointmentConfirmation(env, num, name, date, time, place);
-    await sendMessage(env, chatId, r.ok ? `✅ Confirmación enviada a <code>${normalizeColombianPhone(num)}</code>` : `❌ Error: ${escapeHtmlLocal(r.data?.error?.message ?? r.reason ?? "unknown")}`);
+    await sendMessage(env, chatId, r.ok ? `✅ Confirmación enviada a <code>${normalizeColombianPhone(num)}</code>` : `❌ No se pudo enviar: ${escapeHtmlLocal(r.data?.error?.message ?? r.reason ?? "unknown")}\n<i>Revisa el número (10 dígitos) y que el paciente tenga WhatsApp.</i>`);
     return;
   }
 
@@ -922,12 +1152,12 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
     const rest = text.slice("/wa_postcirugia ".length).trim();
     const parts = rest.split("|").map((s) => s.trim());
     if (parts.length < 3) {
-      await sendMessage(env, chatId, "Uso: <code>/wa_postcirugia &lt;num&gt; | &lt;nombre&gt; | &lt;dias_desde_cirugia&gt;</code>");
+      await sendMessage(env, chatId, "Casi 🙂 Así se usa:\n<code>/wa_postcirugia &lt;num&gt; | &lt;nombre&gt; | &lt;dias_desde_cirugia&gt;</code>");
       return;
     }
     const [num, name, days] = parts;
     const r = await sendPostSurgeryCheckin(env, num, name, parseInt(days, 10));
-    await sendMessage(env, chatId, r.ok ? `✅ Check-in post-cirugía enviado a <code>${normalizeColombianPhone(num)}</code>` : `❌ Error: ${escapeHtmlLocal(r.data?.error?.message ?? r.reason ?? "unknown")}`);
+    await sendMessage(env, chatId, r.ok ? `✅ Check-in post-cirugía enviado a <code>${normalizeColombianPhone(num)}</code>` : `❌ No se pudo enviar: ${escapeHtmlLocal(r.data?.error?.message ?? r.reason ?? "unknown")}\n<i>Revisa el número (10 dígitos) y que el paciente tenga WhatsApp.</i>`);
     return;
   }
 
@@ -937,7 +1167,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
     const rest = text.slice("/wa_mode ".length).trim();
     const parts = rest.split(/\s+/);
     if (parts.length < 2) {
-      await sendMessage(env, chatId, "Uso: <code>/wa_mode &lt;número&gt; &lt;manual|review|auto&gt;</code>\n\n• <b>manual</b>: solo te reenvío.\n• <b>review</b>: Claude propone y tú apruebas.\n• <b>auto</b>: Claude responde directo (con escalación).");
+      await sendMessage(env, chatId, "Casi 🙂 Así se usa:\n<code>/wa_mode &lt;número&gt; &lt;manual|review|auto&gt;</code>\n\n• <b>manual</b>: solo te reenvío.\n• <b>review</b>: Claude propone y tú apruebas.\n• <b>auto</b>: Claude responde directo (con escalación).");
       return;
     }
     const e164 = normalizeColombianPhone(parts[0]);
@@ -948,8 +1178,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
     }
     // auto-mode is admin-only (Claude responds without human review — sensitive)
     if (newMode === "auto" && !(await isDoctor(env, chatId))) {
-      await sendMessage(env, chatId, "❌ Solo doctores pueden activar modo <code>auto</code>. Usa <code>review</code> en su lugar.");
-      return;
+      return soloDoctor(env, chatId, "poner un chat en modo auto — tú puedes usar review", text);
     }
     await setMode(env, e164, newMode);
     // Si vuelve a auto, libera el assignee para que la IA tome el control limpio
@@ -1000,6 +1229,30 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
     return;
   }
 
+  // /pendientes_tg  →  comandos de Telegram esperando a que Bukeala vuelva
+  // (diagnóstico de la cola de tgPendingCommands.ts; solo doctor).
+  if (text === "/pendientes_tg") {
+    if (!(await isDoctor(env, chatId))) {
+      return soloDoctor(env, chatId, "ver la cola de comandos en espera", text);
+    }
+    const cola = await cargarComandosPendientes(env);
+    if (cola.length === 0) {
+      await sendMessage(env, chatId, "✅ No hay comandos de Telegram esperando a Bukeala.");
+      return;
+    }
+    const lines = [`⏳ <b>${cola.length} comando(s) esperando a que Bukeala vuelva</b>`, ""];
+    for (const c of cola) {
+      const hace = Math.round((Date.now() - c.at) / 60000);
+      const quien = await getUserName(env, c.chatId);
+      lines.push(
+        `• <code>${escapeHtml(c.text)}</code> — ${escapeHtml(quien)} · hace ${hace} min${c.intentos ? ` · reintentos: ${c.intentos}` : ""}`,
+      );
+    }
+    lines.push("", "<i>Se ejecutan solos apenas la sesión se renueve (captura, evento ok o keepAlive).</i>");
+    await sendMessage(env, chatId, lines.join("\n"));
+    return;
+  }
+
   // /wa_clear_pending  →  empty the queue
   if (text === "/wa_clear_pending") {
     await clearPendingRequests(env);
@@ -1023,7 +1276,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
   // Útil para alertas de descripciones quirúrgicas u otras urgencias.
   if (text.startsWith("/jhon ") || text === "/jhon") {
     if (text === "/jhon") {
-      await sendMessage(env, chatId, "Uso: <code>/jhon &lt;mensaje&gt;</code>\nEjemplo: <code>/jhon 🚨 Alerta paciente X requiere descripción quirúrgica</code>");
+      await sendMessage(env, chatId, "Casi 🙂 Así se usa:\n<code>/jhon &lt;mensaje&gt;</code>\nEjemplo: <code>/jhon 🚨 Alerta paciente X requiere descripción quirúrgica</code>");
       return;
     }
     const body = text.slice("/jhon ".length).trim();
@@ -1050,7 +1303,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
   if (text.startsWith("/p ") || text === "/p") {
     const cedula = text.slice(2).trim().replace(/\D/g, "");
     if (!cedula) {
-      await sendMessage(env, chatId, "Uso: <code>/p &lt;cédula&gt;</code> (ej: <code>/p 80040718</code>)");
+      await sendMessage(env, chatId, "Casi 🙂 Así se usa:\n<code>/p &lt;cédula&gt;</code> (ej: <code>/p 80040718</code>)");
       return;
     }
     return quickLookupPatient(env, chatId, cedula);
@@ -1083,11 +1336,11 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
 
   // Modo "respuesta WhatsApp" — el doctor tocó "📱 Escribir" en /contactos
   // y el siguiente mensaje se reenvía al WhatsApp del paciente.
-  const writingTo = await env.STATE.get(`mainbot:waReplyTo:${chatId}`);
+  // (writingTo se leyó arriba, antes de aplicar los alias)
   if (writingTo) {
     if (text === "/cancelar" || text === "/cancel") {
       await env.STATE.delete(`mainbot:waReplyTo:${chatId}`);
-      await sendMessage(env, chatId, "❌ Modo escritura cancelado.");
+      await sendMessage(env, chatId, "✅ Listo, salí del modo escritura.");
       return;
     }
     const r = await sendWaText(env, writingTo, text);
@@ -1103,8 +1356,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
     return;
   }
 
-  // Stateful inputs
-  const state = await loadState(env, chatId);
+  // Stateful inputs (el estado se leyó arriba, antes de aplicar los alias)
   if (state.step === "awaiting_customer_id") {
     return onCustomerIdEntered(env, chatId, text, state);
   }
@@ -1114,8 +1366,26 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
   if (state.step === "awaiting_phone") {
     return onPhoneEntered(env, chatId, text, state);
   }
+  if (state.step === "awaiting_lookup_id") {
+    const cedula = text.replace(/\D/g, "");
+    if (!cedula) {
+      await sendMessage(env, chatId, "Necesito la cédula en números (ej. <code>80040718</code>).\n<i>Para salir: /cancelar_flujo</i>");
+      return;
+    }
+    await clearState(env, chatId);
+    return quickLookupPatient(env, chatId, cedula);
+  }
+  // A mitad de un flujo que espera un botón (tipo de documento, especialidad,
+  // cupo, confirmación): decirlo claro en vez de "no te entendí".
+  if (state.step !== "idle") {
+    await sendMessage(env, chatId, "Estoy esperando que toques una opción del mensaje anterior 👆\n<i>Para salir: /cancelar_flujo</i>");
+    return;
+  }
 
-  await sendMessage(env, chatId, "Comando no reconocido. /start para ayuda.");
+  // Fallback amable: solo se llega aquí sin conversación activa.
+  await sendMessage(env, chatId, "No te entendí 🤔 ¿Querías alguna de estas?", {
+    reply_markup: tecladoFallback(),
+  });
 }
 
 // ====================================================================
@@ -1246,15 +1516,14 @@ async function quickLookupPatient(env: Env, chatId: string, cedula: string): Pro
       }
     }
   } catch (e) {
-    if (e instanceof SessionExpiredError) {
-      await sendMessage(env, chatId, "🔴 Sesión Bukeala expirada. /sesion_renew para renovar.");
-      return;
-    }
-    await sendMessage(env, chatId, `❌ Error: ${escapeHtml((e as Error).message)}`);
+    // Sesión caída: que suba a handleUpdate, que pide la renovación y encola
+    // el comando para re-ejecutarlo solo cuando Bukeala vuelva.
+    if (e instanceof SessionExpiredError) throw e;
+    await sendMessage(env, chatId, `❌ Error: ${escapeHtml((e as Error).message)}\n<i>Prueba de nuevo en un momento.</i>`);
     return;
   }
   if (!found) {
-    await sendMessage(env, chatId, `❌ Paciente con cédula <code>${escapeHtml(cedula)}</code> no encontrado en Bukeala.`);
+    await sendMessage(env, chatId, `❌ No encontré la cédula <code>${escapeHtml(cedula)}</code> en Bukeala (probé CC, TI, RC, CE y PA).\n<i>Revisa el número; si el paciente es nuevo, hay que crearlo primero en Bukeala.</i>`);
     return;
   }
   const name: string = found.name ?? found.fullName ?? "(sin nombre)";
@@ -1363,6 +1632,47 @@ async function onCallback(env: Env, chatId: string, callback: any): Promise<void
   const data: string = callback.data ?? "";
   await answerCallback(env, callback.id);
 
+  // Botones del menú (/start, /menu, fallback): se traducen al comando y pasan
+  // por onText, para que hagan EXACTAMENTE lo mismo que escribir el comando.
+  const menuCmd = menuCallbackACommand(data);
+  if (menuCmd) {
+    return onText(env, chatId, menuCmd);
+  }
+
+  // "¿Le aviso al Dr.?" (ver soloDoctor): sí → mensaje al doctor; no → nada.
+  if (data === "pedir:si" || data === "pedir:no") {
+    const raw = await env.STATE.get(`tg:pedir:${chatId}`);
+    await env.STATE.delete(`tg:pedir:${chatId}`);
+    if (data === "pedir:no") {
+      await sendMessage(env, chatId, "Vale 👍");
+      return;
+    }
+    if (!raw) {
+      await sendMessage(env, chatId, "Ya pasó un rato y perdí el detalle 😅\n<i>Vuelve a escribir el comando y toca el botón de nuevo.</i>");
+      return;
+    }
+    let pedido: { accion: string; comando: string } = { accion: "", comando: "" };
+    try { pedido = JSON.parse(raw); } catch { /* ignore */ }
+    const quien = await getUserName(env, chatId);
+    const aviso =
+      `🔔 <b>${escapeHtmlLocal(quien)}</b> pide: ${escapeHtmlLocal(pedido.accion || "(sin detalle)")}` +
+      (pedido.comando ? `\n<code>${escapeHtmlLocal(pedido.comando)}</code>` : "");
+    let enviados = 0;
+    for (const doctorChatId of await getDoctorRecipients(env)) {
+      if (doctorChatId === chatId) continue;
+      try {
+        await sendMessage(env, doctorChatId, aviso);
+        enviados++;
+      } catch { /* seguir con el resto */ }
+    }
+    await sendMessage(
+      env,
+      chatId,
+      enviados > 0 ? "Listo, ya le avisé al Dr. David 👍" : "No pude avisarle 😕\n<i>Escríbele directo por WhatsApp.</i>",
+    );
+    return;
+  }
+
   if (data.startsWith("spec:")) {
     const [, code, idStr] = data.split(":");
     return onSpecialtySelected(env, chatId, code, Number(idStr));
@@ -1430,7 +1740,7 @@ async function onCallback(env: Env, chatId: string, callback: any): Promise<void
     const id = data.slice("wrem:".length);
     const rp = await findRecentPatient(env, id);
     if (!rp || !rp.phone) {
-      await sendMessage(env, chatId, "❌ Sin teléfono en cache. Busca primero con /p o agenda una vez.");
+      await sendMessage(env, chatId, "❌ No tengo guardado el teléfono de ese paciente.\n<i>Búscalo primero con /p o agéndalo una vez; ahí queda guardado.</i>");
       return;
     }
     await sendMessage(
@@ -1447,7 +1757,7 @@ async function onCallback(env: Env, chatId: string, callback: any): Promise<void
       const d = await getActiveDoctor(env);
       await sendMessage(env, chatId, `✅ Doctor activo: <b>${d.name}</b>`);
     } catch (e) {
-      await sendMessage(env, chatId, `❌ Error: ${(e as Error).message}`);
+      await sendMessage(env, chatId, `❌ No pude cambiar el doctor: ${escapeHtmlLocal((e as Error).message)}\n<i>Prueba de nuevo con /doctor.</i>`);
     }
     return;
   }
@@ -1525,8 +1835,7 @@ async function onCallback(env: Env, chatId: string, callback: any): Promise<void
   }
   if (data.startsWith("wa_auto:")) {
     if (!(await isDoctor(env, chatId))) {
-      await sendMessage(env, chatId, "❌ Solo doctores pueden activar auto-modo.");
-      return;
+      return soloDoctor(env, chatId, "activar el modo automático de la IA para ese paciente");
     }
     const phone = data.slice("wa_auto:".length);
     await setMode(env, phone, "auto");
@@ -1664,7 +1973,7 @@ async function onWaSendDraft(env: Env, chatId: string, phone: string): Promise<v
     await sendMessage(env, chatId, `✅ Enviado a <code>${phone}</code>.`);
   } else {
     const err = r.data?.error?.message ?? "unknown";
-    await sendMessage(env, chatId, `❌ Error ${r.status}: ${err}`);
+    await sendMessage(env, chatId, `❌ Error ${r.status}: ${escapeHtmlLocal(String(err))}\n<i>Probablemente pasó la ventana de 24 h: usa una plantilla con /wa_recordar.</i>`);
   }
 }
 
@@ -1800,10 +2109,11 @@ async function onCustomerIdEntered(
 ): Promise<void> {
   const id = text.replace(/\D/g, "");
   if (!id || id.length < 5) {
-    await sendMessage(env, chatId, "Cédula inválida. Escribe solo números.");
+    await sendMessage(env, chatId, "Necesito el número de documento, solo números (mínimo 5).\n<i>Para salir: /cancelar_flujo</i>");
     return;
   }
 
+  await sendMessage(env, chatId, "⏳ Buscando al paciente…");
   const b = new Bukeala(env);
 
   // Helper: try findCustomer with a warmup retry on session-expired.
@@ -1859,7 +2169,7 @@ async function onCustomerIdEntered(
     await sendMessage(
       env,
       chatId,
-      "❌ No pude leer los datos del paciente del HTML. Reportar al desarrollador.",
+      "❌ No pude leer los datos del paciente en Bukeala.\n<i>Prueba de nuevo; si se repite, avísale al Dr. David (puede que Bukeala cambió su página).</i>",
     );
     return;
   }
@@ -2467,7 +2777,7 @@ async function onConfirm(env: Env, chatId: string): Promise<void> {
     );
   } else {
     const msg = json?.messages?.[0]?.description ?? json?.result?.description ?? "Error desconocido";
-    await sendMessage(env, chatId, `❌ Error agendando: ${stripHtmlTags(msg)}`);
+    await sendMessage(env, chatId, `❌ No se pudo agendar: ${escapeHtml(stripHtmlTags(msg))}\n<i>Ese cupo pudo ocuparse mientras tanto. Vuelve a buscar con /buscar.</i>`);
   }
 }
 
@@ -2504,7 +2814,7 @@ async function doCancelBooking(
     await sendMessage(env, chatId, `✅ Cita ${reservationCode} cancelada.`);
   } else {
     const msg = json?.result?.description ?? json?.messages?.[0]?.description ?? "Error desconocido";
-    await sendMessage(env, chatId, `❌ No se pudo cancelar: ${stripHtmlTags(msg)}`);
+    await sendMessage(env, chatId, `❌ No se pudo cancelar: ${escapeHtml(stripHtmlTags(msg))}\n<i>Mira con /citas si la cita sigue activa y vuelve a intentar.</i>`);
   }
 }
 
@@ -2694,6 +3004,7 @@ function bookingEmail(bk: AgendaBooking): string {
 
 export async function showAgenda(env: Env, chatId: string, dateDashed: string): Promise<void> {
   // dateDashed format: DD-MM-YYYY (with dashes, day first)
+  await sendMessage(env, chatId, "⏳ Consultando la agenda…");
   const b = new Bukeala(env);
   const res = await b.getAgenda(dateDashed, AREA_ID, /* includeCanceled */ false);
   const json = await res.json<any>().catch(() => null);
@@ -2719,6 +3030,18 @@ export async function showAgenda(env: Env, chatId: string, dateDashed: string): 
   const friendly = json?.defaultDateFormatted ?? dashedToFriendly(dateDashed);
   const occupied = slots.filter((s) => s.bk).length;
   const free = slots.length - occupied;
+
+  // Día vacío: decirlo con voz humana. (El teclado de detalle también quedaría
+  // vacío: solo lista citas activas.)
+  if (occupied === 0) {
+    const esDoc = await isDoctor(env, chatId);
+    await sendMessage(
+      env,
+      chatId,
+      `📅 <b>${friendly}</b>\n\n${esDoc ? "No tienes" : "No hay"} citas ese día 🎉\n<i>${free} cupos libres</i>`,
+    );
+    return;
+  }
 
   // Contactos del directorio para todas las cédulas del día, en un solo golpe.
   const { getContactos } = await import("./pacientesContacto");
@@ -2843,19 +3166,37 @@ function secondsToHHMM(s: number): string {
 }
 
 /**
- * Cuando un comando de agenda (abrir/cancelar/bloquear) falla por sesión caída
- * —común en modo bajo-demanda—, despierta la sesión Bukeala (la VM hace login)
- * y le pide al doctor reintentar en ~1-2 min, sin tener que correr /sesion_renew.
+ * Cuando un comando falla por sesión caída —común en modo bajo-demanda—,
+ * despierta la sesión Bukeala (la VM hace login) sin que nadie corra
+ * /sesion_renew.
+ *
+ * Si recibe `text` (el comando que falló), lo ENCOLA: cuando la sesión vuelva
+ * se re-ejecuta solo y el resultado llega a este chat (tgPendingCommands.ts).
+ * Así el usuario no tiene que repetir nada. Sin `text` (p. ej. un botón a
+ * mitad de un flujo) solo se pide la renovación y se avisa.
  */
-async function wakeSessionAndNotify(env: Env, chatId: string): Promise<void> {
+async function wakeSessionAndNotify(env: Env, chatId: string, text?: string): Promise<void> {
   try {
     await requestRefresh(env, chatId);
-    await sendMessage(
-      env,
-      chatId,
-      "🔔 Desperté la sesión de Bukeala. Reintenta el comando en <b>~1-2 min</b>.",
-    );
   } catch (e) {
     console.log("[wakeSession] requestRefresh falló:", (e as Error).message);
+  }
+  let cola: "nuevo" | "repetido" | "error" = "error";
+  if (text) {
+    try {
+      cola = (await encolarComando(env, chatId, text)) ? "nuevo" : "repetido";
+    } catch (e) {
+      console.log("[wakeSession] encolar falló:", (e as Error).message);
+    }
+  }
+  const msg =
+    text && cola !== "error"
+      ? "Bukeala está caída ahora mismo 😕\nYa la estoy renovando. Te mando el resultado aquí apenas vuelva — no tienes que repetir nada." +
+        (cola === "repetido" ? "\n<i>(Ya lo tenía anotado.)</i>" : "")
+      : "Bukeala está caída ahora mismo 😕\nYa la estoy renovando. Te aviso aquí cuando vuelva (~1-2 min) y ahí repites el último paso.";
+  try {
+    await sendMessage(env, chatId, msg);
+  } catch (e) {
+    console.log("[wakeSession] aviso falló:", (e as Error).message);
   }
 }

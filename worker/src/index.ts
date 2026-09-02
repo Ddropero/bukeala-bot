@@ -972,6 +972,16 @@ async function keepAlive(env: Env): Promise<void> {
     } catch (e) {
       console.log("[keepalive] pending-queue process failed:", (e as Error).message);
     }
+
+    // Lo mismo para los comandos de Telegram que fallaron con la sesión caída:
+    // cubre el "blip" en que la sesión se recupera sola sin captura ni evento
+    // ok (el ping de arriba acaba de confirmar que Bukeala responde).
+    try {
+      const { procesarComandosPendientes } = await import("./tgPendingCommands");
+      await procesarComandosPendientes(env);
+    } catch (e) {
+      console.log("[keepalive] tg-pending process failed:", (e as Error).message);
+    }
   } catch (e) {
     if (!(e instanceof SessionExpiredError)) {
       console.log("[keepalive] unexpected error:", (e as Error).message);

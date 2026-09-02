@@ -205,6 +205,16 @@ export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
         console.log("[native-host-event] processPendingRequests failed:", err.message);
       }),
     );
+    // Cola de comandos de Telegram (misma señal, try/catch propio para que un
+    // fallo aquí no toque la cola de WhatsApp). Import dinámico: evita el ciclo
+    // telegram.ts → nativeHostEvent.ts → tgPendingCommands.ts → telegram.ts.
+    c.executionCtx.waitUntil(
+      import("../tgPendingCommands")
+        .then(({ procesarComandosPendientes }) => procesarComandosPendientes(c.env))
+        .catch((err) => {
+          console.log("[native-host-event] procesarComandosPendientes failed:", (err as Error).message);
+        }),
+    );
   }
 
   // On TGC expired, send a throttled Telegram alert

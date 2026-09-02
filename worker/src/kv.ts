@@ -25,6 +25,8 @@ export type ConversationState = {
     | "awaiting_customer_id"
     | "awaiting_phone"
     | "awaiting_email"
+    /** /buscar_paciente: esperando la cédula para el lookup directo (/p). */
+    | "awaiting_lookup_id"
     | "confirming";
   /** What action triggered awaiting_customer_id — controls what the bot does after the patient is selected. */
   mode?: "buscar" | "citas" | "cancelar";
