@@ -34,6 +34,22 @@ import {
 } from "./tipos";
 
 /** Busca "etiqueta: valor" en la descripción, probando varios sinónimos. */
+/**
+ * Valor de una linea que empieza con un emoji, sin "etiqueta:".
+ * El espejo (cron/espejoCalendar.ts) escribe asi: "\u{1F4DE} +573106197751",
+ * "\u{1FAAA} CC 63438331", "✉️ ana@correo.com". Sin esto el telefono
+ * del directorio se perdia al pasar por Calendar y la agenda de Laura decia
+ * "sin telefono" teniendolo.
+ */
+function campoEmoji(desc: string, emoji: string): string {
+  const re = new RegExp(`^\s*${emoji}\uFE0F?\s*(.+)$`, "mu");
+  const m = desc.match(re);
+  if (!m) return "";
+  const v = m[1].trim();
+  // El espejo escribe un texto explicito cuando no tiene el dato.
+  return /^sin (tel|email|documento)/i.test(v) ? "" : v;
+}
+
 function campo(desc: string, alias: string[]): string {
   for (const a of alias) {
     const re = new RegExp(`^\\s*${a}\\s*[:=]\\s*(.+)$`, "im");
@@ -91,13 +107,17 @@ export const fuenteGCal: FuenteAgenda = {
         const notaTitulo = partes.slice(1).join(" - ").trim();
 
         let telefono = normalizarTel(campo(desc, ["tel", "tel[eé]fono", "cel", "celular", "whatsapp", "wa"]));
+        if (!telefono) telefono = normalizarTel(campoEmoji(desc, "\u{1F4DE}"));
         if (!telefono) {
-          // Sin etiqueta: cualquier número de 10 dígitos sirve como teléfono.
-          const suelto = desc.match(/(?<!\d)(3\d{9})(?!\d)/);
+          // Sin etiqueta: un celular colombiano, con o sin el 57 delante.
+          const suelto = desc.match(/(?:\+?57)?\s*(3\d{9})(?!\d)/);
           if (suelto) telefono = normalizarTel(suelto[1]);
         }
-        const cc = campo(desc, ["cc", "c[eé]dula", "documento", "doc", "id"]);
-        const email = campo(desc, ["email", "correo", "mail"]);
+        // "\u{1FAAA} CC 63438331" -> nos quedamos con los digitos.
+        const cc =
+          campo(desc, ["cc", "c[eé]dula", "documento", "doc", "id"]) ||
+          campoEmoji(desc, "\u{1FAAA}").replace(/[^\d]/g, "");
+        const email = campo(desc, ["email", "correo", "mail"]) || campoEmoji(desc, "✉");
         const nota = campo(desc, ["nota", "notas", "obs", "observaci[oó]n"]);
 
         // El asistente que confirmó en Calendar cuenta como cita confirmada.
