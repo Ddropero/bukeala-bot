@@ -71,6 +71,25 @@ function esNumeroDelEquipo(env: Env, tel: string): boolean {
   return propios.some((p) => p === d || p.endsWith(d) || d.endsWith(p));
 }
 
+/**
+ * Mismo guardia que arriba, pero para correos. Hizo falta el 1-sep-2026: el
+ * correo del Dr. (david@davidduque.com) quedó guardado como si fuera de una
+ * paciente, porque el contexto de WhatsApp asocia al chat que consulta una
+ * cédula. Se compara contra EQUIPO_EMAILS (lista separada por comas, opcional)
+ * y contra el dominio del consultorio.
+ */
+function esEmailDelEquipo(env: Env, email: string): boolean {
+  const e = (email ?? "").trim().toLowerCase();
+  if (!e.includes("@")) return false;
+  const lista = String((env as any).EQUIPO_EMAILS ?? "")
+    .split(",")
+    .map((x) => x.trim().toLowerCase())
+    .filter(Boolean);
+  if (lista.includes(e)) return true;
+  const dominio = e.split("@")[1] ?? "";
+  return dominio === "davidduque.com";
+}
+
 export async function getContacto(env: Env, cedula: string): Promise<ContactoPaciente | null> {
   if (!cedula) return null;
   try {
@@ -98,7 +117,12 @@ export async function guardarContacto(
     console.log(`[contactos] ${cedula}: descarto tel del equipo (no es del paciente)`);
     tel = "";
   }
-  const email = (datos.email ?? "").includes("@") ? datos.email!.trim() : "";
+  let email = (datos.email ?? "").includes("@") ? datos.email!.trim() : "";
+  // Nunca registrar un correo del equipo como si fuera del paciente.
+  if (email && esEmailDelEquipo(env, email)) {
+    console.log(`[contactos] ${cedula}: descarto email del equipo (no es del paciente)`);
+    email = "";
+  }
   const nombre = (datos.nombre ?? "").trim();
   if (!tel && !email && !nombre) return; // nada que guardar
 
