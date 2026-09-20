@@ -146,8 +146,8 @@ export async function handleAbrirAgenda(env: Env, argsText: string): Promise<Abr
     // ese día, el rango de un día no contiene nada y no se abre ningún cupo.
     // Mejor avisar que crear una agenda vacía en silencio.
     const [d, mo, y] = parts[2].split("/").map((n) => parseInt(n, 10));
-    const bukealaDay = new Date(Date.UTC(y, mo - 1, d)).getUTCDay() + 1; // Domingo=1 … Sábado=7
-    if (bukealaDay !== day) {
+    const bukealaDay = String(new Date(Date.UTC(y, mo - 1, d)).getUTCDay() + 1); // Domingo=1 … Sábado=7
+    if (bukealaDay !== day.num) {
       return {
         reply:
           `❌ El ${parts[2]} no es ${parts[0]}. ` +
