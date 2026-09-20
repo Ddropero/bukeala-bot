@@ -137,10 +137,23 @@ export async function handleAbrirAgenda(env: Env, argsText: string): Promise<Abr
     startDate = parts[2];
     endDate = parts[3];
   } else if (parts.length === 3 && validDate(parts[2])) {
+    // UNA sola fecha = abrir SOLO ese día. Antes era "inicio de un bloque de
+    // 2 semanas", y el Dr. (20-sep-2026) quiere poder abrir un día suelto sin
+    // comprometer quince. Para un bloque, se dan dos fechas.
     startDate = parts[2];
+    endDate = parts[2];
+    // Bukeala abre el DÍA DE LA SEMANA dentro del rango: si la fecha no cae en
+    // ese día, el rango de un día no contiene nada y no se abre ningún cupo.
+    // Mejor avisar que crear una agenda vacía en silencio.
     const [d, mo, y] = parts[2].split("/").map((n) => parseInt(n, 10));
-    const dt = new Date(Date.UTC(y, mo - 1, d) + DEFAULT_WEEKS * 7 * 86400 * 1000);
-    endDate = `${pad2(dt.getUTCDate())}/${pad2(dt.getUTCMonth() + 1)}/${dt.getUTCFullYear()}`;
+    const bukealaDay = new Date(Date.UTC(y, mo - 1, d)).getUTCDay() + 1; // Domingo=1 … Sábado=7
+    if (bukealaDay !== day) {
+      return {
+        reply:
+          `❌ El ${parts[2]} no es ${parts[0]}. ` +
+          `Para abrir solo ese día, pon el día de la semana que le corresponde.`,
+      };
+    }
   }
 
   const b = new Bukeala(env);
@@ -210,11 +223,12 @@ function helpText(): string {
     "Ejemplos:",
     "<code>/abrir_agenda jueves 8:00-12:20</code> (ambos perfiles)",
     "<code>/abrir_agenda ninos jueves 8:00-12:20</code>",
+    "<code>/abrir_agenda mié 8:00-12:00 23/09/2026</code> (solo ese día)",
     "<code>/abrir_agenda adultos lunes 7:00-13:00 01/07/2026 31/07/2026</code>",
     "",
     "• <b>Perfil</b> (opcional): <code>ninos</code> · <code>adultos</code> · <code>ambos</code> (default: ambos a la vez)",
     "• Slots de 20 min · agenda del Dr. Duque",
-    "• Sin fechas = próximas 2 semanas",
+    "• Sin fechas = próximas 2 semanas · <b>una fecha = solo ese día</b> · dos fechas = rango",
     "• Días: lunes…domingo (o lun/mar/mié...)",
   ].join("\n");
 }
