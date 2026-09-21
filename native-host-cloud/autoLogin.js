@@ -299,7 +299,9 @@ async function saveTgc(context, STATE_FILE, log) {
   const tgc = cks.filter((c) => isTgcName(c.name));
   if (tgc.length === 0) { log("warn", "no TGC cookie to save"); return false; }
   try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ cookies: tgc, origins: [] }));
+    // savedAt: para poder comparar con el TGC del Worker y usar el MÁS RECIENTE
+    // (21-sep-2026: un archivo de 5 días ganaba siempre sobre uno fresco).
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ cookies: tgc, origins: [], savedAt: new Date().toISOString() }));
     const tail = (tgc[0].value || "").slice(-12);
     log("info", "TGC saved", { count: tgc.length, tail });
     return tail;
@@ -315,7 +317,9 @@ function loadTgc(STATE_FILE) {
       if (!fs.existsSync(file)) continue;
       const raw = JSON.parse(fs.readFileSync(file, "utf8"));
       const tgc = (raw.cookies || []).filter((c) => isTgcName(c.name));
-      if (tgc.length) return { cookies: tgc, origins: [] };
+      // `at`: cuándo se guardó. Archivos viejos (sin savedAt) usan la fecha del fichero.
+      const at = raw.savedAt || fs.statSync(file).mtime.toISOString();
+      if (tgc.length) return { cookies: tgc, origins: [], at, file };
     } catch { /* probar siguiente */ }
   }
   return null;
@@ -339,7 +343,7 @@ async function fetchTgcFromWorker(WORKER_URL, CAPTURE_TOKEN, log) {
       return null;
     }
     log("info", "TGC rescatado del Worker", { capturedAt: data.capturedAt, count: data.cookies.length });
-    return { cookies: data.cookies, origins: [] };
+    return { cookies: data.cookies, origins: [], at: data.capturedAt || null };
   } catch (e) {
     log("warn", "worker TGC fetch failed", { error: e.message });
     return null;
@@ -403,13 +407,24 @@ async function runAutoLogin(env, opts = {}) {
 
   try {
     // ---- INTENTO 1: restaurar SOLO la cookie TGC ----
-    // Orden: archivo local → rescate desde el Worker (si el archivo se perdió,
-    // p.ej. tras un reboot cuando vivía en /tmp) → sin TGC (captcha directo).
-    let savedTgc = loadTgc(STATE_FILE);
-    diag.tgcSource = savedTgc ? "file" : null;
-    if (!savedTgc) {
-      savedTgc = await fetchTgcFromWorker(WORKER_URL, CAPTURE_TOKEN, log);
-      if (savedTgc) diag.tgcSource = "worker";
+    // Se miran AMBAS fuentes y gana el TGC MÁS RECIENTE. Antes el archivo local
+    // ganaba siempre que existiera, y el 21-sep-2026 uno de 5 días (muerto)
+    // tapó el que el Dr. acababa de sembrar desde Brave: formulario CAS →
+    // captcha → Radware, en bucle. El del Worker es el último login HUMANO,
+    // que es el que importa desde que Radware bloquea el login automático.
+    const fromFile = loadTgc(STATE_FILE);
+    const fromWorker = await fetchTgcFromWorker(WORKER_URL, CAPTURE_TOKEN, log);
+    const ms = (t) => (t && t.at ? Date.parse(t.at) || 0 : 0);
+    let savedTgc = null;
+    if (fromFile && fromWorker) {
+      savedTgc = ms(fromWorker) > ms(fromFile) ? fromWorker : fromFile;
+      diag.tgcSource = savedTgc === fromWorker ? "worker" : "file";
+      log("info", "TGC: elegido el más reciente", { file: fromFile.at, worker: fromWorker.at, elegido: diag.tgcSource });
+    } else if (fromFile || fromWorker) {
+      savedTgc = fromFile || fromWorker;
+      diag.tgcSource = fromFile ? "file" : "worker";
+    } else {
+      diag.tgcSource = null;
     }
     if (savedTgc) diag.tgcUsedTail = (savedTgc.cookies[0]?.value || "").slice(-12) || null;
     const ctx1 = await browser.newContext({ ...CONTEXT_OPTIONS });
@@ -426,6 +441,13 @@ async function runAutoLogin(env, opts = {}) {
     let activePage = page1;
 
     if (!diag.hadBukealaJsession) {
+      // Si CAS mostró el formulario, el TGC que presentamos está MUERTO. Si
+      // venía del archivo local, borrarlo: si no, en el siguiente ciclo vuelve a
+      // ganar y tapa cualquier TGC fresco que el Dr. siembre desde Brave.
+      if (nav1.usedCaptcha && diag.tgcSource === "file") {
+        try { fs.unlinkSync(STATE_FILE); log("info", "TGC del archivo rechazado por CAS → archivo borrado"); }
+        catch { /* ya no existía */ }
+      }
       if (nav1.usedCaptcha) {
         // Ya gastamos un captcha y aun así no hay sesión de Bukeala: un 2º captcha
         // rara vez ayuda. Fallar y reportar (evita doble gasto / saldo agotado).
