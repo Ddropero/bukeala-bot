@@ -92,7 +92,9 @@ export async function handleAbrirAgenda(env: Env, argsText: string): Promise<Abr
   // 0. Perfil opcional como primer token: ninos | adultos | ambos.
   //    Si no se especifica, default = AMBOS (niños + adultos simultáneo).
   let profiles: ProfileKey[] = ["ninos", "adultos"];
-  let profileLabel = "Ambos perfiles (niños + adultos)";
+  // Etiqueta del caso normal: que el Dr. lea de frente que abrió las dos
+  // consultas, sin que suene a "opción elegida".
+  let profileLabel = "Adultos + Adolescentes";
   const firstKey = stripAccents(parts[0].toLowerCase());
   if (PROFILE_ALIASES[firstKey]) {
     const sel = PROFILE_ALIASES[firstKey];
@@ -218,15 +220,16 @@ function helpText(): string {
   return [
     "📋 <b>Abrir agenda (cupos)</b>",
     "",
-    "<code>/abrir_agenda [perfil] &lt;día&gt; &lt;inicio&gt;-&lt;fin&gt; [desde] [hasta]</code>",
+    "Abre cupos para <b>adultos y adolescentes a la vez</b>, siempre.",
+    "",
+    "<code>/abrir_agenda &lt;día&gt; &lt;inicio&gt;-&lt;fin&gt; [fecha]</code>",
     "",
     "Ejemplos:",
-    "<code>/abrir_agenda jueves 8:00-12:20</code> (ambos perfiles)",
-    "<code>/abrir_agenda ninos jueves 8:00-12:20</code>",
+    "<code>/abrir_agenda mié 8:00-12:00</code> (próximas 2 semanas)",
     "<code>/abrir_agenda mié 8:00-12:00 23/09/2026</code> (solo ese día)",
-    "<code>/abrir_agenda adultos lunes 7:00-13:00 01/07/2026 31/07/2026</code>",
+    "<code>/abrir_agenda lunes 7:00-13:00 01/07/2026 31/07/2026</code> (rango)",
     "",
-    "• <b>Perfil</b> (opcional): <code>ninos</code> · <code>adultos</code> · <code>ambos</code> (default: ambos a la vez)",
+    "• Solo si quieres UN perfil, antepón <code>ninos</code> o <code>adultos</code>",
     "• Slots de 20 min · agenda del Dr. Duque",
     "• Sin fechas = próximas 2 semanas · <b>una fecha = solo ese día</b> · dos fechas = rango",
     "• Días: lunes…domingo (o lun/mar/mié...)",
