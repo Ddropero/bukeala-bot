@@ -11,7 +11,7 @@ import { handleListTemplates, handleCreateTemplates, handleCreateAgendaTemplate,
 import { handleDashboard } from "./handlers/dashboard";
 import { handlePanel } from "./handlers/panel";
 import { handleApiAgenda } from "./handlers/apiAgenda";
-import { handleNativeHostEvent, handleCheckRefresh, handleRefreshComplete, handleGetTgc } from "./handlers/nativeHostEvent";
+import { handleNativeHostEvent, handleCheckRefresh, handleRefreshComplete, handleGetTgc, handleGetSession } from "./handlers/nativeHostEvent";
 import {
   handleExtensionRequestSend,
   handleExtensionCheckSend,
@@ -66,6 +66,10 @@ app.post("/native-host/refresh-complete", handleRefreshComplete);
 // TGC rescue: la VM recupera el TGC de la última sesión en KV tras un reboot
 // (evita gastar captcha para re-bootstrapear). Solo devuelve cookies TGC.
 app.get("/native-host/tgc", handleGetTgc);
+
+// La VM ADOPTA esta sesión (no loguea): Radware le bloquea el login, pero el
+// JSESSIONID de Bukeala sí es portable a otra IP. Ver handleGetSession.
+app.get("/native-host/session", handleGetSession);
 
 // Cola de órdenes para la EXTENSIÓN del navegador del Dr. — renovación remota
 // SIN abrir el popup. Mismo patrón que /native-host/check-refresh pero con

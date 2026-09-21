@@ -302,6 +302,46 @@ export async function handleGetTgc(c: Context<{ Bindings: Env }>) {
   return c.json({ found: true, capturedAt: session.capturedAt, cookies: tgc });
 }
 
+/**
+ * Entrega la sesión COMPLETA para que la VM la ADOPTE sin loguearse.
+ *
+ * POR QUÉ (21-sep-2026): Radware bloquea el login automático de la VM — 12
+ * intentos, 0 éxitos, incluso con un TGC creado minutos antes por un login
+ * humano. El TGC no sirve para loguear desde la VM. Pero el JSESSIONID de
+ * Bukeala SÍ es portable a otra IP: este mismo Worker lo usa desde Cloudflare
+ * y funciona, y `appoint.tuscitasmedicas.com` no tiene Radware (verificado en
+ * un HAR de 263 peticiones). Así que la VM puede cargar estas cookies en
+ * Playwright y mantenerlas vivas navegando, sin iniciar sesión nunca.
+ *
+ * A diferencia de /native-host/tgc, aquí van TODAS las cookies: sin el
+ * JSESSIONID no hay sesión que adoptar.
+ */
+export async function handleGetSession(c: Context<{ Bindings: Env }>) {
+  const token = c.req.header("X-Capture-Token") ?? c.req.query("token");
+  if (!token || token !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+
+  const session = await loadSession(c.env);
+  if (!session) return c.json({ found: false, reason: "no hay sesión en KV" });
+
+  const cookies = session.cookies ?? [];
+  const tieneBukeala = cookies.some(
+    (k) => k.name === "JSESSIONID" && (k.domain ?? "").toLowerCase().includes("tuscitasmedicas"),
+  );
+  if (!tieneBukeala) {
+    return c.json({
+      found: false,
+      reason: "la sesión guardada no tiene JSESSIONID de Bukeala",
+      capturedAt: session.capturedAt,
+    });
+  }
+
+  const edadMin = Math.round((Date.now() - new Date(session.capturedAt).getTime()) / 60000);
+  console.log(`[adopcion] entregando ${cookies.length} cookies (capturadas hace ${edadMin} min)`);
+  return c.json({ found: true, capturedAt: session.capturedAt, edadMin, cookies });
+}
+
 // ====================================================================
 // Refresh-on-demand: Telegram → triggers Native Host to run --setup
 // ====================================================================
