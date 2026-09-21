@@ -24,13 +24,20 @@
  */
 const os = require("node:os");
 const path = require("node:path");
-const { runAutoLogin, keepAliveInPlace } = require("./autoLogin");
+const { runAutoLogin, keepAliveInPlace, adoptSession } = require("./autoLogin");
 
 const APP_DIR = os.tmpdir(); // solo para screenshots de error
 // Archivo del TGC de CAS entre renovaciones → la mayoría no usan captcha.
 // Vive en el HOME (persiste reboots — /tmp se borraba al reiniciar la VM y
 // cada reboot costaba un captcha). Solo guarda la cookie TGC, no el estado
 // completo (el estado completo envenenaba la sesión — lección jun 2026).
+// Radware bloquea el login automatico desde la VM (21-sep-2026: 12 intentos,
+// 0 exitos, incluso con TGC recien creado por un login humano). Cada intento
+// gasta un captcha para nada, asi que por DEFECTO la VM no loguea: solo ADOPTA
+// la sesion que siembra el navegador del Dr. Poner DISABLE_AUTO_LOGIN=0 para
+// reactivar el login (si algun dia Colsanitas cambia).
+const DISABLE_AUTO_LOGIN = process.env.DISABLE_AUTO_LOGIN !== "0";
+
 const STATE_FILE = process.env.STATE_FILE || path.join(os.homedir(), ".bukeala-tgc.json");
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
 const PROACTIVE_INTERVAL_MS = parseInt(process.env.PROACTIVE_INTERVAL_MS || "600000", 10);
@@ -193,7 +200,36 @@ async function doLogin(c, reason) {
       await closeLiveSession(`en sitio: ${aliveFail}`);
     }
 
-    // 2. Login completo, conservando el browser para renovar en sitio después.
+    // 2. ADOPTAR la sesion del navegador del Dr. (sin loguear, sin captcha).
+    //    Es el camino normal desde que Radware bloquea el login de la VM.
+    const ad = await adoptSession(c);
+    if (ad.ok) {
+      adoptLiveSession({ browser: ad.browser, context: ad.context, page: ad.page });
+      const durationMs = Date.now() - startedAt;
+      log("info", "auto-login OK", { cookieCount: ad.cookieCount, durationMs, reason, via: "adoptada", url: ad.postNavUrl });
+      await reportEvent(c, {
+        type: "ok", message: `${ad.cookieCount} cookies (cloud, ${reason}, adoptada)`,
+        cookieCount: ad.cookieCount, durationMs, via: "adoptada",
+        hadBukealaJsession: true, postNavUrl: ad.postNavUrl,
+        aliveFail: aliveFail || undefined,
+      });
+      return { ok: true, via: "adoptada", cookieCount: ad.cookieCount, postNavUrl: ad.postNavUrl };
+    }
+
+    // 3. No hubo nada que adoptar. NO se loguea (gastaria captcha y Radware lo
+    //    bloquea): se reporta y se espera a que el Dr. siembre sesion.
+    if (DISABLE_AUTO_LOGIN) {
+      const durationMs = Date.now() - startedAt;
+      log("warn", "sin sesion que adoptar — el Dr. debe loguearse en su navegador", { reason: ad.reason });
+      await reportEvent(c, {
+        type: "error",
+        message: `${ad.reason} (cloud, ${reason}, via=adopcion; login automatico DESACTIVADO)`,
+        durationMs, via: "adoptada", aliveFail: aliveFail || undefined,
+      });
+      return { ok: false, reason: ad.reason, via: "adoptada" };
+    }
+
+    // 4. Login completo (solo con DISABLE_AUTO_LOGIN=0).
     const r = await runAutoLogin(c, { keepAlive: true });
     const durationMs = Date.now() - startedAt;
     if (r.ok && r.session) adoptLiveSession(r.session);

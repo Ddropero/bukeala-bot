@@ -631,4 +631,68 @@ async function keepAliveInPlace(env, session) {
   }
 }
 
-module.exports = { runAutoLogin, keepAliveInPlace };
+/**
+ * ADOPTAR la sesión que sembró el navegador del Dr., sin loguearse jamás.
+ *
+ * POR QUÉ (21-sep-2026): Radware bloquea el login automático de la VM — 12
+ * intentos, 0 éxitos, el último con un TGC creado minutos antes por un login
+ * humano. El TGC NO es adoptable para loguear desde la VM. Pero el JSESSIONID
+ * de Bukeala SÍ es portable a otra IP: el Worker lo usa desde Cloudflare y
+ * funciona, y `appoint.tuscitasmedicas.com` no tiene Radware (HAR de 263
+ * peticiones, 0 rastro). Así que cargamos esas cookies en Playwright y, si la
+ * sesión responde autenticada, se convierte en la `liveSession` que
+ * `keepAliveInPlace` mantiene viva navegando. Cero captchas.
+ *
+ * Devuelve { ok:true, browser, context, page, cookieCount } o { ok:false, reason }.
+ */
+async function adoptSession(env) {
+  const { CAPTURE_TOKEN, WORKER_URL, log } = env;
+  let browser = null;
+  try {
+    const base = WORKER_URL.replace(/\/capture$/, "");
+    const res = await fetch(`${base}/native-host/session`, {
+      headers: { "X-Capture-Token": CAPTURE_TOKEN },
+    });
+    if (!res.ok) return { ok: false, reason: `worker respondió ${res.status}` };
+    const data = await res.json();
+    if (!data.found || !Array.isArray(data.cookies) || data.cookies.length === 0) {
+      // Caso normal cuando el Dr. tiene el navegador cerrado y la sesión ya venció.
+      return { ok: false, reason: `sin sesión que adoptar: ${data.reason || "worker sin sesión"}` };
+    }
+    log("info", "sesión recibida del Worker", { cookies: data.cookies.length, edadMin: data.edadMin });
+
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+    });
+    const context = await browser.newContext({ ...CONTEXT_OPTIONS });
+    await context.addCookies(data.cookies.map(toPlaywrightCookie));
+    const page = await context.newPage();
+
+    // La prueba real: navegar y comprobar que Bukeala nos trata como
+    // autenticados. Si CAS nos manda al formulario, la sesión no sirve — y NO
+    // se loguea: se reporta y se espera a que el Dr. siembre una nueva.
+    await page.goto(BUKEALA_HOME, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForTimeout(1500);
+    const url = page.url();
+    if (url.includes("/cas/login")) {
+      await browser.close().catch(() => {});
+      return { ok: false, reason: `la sesión adoptada no sirve (CAS pidió login, url=${url})` };
+    }
+    await waitForBukealaSession(context, SESSION_WAIT_MS);
+    const authed = (await hasBukealaSession(context)) && looksAuthenticated(url);
+    if (!authed) {
+      await browser.close().catch(() => {});
+      return { ok: false, reason: `adoptada pero sin sesión de Bukeala (url=${page.url()})` };
+    }
+
+    const cookieCount = await captureAndPush(context, WORKER_URL, CAPTURE_TOKEN, log);
+    log("info", "sesión ADOPTADA (sin login, sin captcha)", { url: page.url(), cookieCount });
+    return { ok: true, browser, context, page, cookieCount, postNavUrl: page.url() };
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {});
+    return { ok: false, reason: `adopción falló: ${e.message}` };
+  }
+}
+
+module.exports = { runAutoLogin, keepAliveInPlace, adoptSession };

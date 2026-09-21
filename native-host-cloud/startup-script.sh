@@ -682,7 +682,71 @@ async function keepAliveInPlace(env, session) {
   }
 }
 
-module.exports = { runAutoLogin, keepAliveInPlace };
+/**
+ * ADOPTAR la sesión que sembró el navegador del Dr., sin loguearse jamás.
+ *
+ * POR QUÉ (21-sep-2026): Radware bloquea el login automático de la VM — 12
+ * intentos, 0 éxitos, el último con un TGC creado minutos antes por un login
+ * humano. El TGC NO es adoptable para loguear desde la VM. Pero el JSESSIONID
+ * de Bukeala SÍ es portable a otra IP: el Worker lo usa desde Cloudflare y
+ * funciona, y `appoint.tuscitasmedicas.com` no tiene Radware (HAR de 263
+ * peticiones, 0 rastro). Así que cargamos esas cookies en Playwright y, si la
+ * sesión responde autenticada, se convierte en la `liveSession` que
+ * `keepAliveInPlace` mantiene viva navegando. Cero captchas.
+ *
+ * Devuelve { ok:true, browser, context, page, cookieCount } o { ok:false, reason }.
+ */
+async function adoptSession(env) {
+  const { CAPTURE_TOKEN, WORKER_URL, log } = env;
+  let browser = null;
+  try {
+    const base = WORKER_URL.replace(/\/capture$/, "");
+    const res = await fetch(`${base}/native-host/session`, {
+      headers: { "X-Capture-Token": CAPTURE_TOKEN },
+    });
+    if (!res.ok) return { ok: false, reason: `worker respondió ${res.status}` };
+    const data = await res.json();
+    if (!data.found || !Array.isArray(data.cookies) || data.cookies.length === 0) {
+      // Caso normal cuando el Dr. tiene el navegador cerrado y la sesión ya venció.
+      return { ok: false, reason: `sin sesión que adoptar: ${data.reason || "worker sin sesión"}` };
+    }
+    log("info", "sesión recibida del Worker", { cookies: data.cookies.length, edadMin: data.edadMin });
+
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+    });
+    const context = await browser.newContext({ ...CONTEXT_OPTIONS });
+    await context.addCookies(data.cookies.map(toPlaywrightCookie));
+    const page = await context.newPage();
+
+    // La prueba real: navegar y comprobar que Bukeala nos trata como
+    // autenticados. Si CAS nos manda al formulario, la sesión no sirve — y NO
+    // se loguea: se reporta y se espera a que el Dr. siembre una nueva.
+    await page.goto(BUKEALA_HOME, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForTimeout(1500);
+    const url = page.url();
+    if (url.includes("/cas/login")) {
+      await browser.close().catch(() => {});
+      return { ok: false, reason: `la sesión adoptada no sirve (CAS pidió login, url=${url})` };
+    }
+    await waitForBukealaSession(context, SESSION_WAIT_MS);
+    const authed = (await hasBukealaSession(context)) && looksAuthenticated(url);
+    if (!authed) {
+      await browser.close().catch(() => {});
+      return { ok: false, reason: `adoptada pero sin sesión de Bukeala (url=${page.url()})` };
+    }
+
+    const cookieCount = await captureAndPush(context, WORKER_URL, CAPTURE_TOKEN, log);
+    log("info", "sesión ADOPTADA (sin login, sin captcha)", { url: page.url(), cookieCount });
+    return { ok: true, browser, context, page, cookieCount, postNavUrl: page.url() };
+  } catch (e) {
+    if (browser) await browser.close().catch(() => {});
+    return { ok: false, reason: `adopción falló: ${e.message}` };
+  }
+}
+
+module.exports = { runAutoLogin, keepAliveInPlace, adoptSession };
 
 ALEOF
 
@@ -713,13 +777,20 @@ cat > $APP/watcher.js <<'WEOF'
  */
 const os = require("node:os");
 const path = require("node:path");
-const { runAutoLogin, keepAliveInPlace } = require("./autoLogin");
+const { runAutoLogin, keepAliveInPlace, adoptSession } = require("./autoLogin");
 
 const APP_DIR = os.tmpdir(); // solo para screenshots de error
 // Archivo del TGC de CAS entre renovaciones → la mayoría no usan captcha.
 // Vive en el HOME (persiste reboots — /tmp se borraba al reiniciar la VM y
 // cada reboot costaba un captcha). Solo guarda la cookie TGC, no el estado
 // completo (el estado completo envenenaba la sesión — lección jun 2026).
+// Radware bloquea el login automatico desde la VM (21-sep-2026: 12 intentos,
+// 0 exitos, incluso con TGC recien creado por un login humano). Cada intento
+// gasta un captcha para nada, asi que por DEFECTO la VM no loguea: solo ADOPTA
+// la sesion que siembra el navegador del Dr. Poner DISABLE_AUTO_LOGIN=0 para
+// reactivar el login (si algun dia Colsanitas cambia).
+const DISABLE_AUTO_LOGIN = process.env.DISABLE_AUTO_LOGIN !== "0";
+
 const STATE_FILE = process.env.STATE_FILE || path.join(os.homedir(), ".bukeala-tgc.json");
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
 const PROACTIVE_INTERVAL_MS = parseInt(process.env.PROACTIVE_INTERVAL_MS || "600000", 10);
@@ -882,7 +953,36 @@ async function doLogin(c, reason) {
       await closeLiveSession(`en sitio: ${aliveFail}`);
     }
 
-    // 2. Login completo, conservando el browser para renovar en sitio después.
+    // 2. ADOPTAR la sesion del navegador del Dr. (sin loguear, sin captcha).
+    //    Es el camino normal desde que Radware bloquea el login de la VM.
+    const ad = await adoptSession(c);
+    if (ad.ok) {
+      adoptLiveSession({ browser: ad.browser, context: ad.context, page: ad.page });
+      const durationMs = Date.now() - startedAt;
+      log("info", "auto-login OK", { cookieCount: ad.cookieCount, durationMs, reason, via: "adoptada", url: ad.postNavUrl });
+      await reportEvent(c, {
+        type: "ok", message: `${ad.cookieCount} cookies (cloud, ${reason}, adoptada)`,
+        cookieCount: ad.cookieCount, durationMs, via: "adoptada",
+        hadBukealaJsession: true, postNavUrl: ad.postNavUrl,
+        aliveFail: aliveFail || undefined,
+      });
+      return { ok: true, via: "adoptada", cookieCount: ad.cookieCount, postNavUrl: ad.postNavUrl };
+    }
+
+    // 3. No hubo nada que adoptar. NO se loguea (gastaria captcha y Radware lo
+    //    bloquea): se reporta y se espera a que el Dr. siembre sesion.
+    if (DISABLE_AUTO_LOGIN) {
+      const durationMs = Date.now() - startedAt;
+      log("warn", "sin sesion que adoptar — el Dr. debe loguearse en su navegador", { reason: ad.reason });
+      await reportEvent(c, {
+        type: "error",
+        message: `${ad.reason} (cloud, ${reason}, via=adopcion; login automatico DESACTIVADO)`,
+        durationMs, via: "adoptada", aliveFail: aliveFail || undefined,
+      });
+      return { ok: false, reason: ad.reason, via: "adoptada" };
+    }
+
+    // 4. Login completo (solo con DISABLE_AUTO_LOGIN=0).
     const r = await runAutoLogin(c, { keepAlive: true });
     const durationMs = Date.now() - startedAt;
     if (r.ok && r.session) adoptLiveSession(r.session);
