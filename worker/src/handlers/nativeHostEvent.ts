@@ -146,10 +146,10 @@ export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
               chat_id: chat,
               text:
                 "🔴 <b>2Captcha SIN SALDO</b>\n\n" +
-                "La VM no puede renovar la sesión de Bukeala hasta que recargues.\n\n" +
+                "El servicio de renovación no puede completar los intentos que requieran CAPTCHA hasta que recargues.\n\n" +
                 "1. Recarga en https://2captcha.com → Add funds\n" +
                 "2. Luego corre /sesion_renew\n\n" +
-                "<i>Alternativa gratis: loguéate en Bukeala desde el PC y captura con la extensión — la VM rescatará el TGC sola.</i>",
+                "<i>Los reintentos respetan su tiempo de espera. También puedes enviar una sesión válida desde la extensión, si la tienes disponible.</i>",
               parse_mode: "HTML",
             }),
           }).catch(() => {});
@@ -182,12 +182,11 @@ export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
               chat_id: chat,
               text:
                 "🟠 <b>Bukeala bloqueó el login automático</b> (anti-bot Radware)\n\n" +
-                "La VM no puede renovar sola: Colsanitas desvía el login a su sistema " +
-                "anti-bot. Esto <b>necesita tu login humano</b>:\n\n" +
-                "1. Entra a Bukeala en tu Chrome (tú sí pasas el anti-bot)\n" +
-                "2. Abre la extensión → <b>Enviar sesión ahora</b>\n\n" +
-                "<i>La VM tomará esa sesión y la mantendrá viva ~6 h. Reintentar el " +
-                "login automático solo empeora las cosas, así que la VM ya no lo hace.</i>",
+                "El proveedor está pidiendo una verificación adicional al navegador que mantiene la sesión. " +
+                "Puede requerir intervención humana en ese host.\n\n" +
+                "Si ya tienes una sesión válida en otro navegador, puedes enviarla con la extensión " +
+                "mediante <b>Enviar sesión ahora</b>.\n\n" +
+                "<i>El servicio respetará la espera antes de reintentar. Repetir /sesion_renew no elimina esa espera ni la verificación del proveedor.</i>",
               parse_mode: "HTML",
             }),
           }).catch(() => {});
@@ -236,9 +235,9 @@ export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
               chat_id: doctorChatId,
               text:
                 "⚠️ <b>Sesión Bukeala expiró</b> (TGC murió en CAS)\n\n" +
-                "El Native Host ya no puede refrescar cookies. Para volver a activar:\n\n" +
-                "<code>cd C:\\Users\\dfduq\\OneDrive\\Documents\\agendamiento\\outputs\\bukeala-bot\\native-host\nnode index.js --setup</code>\n\n" +
-                "Loguea en la ventana que se abre (con reCAPTCHA), espera a ver Bukeala, la ventana se cierra sola.",
+                "El servicio de renovación necesita volver a autenticarse. Solicita /sesion_renew; se respetará la espera entre reintentos.\n\n" +
+                "Si el proveedor exige verificación humana, debe completarse en el navegador del host que mantiene la sesión.\n\n" +
+                "Puedes consultar /estado para comprobar si la sesión ya está disponible.",
               parse_mode: "HTML",
             }),
           });
@@ -428,7 +427,7 @@ export async function handleRefreshComplete(c: Context<{ Bindings: Env }>) {
       // Notify whoever requested
       const txt = body.ok
         ? "✅ <b>Sesión Bukeala renovada</b>\n\nYa puedes usar el bot normalmente."
-        : `❌ <b>Renovación falló</b>\n\nMensaje: ${body.message ?? "n/a"}\n\nIntenta de nuevo con /sesion_renew o corre <code>node index.js --setup</code> manualmente en el PC.`;
+        : `❌ <b>La sesión aún no se pudo recuperar</b>\n\nMensaje: ${body.message ?? "n/a"}\n\nPuedes consultar /estado. El servicio respetará la espera antes de reintentar; repetir /sesion_renew no la acorta. Si se requiere verificación humana, habrá que completarla en el navegador que mantiene la sesión.`;
       try {
         await fetch(`${TG(c.env.TELEGRAM_BOT_TOKEN)}/sendMessage`, {
           method: "POST",

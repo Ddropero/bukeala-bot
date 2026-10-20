@@ -30,3 +30,8 @@ desktop.ini
 *.tmp
 *.bak
 .cache/
+
+# Browser profiles and HAR files contain live authentication data.
+**/browser-profile/
+**/.bukeala-browser/
+*.har

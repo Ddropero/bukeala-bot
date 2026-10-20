@@ -359,7 +359,11 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  log("error", "fatal", { error: err.message, stack: err.stack });
+const start = process.env.BROWSER_SESSION_MODE === "persistent"
+  ? () => require("./persistentWatcher").main()
+  : main;
+
+start().catch(() => {
+  log("error", "fatal", { mode: process.env.BROWSER_SESSION_MODE || "legacy" });
   process.exit(2);
 });

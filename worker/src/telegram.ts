@@ -469,7 +469,7 @@ export async function onText(env: Env, chatId: string, text: string): Promise<vo
       "/cuc_clear — vaciar lista (solo doctor)",
       "",
       "<b>🔄 Sesión Bukeala</b>",
-      "/sesion_renew — pedir nuevo login (cualquiera, abre ventana en PC)",
+      "/sesion_renew — solicitar recuperación de la sesión (respeta la espera entre reintentos)",
       "/renovar_navegador — ordenar al navegador del Dr. re-enviar sesión (solo doctor)",
       "/sesion_blackout — heatmap disponibilidad por hora (detecta mantenimientos)",
       "",
@@ -514,7 +514,7 @@ export async function onText(env: Env, chatId: string, text: string): Promise<vo
         "Bukeala: caída 🔴 — ya la estoy renovando",
         "Última renovación: no tengo ninguna sesión guardada",
         "",
-        "<i>Te aviso aquí cuando vuelva. Si en 2-3 min no pasa nada: /sesion_renew</i>",
+        "<i>La recuperación está solicitada. Puedes consultar /estado; repetir /sesion_renew no acorta la espera entre reintentos.</i>",
       ];
       if (esDoc) {
         lines.push("", "<i>Detalle técnico</i>", "Sin sesión en KV (SESSIONS): la VM o la extensión deben capturar una nueva.");
@@ -574,7 +574,7 @@ export async function onText(env: Env, chatId: string, text: string): Promise<vo
       alive ? "Bukeala: en línea ✅" : "Bukeala: caída 🔴 — ya la estoy renovando",
       `Última renovación: hace ${ageMin} min`,
     ];
-    if (!alive) lines.push("", "<i>Te aviso aquí cuando vuelva. Si en 2-3 min no pasa nada: /sesion_renew</i>");
+    if (!alive) lines.push("", "<i>La recuperación está solicitada. Puedes consultar /estado; repetir /sesion_renew no acorta la espera entre reintentos.</i>");
     if (esDoc) {
       lines.push(
         "",
@@ -913,13 +913,13 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
     return;
   }
 
-  // /sesion_renew — request the local Native Host to renew the session
+  // /sesion_renew — request session recovery from the configured renewal host
   if (text === "/sesion_renew") {
     await requestRefresh(env, chatId);
     await sendMessage(
       env,
       chatId,
-      "🔔 <b>Solicitud enviada</b>\n\nEl Native Host la procesará en los próximos 30 segundos.\n\n• Si tienes 2Captcha activo: login automático (~30 seg, sin tu intervención)\n• Si no: se abre Chromium en el PC para login manual\n\n<i>Te aviso aquí cuando termine.</i>",
+      "🔔 <b>Solicitud registrada</b>\n\nEl servicio de renovación intentará recuperar la sesión. El host remoto puede hacerlo con tu PC apagado.\n\nSi hay un reintento pendiente, respetará su tiempo de espera; repetir el comando no lo acelera. Si el proveedor exige una verificación humana, habrá que completarla en el navegador que mantiene la sesión.\n\n<i>Cuando se procese la solicitud, recibirás aquí el resultado. Puedes consultar /estado.</i>",
     );
     return;
   }
@@ -959,7 +959,7 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
   if (text === "/sesion_stats") {
     const events = await getNativeHostEvents(env);
     if (events.length === 0) {
-      await sendMessage(env, chatId, "No hay eventos del Native Host aún. (¿Está corriendo la Scheduled Task?)");
+      await sendMessage(env, chatId, "Aún no hay eventos del servicio de renovación. Comprueba que el host configurado esté activo.");
       return;
     }
     const last24hCutoff = Date.now() - 24 * 60 * 60 * 1000;
@@ -3191,9 +3191,9 @@ async function wakeSessionAndNotify(env: Env, chatId: string, text?: string): Pr
   }
   const msg =
     text && cola !== "error"
-      ? "Bukeala está caída ahora mismo 😕\nYa la estoy renovando. Te mando el resultado aquí apenas vuelva — no tienes que repetir nada." +
+      ? "La sesión de Bukeala no está disponible ahora mismo 😕\nSolicité su recuperación. El servicio respetará la espera entre reintentos y enviará aquí el resultado del comando cuando pueda retomarlo — no tienes que repetirlo." +
         (cola === "repetido" ? "\n<i>(Ya lo tenía anotado.)</i>" : "")
-      : "Bukeala está caída ahora mismo 😕\nYa la estoy renovando. Te aviso aquí cuando vuelva (~1-2 min) y ahí repites el último paso.";
+      : "La sesión de Bukeala no está disponible ahora mismo 😕\nSolicité su recuperación. El servicio respetará la espera entre reintentos. Puedes consultar /estado y repetir el último paso cuando la sesión esté disponible.";
   try {
     await sendMessage(env, chatId, msg);
   } catch (e) {

@@ -25,10 +25,17 @@
 const path = require("node:path");
 const os = require("node:os");
 const fs = require("node:fs");
-const { chromium } = require("playwright-extra");
-const StealthPlugin = require("puppeteer-extra-plugin-stealth");
-
-try { chromium.use(StealthPlugin()); } catch { /* already applied */ }
+// Load legacy plugins only when a legacy entry point is used. The persistent
+// browser uses unmodified Playwright and the installed browser's actual UA.
+let legacyChromium;
+function getLegacyChromium() {
+  if (!legacyChromium) {
+    legacyChromium = require("playwright-extra").chromium;
+    const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+    try { legacyChromium.use(StealthPlugin()); } catch { /* already applied */ }
+  }
+  return legacyChromium;
+}
 
 const TWO_CAPTCHA_BASE = "https://2captcha.com";
 const TWO_CAPTCHA_POLL_INTERVAL_MS = 5000;
@@ -60,7 +67,7 @@ async function solveRecaptcha(twoCaptchaKey, sitekey, pageUrl, log) {
   const submitParams = new URLSearchParams({
     key: twoCaptchaKey, method: "userrecaptcha", googlekey: sitekey, pageurl: pageUrl, json: "1",
   });
-  const subRes = await fetch(`${TWO_CAPTCHA_BASE}/in.php?${submitParams}`);
+  const subRes = await fetch(`${TWO_CAPTCHA_BASE}/in.php?${submitParams}`, { signal: AbortSignal.timeout(20_000) });
   const subJson = await subRes.json();
   if (subJson.status !== 1) {
     // Saldo agotado u otro error fatal: propagar claro para abortar el ciclo.
@@ -70,7 +77,7 @@ async function solveRecaptcha(twoCaptchaKey, sitekey, pageUrl, log) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < TWO_CAPTCHA_MAX_WAIT_MS) {
     await new Promise((r) => setTimeout(r, TWO_CAPTCHA_POLL_INTERVAL_MS));
-    const pollRes = await fetch(`${TWO_CAPTCHA_BASE}/res.php?key=${twoCaptchaKey}&action=get&id=${captchaId}&json=1`);
+    const pollRes = await fetch(`${TWO_CAPTCHA_BASE}/res.php?key=${twoCaptchaKey}&action=get&id=${captchaId}&json=1`, { signal: AbortSignal.timeout(20_000) });
     const pollJson = await pollRes.json();
     if (pollJson.status === 1) { log("info", "2Captcha solved", { elapsedMs: Date.now() - startedAt }); return pollJson.request; }
     if (pollJson.request !== "CAPCHA_NOT_READY") throw new Error(`2Captcha poll failed: ${pollJson.request}`);
@@ -95,7 +102,7 @@ async function hasBukealaSession(context) {
  * 10 min durante ~28 min. /agenda caído todo ese rato sin que nadie lo supiera.
  * Con esta prueba, ese caso cae a login completo (~90 s) en el primer ciclo.
  */
-async function verifySessionWorks(context, log) {
+async function verifySessionWorks(context, log, opts = {}) {
   try {
     const url = `${BUKEALA_BASE}${VERIFY_PATH}&_=${Date.now()}`;
     const res = await context.request.get(url, {
@@ -110,24 +117,39 @@ async function verifySessionWorks(context, log) {
     const status = res.status();
     if (status !== 200) {
       log("warn", "verificación de sesión falló", { status });
-      return { ok: false, detail: `status ${status}` };
+      return { ok: false, detail: `status ${status}`, status, authRequired: status === 401 || status === 403 || status === 302, retryable: status >= 500 };
     }
     const body = (await res.text().catch(() => "")).trim();
     // Con sesión viva loadComponents devuelve un array JSON.
-    if (!body.startsWith("[") && !body.startsWith("{")) {
-      log("warn", "verificación de sesión: respuesta no-JSON", { head: body.slice(0, 60) });
-      return { ok: false, detail: "respuesta no-JSON" };
+    let parsed;
+    try { parsed = JSON.parse(body); } catch {
+      log("warn", "verificación de sesión: respuesta no-JSON");
+      return { ok: false, detail: "respuesta no-JSON", inconclusive: true };
+    }
+    if (opts.strict && !isComponentsResponse(parsed)) {
+      log("warn", "verificación de sesión: estructura no reconocida");
+      return { ok: false, detail: "estructura loadComponents no reconocida", inconclusive: true };
     }
     return { ok: true, detail: `200 (${body.length} bytes)` };
   } catch (e) {
     log("warn", "verificación de sesión lanzó", { error: e.message });
-    return { ok: false, detail: e.message };
+    return { ok: false, detail: e.message, retryable: true };
   }
+}
+
+/** Strict success shape for the authenticated loadComponents endpoint. */
+function isComponentsResponse(value) {
+  return Array.isArray(value) && value.length > 0 && value.every((row) =>
+    row && typeof row === "object" && !Array.isArray(row) &&
+    Number.isFinite(row.id) && typeof row.code === "string" && row.code.trim().length > 0 &&
+    typeof row.description === "string"
+  );
 }
 
 /**
  * Verificación AUTORITATIVA: le pregunta al WORKER si la sesión que acabamos
- * de empujar le sirve (GET /debug/measure → {alive:true|false}).
+ * de empujar le sirve. El modo estricto consulta /debug/components y valida
+ * el cuerpo real; el modo legacy conserva /debug/measure.
  *
  * Por qué no basta verifySessionWorks(): esa prueba usa las cookies del
  * NAVEGADOR, y el Worker solo recibe el subconjunto que captureAndPush filtra
@@ -136,15 +158,36 @@ async function verifySessionWorks(context, log) {
  * el Worker recibe 302. Eso es lo que pasó el 29/jul: pushes de 14 cookies
  * "OK" con /agenda caído. Esta prueba mide justo lo que importa.
  */
-async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log) {
+async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log, opts = {}) {
   const base = WORKER_URL.replace(/\/capture$/, "");
-  const url = `${base}/debug/measure?token=${encodeURIComponent(CAPTURE_TOKEN)}`;
+  const resource = opts.strict ? "components" : "measure";
+  const url = `${base}/debug/${resource}?token=${encodeURIComponent(CAPTURE_TOKEN)}`;
 
   // Un intento: distingue VEREDICTO ({alive:true/false}) de AMBIGUO (5xx, red,
   // cuerpo no-JSON). Solo un veredicto explícito de "no sirve" descarta la sesión.
   async function attempt() {
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+      const res = await fetch(url, {
+        signal: AbortSignal.timeout(20_000),
+        ...(opts.strict ? { redirect: "manual" } : {}),
+      });
+      if (opts.strict) {
+        const status = res.status;
+        if (status !== 200) {
+          return {
+            verdict: status === 401 || status === 403 ? "malo" : "ambiguo",
+            detail: `worker-components-http-${status}`, status,
+          };
+        }
+        let components;
+        try { components = JSON.parse(await res.text()); } catch {
+          return { verdict: "malo", detail: "worker-components-invalid-json", status };
+        }
+        if (!isComponentsResponse(components)) {
+          return { verdict: "malo", detail: "worker-components-invalid-shape", status };
+        }
+        return { verdict: "ok", detail: "worker-components-verified", status, componentCount: components.length };
+      }
       if (!res.ok) return { verdict: "ambiguo", detail: `worker HTTP ${res.status}` };
       const text = await res.text();
       let data;
@@ -158,7 +201,7 @@ async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log) {
       }
       return { verdict: "ambiguo", detail: "respuesta sin campo alive" };
     } catch (e) {
-      return { verdict: "ambiguo", detail: e.message };
+      return { verdict: "ambiguo", detail: opts.strict ? "worker-components-network-error" : e.message };
     }
   }
 
@@ -169,10 +212,17 @@ async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log) {
     r = await attempt();
   }
 
-  if (r.verdict === "ok") return { ok: true, detail: r.detail };
+  if (r.verdict === "ok") return {
+    ok: true, detail: r.detail,
+    ...(opts.strict ? { status: r.status, componentCount: r.componentCount } : {}),
+  };
   if (r.verdict === "malo") {
     log("warn", "verify via worker: el Worker NO puede usar la sesión", { detail: r.detail });
-    return { ok: false, detail: r.detail };
+    return { ok: false, detail: r.detail, ...(opts.strict ? { status: r.status } : {}) };
+  }
+  if (opts.strict) {
+    log("warn", "verify via worker inconcluso tras reintento");
+    return { ok: false, inconclusive: true, retryable: true, detail: "worker-verification-inconclusive" };
   }
   // AMBIGUO tras reintento: asumir OK. verifySessionWorks() ya validó la sesión
   // contra Bukeala desde el navegador; tirar el navegador vivo por no poder
@@ -283,6 +333,7 @@ async function captureAndPush(context, WORKER_URL, CAPTURE_TOKEN, log) {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Capture-Token": CAPTURE_TOKEN },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(20_000),
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Worker rejected: ${res.status} ${JSON.stringify(body).slice(0, 200)}`);
@@ -388,7 +439,7 @@ async function runAutoLogin(env, opts = {}) {
   const STATE_FILE = env.STATE_FILE || path.join(os.homedir(), ".bukeala-tgc.json");
   log("info", "credentials from env", { user: creds.username });
 
-  const browser = await chromium.launch({
+  const browser = await getLegacyChromium().launch({
     headless: true,
     args: ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
   });
@@ -661,7 +712,7 @@ async function adoptSession(env) {
     }
     log("info", "sesión recibida del Worker", { cookies: data.cookies.length, edadMin: data.edadMin });
 
-    browser = await chromium.launch({
+    browser = await getLegacyChromium().launch({
       headless: true,
       args: ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
     });
@@ -695,4 +746,10 @@ async function adoptSession(env) {
   }
 }
 
-module.exports = { runAutoLogin, keepAliveInPlace, adoptSession };
+module.exports = {
+  runAutoLogin, keepAliveInPlace, adoptSession,
+  sessionHelpers: {
+    BUKEALA_HOME, hasBukealaSession, submitCasForm, verifySessionWorks,
+    captureAndPush, verifyViaWorker, isComponentsResponse,
+  },
+};

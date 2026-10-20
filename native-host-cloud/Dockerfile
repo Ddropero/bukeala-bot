@@ -10,11 +10,13 @@ COPY package*.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 
 # Copia el código
-COPY autoLogin.js watcher.js ./
+COPY autoLogin.js watcher.js persistentSession.js persistentWatcher.js persistentProbe.js ./
 
 # El navegador ya viene en la imagen; le decimos a playwright dónde está.
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV NODE_ENV=production
+ENV BROWSER_SESSION_MODE=persistent
+ENV BROWSER_PROFILE_DIR=/data/browser-profile
 
 # Sin puerto: es un worker de fondo, no un servidor HTTP.
 CMD ["node", "watcher.js"]
