@@ -1,37 +1,24 @@
 /**
  * Watchdog — vigilante de salud del sistema de sesión Bukeala.
  *
- * Corre cada 5 min. Su trabajo: detectar cuando la sesión lleva DEMASIADO
- * tiempo caída en horario laboral (señal de que la VM/renovador no está
- * cumpliendo) y avisar UNA vez al doctor, sin spam.
- *
- * Lógica:
- *   1. Solo vigila en horario laboral Bogotá (7am-7pm). De noche la sesión
- *      expira a propósito (la VM duerme), así que no es una falla.
- *   2. Hace un ping real a Bukeala (findCustomer). Si responde 200 → todo OK,
- *      limpia cualquier estado de alarma previo.
- *   3. Si falla, mira hace cuánto está fallando (marca "downSince" en KV):
- *        - Primera detección → marca downSince + dispara un refresh on-demand
- *          (intento de auto-recuperación). NO avisa todavía.
- *        - Si sigue caído tras GRACE_MIN (20 min) → manda UN aviso al doctor
- *          con el diagnóstico probable, y no vuelve a avisar hasta que se
- *          recupere (evita spam).
+ * Corre cada 15 min, las 24 horas. Vigila dos señales independientes:
+ *   1. Reportes del renovador atrasados, respetando la espera registrada
+ *      entre reintentos. La ausencia de eventos no prueba que la VM se apagó.
+ *   2. Pacientes en cola durante GRACE_MIN (20 min) o más.
+ * El acceso real a Bukeala se verifica en keepalive y /estado.
  *
  * KV:
- *   watchdog:downSince   → ISO de cuándo empezó la caída actual
- *   watchdog:alerted     → "1" si ya avisamos por esta caída (TTL 6h)
+ *   watchdog:renewerStaleAlerted → alerta por reportes atrasados (TTL 3h)
+ *   watchdog:alerted             → alerta por pacientes en cola (TTL 6h)
  */
 import type { Env } from "../env";
 import { getDoctorRecipients } from "../users";
 import { requestRefresh, getNativeHostEvents } from "../handlers/nativeHostEvent";
 import { loadPendingRequests } from "../claudeBookingAgent";
+import { getRecoveryStatus } from "../sessionRecovery";
 
 const TG = (token: string) => `https://api.telegram.org/bot${token}`;
 const GRACE_MIN = 20; // minutos caído antes de alertar
-
-function bogotaHour(): number {
-  return (new Date().getUTCHours() - 5 + 24) % 24;
-}
 
 /** Diagnóstico probable de por qué está caído, leyendo los últimos eventos. */
 async function diagnose(env: Env): Promise<string> {
@@ -61,12 +48,13 @@ async function diagnose(env: Env): Promise<string> {
 }
 
 /**
- * Vigila que el renovador (VM) siga vivo: si su último evento tiene más de
- * STALE_MIN, alerta UNA vez (throttle 3h) y pide un refresh. Antes esto era
- * inalcanzable: el diagnóstico "VM apagada" solo corría si había pacientes
- * atascados, así que una VM muerta a las 3am no generaba ninguna señal.
+ * Detecta reportes atrasados sin confundir el backoff de 30/60 min con una
+ * caída de la VM. Tras el plazo registrado damos 5 min para completar el
+ * intento y publicar su resultado; el cron siguiente puede alertar.
  */
 const STALE_MIN = 25; // la VM renueva cada ~10 min → 25 min = 2 ciclos perdidos
+const RETRY_REPORT_GRACE_MS = 5 * 60 * 1000;
+const MAX_RETRY_WAIT_MS = 60 * 60 * 1000; // límite del coordinador de recuperación
 
 async function checkRenewerAlive(env: Env): Promise<void> {
   let lastAt = 0;
@@ -79,13 +67,32 @@ async function checkRenewerAlive(env: Env): Promise<void> {
   } catch { return; /* sin datos: no inventamos alarma */ }
   if (!lastAt) return;
 
-  const ageMin = (Date.now() - lastAt) / 60000;
+  const now = Date.now();
+  const ageMin = (now - lastAt) / 60000;
   if (ageMin < STALE_MIN) {
     await env.STATE.delete("watchdog:renewerStaleAlerted");
     return;
   }
 
-  try { await requestRefresh(env, "watchdog-renovador-mudo"); } catch { /* ignore */ }
+  let recovery;
+  try { recovery = await getRecoveryStatus(env, now); }
+  catch {
+    // Sin el plazo no podemos distinguir una espera prevista de un reporte
+    // perdido. No confirmamos salud ni borramos una alerta previa.
+    console.log("[watchdog] estado de recuperación no disponible; diagnóstico inconcluso");
+    return;
+  }
+  if (recovery.pending && recovery.nextAttemptAt &&
+      recovery.nextAttemptAt <= now + MAX_RETRY_WAIT_MS &&
+      now < recovery.nextAttemptAt + RETRY_REPORT_GRACE_MS) {
+    return;
+  }
+
+  let refreshRequested = false;
+  try {
+    await requestRefresh(env, "watchdog-renovador-mudo");
+    refreshRequested = true;
+  } catch { /* el aviso debe distinguir un intento de una solicitud guardada */ }
 
   if (await env.STATE.get("watchdog:renewerStaleAlerted")) return;
   await env.STATE.put("watchdog:renewerStaleAlerted", "1", { expirationTtl: 60 * 60 * 3 });
@@ -98,17 +105,19 @@ async function checkRenewerAlive(env: Env): Promise<void> {
       body: JSON.stringify({
         chat_id: chat,
         text:
-          `🔴 <b>El renovador de sesión no reporta hace ${Math.round(ageMin)} min</b>\n\n` +
-          "La VM de Google puede estar apagada o colgada. Sin ella, /agenda y el " +
-          "bot de WhatsApp dejan de funcionar.\n\n" +
-          "Ya pedí una renovación. Si no se recupera:\n" +
-          "• Revisa que la VM <code>bukeala-session-keeper</code> esté prendida\n" +
-          "• Comprueba con /estado",
+          `⚠️ <b>El renovador no tiene un nuevo reporte hace ${Math.round(ageMin)} min</b>\n\n` +
+          "No llegó otro reporte dentro del plazo esperado. Esto no confirma que la VM esté apagada: " +
+          "puede haber un problema de ejecución o comunicación.\n\n" +
+          (refreshRequested
+            ? "La recuperación quedó solicitada y respetará la espera entre reintentos.\n\n"
+            : "No pude confirmar que se guardara la solicitud de recuperación.\n\n") +
+          "Comprueba el acceso y el estado de recuperación con /estado. " +
+          "Si siguen faltando reportes, revisa el servicio en la VM <code>bukeala-session-keeper</code>.",
         parse_mode: "HTML",
       }),
     }).catch(() => {});
   }
-  console.log(`[watchdog] ALERTA renovador mudo hace ${Math.round(ageMin)} min`);
+  console.log(`[watchdog] ALERTA reporte del renovador atrasado hace ${Math.round(ageMin)} min`);
 }
 
 export async function watchdogCron(env: Env): Promise<void> {
@@ -116,9 +125,8 @@ export async function watchdogCron(env: Env): Promise<void> {
   // que una sesión caída de madrugada es una falla real (y los pacientes
   // escriben por WhatsApp a cualquier hora).
 
-  // VIGILANCIA 1 — ¿la VM sigue reportando? Si el último evento del renovador
-  // es viejo, la VM está apagada/colgada y nadie se enteraría: /agenda muere
-  // en silencio. Esto NO depende de que haya pacientes en cola.
+  // VIGILANCIA 1 — ¿faltan reportes fuera de la espera entre reintentos?
+  // Esto NO depende de que haya pacientes en cola ni confirma acceso a Bukeala.
   await checkRenewerAlive(env);
 
   // VIGILANCIA 2 — ¿hay PACIENTES EN COLA sin atender? Señal de que el
