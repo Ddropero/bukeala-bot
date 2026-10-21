@@ -73,6 +73,8 @@ import { suggestReply, appendHistory, getMode, setMode, type WaMode } from "./cl
 import { loadPendingRequests, clearPendingRequests, processPendingRequests } from "./claudeBookingAgent";
 import { getNativeHostEvents, requestRefresh } from "./handlers/nativeHostEvent";
 import { requestExtensionSend, getExtensionLastSeenMin } from "./handlers/extensionCommand";
+import { getRecoveryStatus } from "./sessionRecovery";
+import { formatSessionStatus, probeSessionStatus, readRenewalCounts } from "./sessionStatus";
 import { isAllowed, isDoctor, getRole, getUserName, listUsers, addUser, removeUser, getDoctorRecipients, type Role } from "./users";
 import { encolarComando, cargarComandosPendientes } from "./tgPendingCommands";
 
@@ -502,92 +504,38 @@ export async function onText(env: Env, chatId: string, text: string): Promise<vo
   }
 
   if (text === "/sesion" || text === "/estado") {
-    // Primero lo humano (¿está en línea?, ¿hace cuánto se renovó?); lo técnico
-    // solo para el doctor, debajo de "Detalle técnico". Si está caída se pide
-    // la renovación aquí mismo: así "ya la estoy renovando" es verdad y el
-    // aviso de "✅ renovada" le llega a este chat.
     const esDoc = await isDoctor(env, chatId);
-    const s = await loadSession(env);
-    if (!s) {
-      try { await requestRefresh(env, chatId); } catch { /* best effort */ }
-      const lines = [
-        "Bukeala: caída 🔴 — ya la estoy renovando",
-        "Última renovación: no tengo ninguna sesión guardada",
-        "",
-        "<i>La recuperación está solicitada. Puedes consultar /estado; repetir /sesion_renew no acorta la espera entre reintentos.</i>",
-      ];
-      if (esDoc) {
-        lines.push("", "<i>Detalle técnico</i>", "Sin sesión en KV (SESSIONS): la VM o la extensión deben capturar una nueva.");
-      }
-      await sendMessage(env, chatId, lines.join("\n"));
-      return;
+    const session = await loadSession(env);
+    const health = session
+      ? await probeSessionStatus(() => new Bukeala(env).loadComponents())
+      : { alive: false, note: "no hay sesión guardada" };
+    // Requesting recovery is not proof that a login is running or succeeded.
+    // Read the coordinator afterwards to preserve its human-attention/backoff status.
+    if (!health.alive) {
+      try { await requestRefresh(env, chatId); } catch { /* status below does not claim success */ }
     }
-    const ageMin = Math.round((Date.now() - new Date(s.capturedAt).getTime()) / 60000);
-
-    // Verificación EN VIVO: ping real a Bukeala. Antes este comando solo
-    // miraba si el blob existía en KV (TTL 12h) — podía decir 🟢 con la
-    // sesión muerta hace horas.
-    let alive = false;
-    let pingNote = "";
-    try {
-      const b = new Bukeala(env);
-      const r = await b.findCustomerPage();
-      await r.text();
-      alive = true;
-      pingNote = `HTTP ${r.status}`;
-    } catch (e) {
-      alive = false;
-      pingNote = e instanceof SessionExpiredError
-        ? "sesión rechazada (redirect a login)"
-        : `error: ${(e as Error).message.slice(0, 60)}`;
-    }
-
-    // Contexto operativo: último evento de la VM, gasto de captcha hoy, cola
-    const events = await getNativeHostEvents(env);
-    const last = events[events.length - 1];
-    let vmLine = "VM: sin eventos reportados";
-    if (last) {
-      const agoMin = Math.round((Date.now() - new Date(last.at).getTime()) / 60000);
-      const via = last.via ? ` vía ${last.via}${last.tgcSource === "worker" ? " (TGC rescatado del Worker)" : ""}` : "";
-      vmLine = `VM: ${last.type === "ok" ? "✅ renovó" : "❌ falló"} hace ${agoMin} min${via}${last.type === "ok" ? "" : " — si se repite: /sesion_renew"}`;
-    }
-    const day = new Date().toISOString().slice(0, 10);
-    const [aliveC, tgcC, capC, fallC, errC, pendingRaw] = await Promise.all([
-      env.STATE.get(`stats:renew:${day}:ok:alive`),
-      env.STATE.get(`stats:renew:${day}:ok:tgc`),
-      env.STATE.get(`stats:renew:${day}:ok:captcha`),
-      env.STATE.get(`stats:renew:${day}:ok:captcha-fallback`),
-      env.STATE.get(`stats:renew:${day}:error`),
+    const [events, recovery, counts, pendingRaw, pendingTelegram] = await Promise.all([
+      getNativeHostEvents(env),
+      getRecoveryStatus(env).catch(() => null),
+      readRenewalCounts(env),
       env.STATE.get("wa:pending:list"),
+      cargarComandosPendientes(env),
     ]);
-    let pendingCount = 0;
-    try { pendingCount = pendingRaw ? (JSON.parse(pendingRaw) as unknown[]).length : 0; } catch { /* ignore */ }
-    const captchasHoy = (parseInt(capC ?? "0", 10) || 0) + (parseInt(fallC ?? "0", 10) || 0);
-    // Gratis = navegador vivo (alive) + reuso de TGC. Ambas evitan el captcha.
-    const gratisHoy = (parseInt(aliveC ?? "0", 10) || 0) + (parseInt(tgcC ?? "0", 10) || 0);
-    const colaTg = (await cargarComandosPendientes(env)).length;
-
-    if (!alive) {
-      try { await requestRefresh(env, chatId); } catch { /* best effort */ }
-    }
-    const lines = [
-      alive ? "Bukeala: en línea ✅" : "Bukeala: caída 🔴 — ya la estoy renovando",
-      `Última renovación: hace ${ageMin} min`,
-    ];
-    if (!alive) lines.push("", "<i>La recuperación está solicitada. Puedes consultar /estado; repetir /sesion_renew no acorta la espera entre reintentos.</i>");
-    if (esDoc) {
-      lines.push(
-        "",
-        "<i>Detalle técnico</i>",
-        `Ping: ${pingNote}`,
-        `Sesión: capturada hace ${ageMin} min · ${s.cookies.length} cookies`,
-        vmLine,
-        `Hoy: ${gratisHoy} renovaciones sin captcha · ${captchasHoy} con captcha · ${parseInt(errC ?? "0", 10) || 0} errores`,
-        pendingCount > 0 ? `Cola WhatsApp: ${pendingCount} paciente(s) esperando` : "Cola WhatsApp: vacía",
-        colaTg > 0 ? `Cola Telegram: ${colaTg} comando(s) esperando (/pendientes_tg)` : "Cola Telegram: vacía",
-      );
-    }
-    await sendMessage(env, chatId, lines.join("\n"));
+    let pendingWhatsApp = 0;
+    try {
+      const pending = JSON.parse(pendingRaw ?? "[]");
+      pendingWhatsApp = Array.isArray(pending) ? pending.length : 0;
+    } catch { /* ignore malformed queue metadata */ }
+    await sendMessage(env, chatId, formatSessionStatus({
+      alive: health.alive,
+      pingNote: health.note,
+      capturedAt: session?.capturedAt,
+      cookieCount: session?.cookies.length ?? 0,
+      events, recovery, counts,
+      isDoctor: esDoc,
+      pendingWhatsApp,
+      pendingTelegram: pendingTelegram.length,
+    }));
     return;
   }
 

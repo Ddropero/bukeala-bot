@@ -129,6 +129,23 @@ function needsHumanAttention(reasonCode?: string): boolean {
   return /challenge|captcha|blocked|credential|login-form-unavailable|full-login-rejected/i.test(reasonCode ?? "");
 }
 
+/** Read-only status for /estado; never picks up a request or changes its retry deadline. */
+export async function getRecoveryStatus(env: Env, now = Date.now()) {
+  const request = await readRequest(env);
+  if (!request) return { pending: false as const };
+  const pickedUpAt = Date.parse(request.pickedUpAt ?? "");
+  return {
+    pending: true as const,
+    requestedAt: request.requestedAt,
+    nextAttemptAt: typeof request.nextAttemptAt === "number" && Number.isFinite(request.nextAttemptAt)
+      ? request.nextAttemptAt : undefined,
+    pickedUp: Number.isFinite(pickedUpAt) && pickedUpAt <= now && now - pickedUpAt < PICKUP_LEASE_MS,
+    // A later network failure/cooldown does not prove that the earlier human
+    // challenge was cleared. Keep that warning until this request succeeds.
+    needsHumanAttention: Boolean(request.humanNoticeAt) || needsHumanAttention(request.lastResult?.reasonCode),
+  };
+}
+
 async function addHumanNotice(env: Env, request: RefreshRequest, now: number): Promise<boolean> {
   if (request.humanNoticeAt || !needsHumanAttention(request.lastResult?.reasonCode)) return false;
   const delivered = await notify(env, [...manualRecipients(request), ...await getDoctorRecipients(env)],

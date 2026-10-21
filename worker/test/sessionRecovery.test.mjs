@@ -10,7 +10,7 @@ const bundle = buildSync({
   bundle: true, write: false, platform: "node", format: "esm", target: "es2022",
 }).outputFiles[0].text;
 const recovery = await import(`data:text/javascript;base64,${Buffer.from(bundle).toString("base64")}`);
-const { requestRecovery, pollRecovery, completeRecovery, notifyRecoveryDelay, closeAutomaticRecovery, validComponentsResponse } = recovery;
+const { requestRecovery, pollRecovery, completeRecovery, notifyRecoveryDelay, closeAutomaticRecovery, validComponentsResponse, getRecoveryStatus } = recovery;
 const KEY = "nativeHost:refreshRequest";
 const START = Date.UTC(2026, 9, 20, 23);
 const MINUTE = 60_000;
@@ -42,6 +42,56 @@ function fixture(t) {
     setNetwork: (fn) => { network = fn; },
   };
 }
+
+test("status reads pending challenge and cooldown without picking it up or exposing recipients", async (t) => {
+  const f = fixture(t);
+  await requestRecovery(f.env, "202", START);
+  const request = f.request();
+  await completeRecovery(f.env, {
+    requestedAt: request.requestedAt, ok: false, reasonCode: "external-auth-challenge",
+    nextAttemptAt: START + 30 * MINUTE,
+  }, START + MINUTE);
+  const before = f.data.get(KEY);
+  const writes = f.writes.length;
+  const snapshot = await getRecoveryStatus(f.env, START + 2 * MINUTE);
+  assert.deepEqual(snapshot, {
+    pending: true, requestedAt: request.requestedAt,
+    nextAttemptAt: START + 30 * MINUTE, pickedUp: false, needsHumanAttention: true,
+  });
+  assert.equal(f.data.get(KEY), before);
+  assert.equal(f.writes.length, writes);
+  assert.equal(snapshot.requestedBy, undefined);
+  assert.equal(snapshot.notifyChatIds, undefined);
+});
+
+test("status only reports a recently picked up request while its lease remains current", async (t) => {
+  const f = fixture(t);
+  assert.deepEqual(await getRecoveryStatus(f.env, START), { pending: false });
+  await requestRecovery(f.env, "202", START);
+  await pollRecovery(f.env, START);
+  assert.equal((await getRecoveryStatus(f.env, START + MINUTE)).pickedUp, true);
+  assert.equal((await getRecoveryStatus(f.env, START + 6 * MINUTE)).pickedUp, false);
+});
+
+test("human attention persists after challenge then transient failure or cooldown until recovery succeeds", async (t) => {
+  const f = fixture(t);
+  await requestRecovery(f.env, "202", START);
+  const { requestedAt } = f.request();
+  await completeRecovery(f.env, {
+    requestedAt, ok: false, reasonCode: "external-auth-challenge",
+  }, START + MINUTE);
+  assert.ok(f.request().humanNoticeAt);
+  for (const [index, reasonCode] of ["network-failed", "login-cooldown"].entries()) {
+    const now = START + (index + 2) * MINUTE;
+    await completeRecovery(f.env, { requestedAt, ok: false, reasonCode }, now);
+    assert.equal(f.request().lastResult.reasonCode, reasonCode);
+    const snapshot = await getRecoveryStatus(f.env, now);
+    assert.equal(snapshot.needsHumanAttention, true);
+    assert.ok(snapshot.nextAttemptAt > now);
+  }
+  await completeRecovery(f.env, { requestedAt, ok: true }, START + 4 * MINUTE);
+  assert.deepEqual(await getRecoveryStatus(f.env, START + 4 * MINUTE), { pending: false });
+});
 
 test("cron coalesces without replacing manual recipient, ID, pickup, or cooldown", async (t) => {
   const f = fixture(t);
