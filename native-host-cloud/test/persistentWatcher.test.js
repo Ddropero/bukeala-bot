@@ -48,6 +48,11 @@ function fixture(t) {
       at: clock,
     };
     requests.push(request);
+    if (request.pathname === "/native-host/refresh-complete") {
+      assert.equal(typeof request.body.requestedAt, "string");
+      assert.ok(request.body.reasonCode === undefined || typeof request.body.reasonCode === "string");
+      assert.ok(Number.isFinite(Date.parse(request.body.completedAt)));
+    }
     if (networkFailure?.(request)) throw new Error("simulated network outage");
     return {
       ok: true,
@@ -245,6 +250,7 @@ test("exceptions become failures; restart and on-demand requests cannot bypass b
   const completed = f.requests.filter((request) => request.pathname === "/native-host/refresh-complete");
   assert.equal(completed.length, 1);
   assert.equal(completed[0].body.ok, true);
+  assert.equal(completed[0].body.requestedAt, "synthetic-request-1");
 
   f.advance(30_000);
   await recovered.tick();
@@ -330,4 +336,103 @@ test("concurrent requests share one in-flight renewal and close is idempotent", 
   await watcher.close();
   assert.equal(closeCalls, 1);
   assert.equal((await watcher.runCycle("scheduled")).skipped, true);
+});
+
+test("one automatic request survives failure and recovers after cooldown without a new command", async (t) => {
+  const f = fixture(t);
+  const requestedAt = new Date(START).toISOString();
+  let attempts = 0;
+  const watcher = f.create({
+    renew: async () => ++attempts === 1
+      ? { ok: false, reasonCode: "auth-challenge" }
+      : healthy(),
+    close: async () => {},
+  });
+  f.setPending({ pending: true, requestedAt });
+  await watcher.tick();
+  assert.equal(watcher.getStatus().pendingRequest, requestedAt);
+  const first = f.requests.find(r => r.pathname === "/native-host/refresh-complete").body;
+  assert.equal(first.requestedAt, requestedAt);
+  assert.equal(first.nextAttemptAt, START + 30 * MINUTE);
+  assert.equal(first.ok, false);
+
+  f.advance(29 * MINUTE);
+  await watcher.tick();
+  assert.equal(attempts, 1, "automatic retry must respect authentication cooldown");
+  f.advance(MINUTE);
+  await watcher.tick();
+  assert.equal(attempts, 2, "the same request must be retried after its failure");
+  const completions = f.requests.filter(r => r.pathname === "/native-host/refresh-complete");
+  assert.equal(completions.length, 2);
+  assert.equal(completions[1].body.requestedAt, requestedAt);
+  assert.equal(completions[1].body.ok, true);
+  assert.equal(watcher.getStatus().pendingRequest, undefined);
+  f.advance(30_000);
+  await watcher.tick();
+  assert.equal(attempts, 2, "an acknowledged successful request must not renew twice");
+});
+
+test("a failed request is completed by scheduled recovery after restart even if remote flag is unavailable", async (t) => {
+  const f = fixture(t);
+  const requestedAt = new Date(START).toISOString();
+  const failed = f.create({ renew: async () => ({ ok: false, reasonCode: "network-failed" }), close: async () => {} });
+  f.setPending({ pending: true, requestedAt });
+  await failed.tick();
+  await failed.close();
+  f.setPending({ pending: false });
+  f.advance(90_000);
+  const recovered = f.create({ renew: async () => healthy(), close: async () => {} });
+  await recovered.tick();
+  const completions = f.requests.filter(r => r.pathname === "/native-host/refresh-complete");
+  assert.equal(completions.length, 2);
+  assert.equal(completions[1].body.requestedAt, requestedAt);
+  assert.equal(completions[1].body.ok, true);
+  assert.equal(recovered.getStatus().lastCompletedRequest, requestedAt);
+});
+
+test("lost completion is durable and delivered after restart without renewing again", async (t) => {
+  const f = fixture(t);
+  const requestedAt = new Date(START).toISOString();
+  let renewals = 0;
+  const manager = () => ({ renew: async () => { renewals++; return healthy(); }, close: async () => {} });
+  f.failNetworkWhen(r => r.pathname === "/native-host/refresh-complete");
+  f.setPending({ pending: true, requestedAt });
+  const first = f.create(manager());
+  await first.tick();
+  assert.equal(renewals, 1);
+  assert.equal(first.getStatus().completionOutbox.requestedAt, requestedAt);
+  await first.close();
+
+  f.advance(30_000);
+  f.failNetworkWhen(null);
+  const restarted = f.create(manager());
+  await restarted.tick();
+  assert.equal(renewals, 1);
+  assert.equal(restarted.getStatus().completionOutbox, undefined);
+  const completions = f.requests.filter(r => r.pathname === "/native-host/refresh-complete");
+  assert.equal(completions.length, 2);
+  assert.deepEqual(completions[1].body, completions[0].body);
+});
+
+test("failed startup supersedes an undelivered success instead of announcing stale recovery", async (t) => {
+  const f = fixture(t);
+  const requestedAt = new Date(START).toISOString();
+  f.setPending({ pending: true, requestedAt });
+  f.failNetworkWhen(r => r.pathname === "/native-host/refresh-complete");
+  const first = f.create({ renew: async () => healthy(), close: async () => {} });
+  await first.tick();
+  assert.equal(first.getStatus().completionOutbox.ok, true);
+  await first.close();
+
+  f.advance(5_000);
+  f.failNetworkWhen(null);
+  const restarted = f.create({ renew: async () => ({ ok: false, reasonCode: "auth-challenge" }), close: async () => {} });
+  await restarted.runCycle("startup");
+  const completions = f.requests.filter(r => r.pathname === "/native-host/refresh-complete");
+  assert.equal(completions.length, 2);
+  assert.equal(completions[1].body.ok, false, "never publish an older success after a newer failed verification");
+  assert.equal(completions[1].body.requestedAt, requestedAt);
+  assert.equal(restarted.getStatus().pendingRequest, requestedAt);
+  assert.equal(restarted.getStatus().lastCompletedRequest, undefined);
+  assert.equal(restarted.getStatus().completionOutbox, undefined);
 });

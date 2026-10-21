@@ -1597,7 +1597,7 @@ function createPersistentWatcher(env, options = {}) {
   status.startedAt = new Date(now()).toISOString();
   let inFlight = false;
   let closed = false;
-  let lastRequest = status.lastRequest || null;
+  let reportingCompletion = false;
 
   function persist() {
     const temp = `${statusFile}.${process.pid}.tmp`;
@@ -1621,6 +1621,29 @@ function createPersistentWatcher(env, options = {}) {
     catch { logger("warn", "telemetría no disponible", { route }); }
   }
 
+  async function flushCompletion() {
+    const completion = status.completionOutbox;
+    if (!completion || reportingCompletion || now() < (status.completionRetryAt || 0)) return;
+    reportingCompletion = true;
+    try {
+      // Keep the result across restarts/network failures. A stale result is
+      // acknowledged by the Worker without changing a different request.
+      const acknowledgement = await request("/native-host/refresh-complete", completion);
+      if (acknowledgement?.ok !== true) throw new Error("completion-not-acknowledged");
+      if (status.completionOutbox === completion) {
+        delete status.completionOutbox;
+        delete status.completionRetryAt;
+        persist();
+      }
+    } catch {
+      status.completionRetryAt = now() + pollMs;
+      persist();
+      logger("warn", "confirmación de renovación pendiente");
+    } finally {
+      reportingCompletion = false;
+    }
+  }
+
   function retryMs(result) {
     // The session manager also persists its full-login cooldown across restarts.
     if (/captcha|blocked|credential|login|cooldown|challenge|config/i.test(result.reasonCode || "")) {
@@ -1637,6 +1660,7 @@ function createPersistentWatcher(env, options = {}) {
     const resumeHealthyProfile = reason === "startup" && status.failures === 0;
     if (now() < status.nextAttemptAt && !resumeHealthyProfile) return { skipped: true, reason: "backoff" };
     inFlight = true;
+    const completionRequest = status.pendingRequest || status.completionOutbox?.requestedAt;
     status.lastAttemptAt = new Date(now()).toISOString();
     let result;
     try {
@@ -1665,6 +1689,26 @@ function createPersistentWatcher(env, options = {}) {
         status.fullLogins++;
         status.lastFullLoginAt = status.lastCompletedAt;
       }
+      if (completionRequest) {
+        status.completionOutbox = {
+          requestedAt: completionRequest,
+          completedAt: status.lastCompletedAt,
+          ok: summary.ok,
+          ...(summary.reasonCode ? { reasonCode: summary.reasonCode } : {}),
+          nextAttemptAt: summary.ok ? undefined : status.nextAttemptAt,
+          message: summary.ok ? "Sesión persistente verificada" : "La VM reintentará automáticamente",
+        };
+        delete status.completionRetryAt;
+        if (summary.ok) {
+          status.lastCompletedRequest = completionRequest;
+          delete status.pendingRequest;
+        } else {
+          // A newer verification supersedes an undelivered old success, also
+          // when a process restart discovers that the session no longer works.
+          status.pendingRequest = completionRequest;
+          if (status.lastCompletedRequest === completionRequest) delete status.lastCompletedRequest;
+        }
+      }
       persist();
       logger(summary.ok ? "info" : "warn", "ciclo persistente", { reason, ...summary });
       await report("/native-host/event", {
@@ -1674,6 +1718,7 @@ function createPersistentWatcher(env, options = {}) {
         hadBukealaJsession: summary.authenticated,
         message: summary.ok ? "persistent: navegador y Worker verificados" : `persistent: ${summary.reasonCode || "unverified"}`,
       });
+      await flushCompletion();
       return summary;
     } finally {
       inFlight = false;
@@ -1681,21 +1726,18 @@ function createPersistentWatcher(env, options = {}) {
   }
 
   async function tick() {
-    if (closed || inFlight || now() < status.nextAttemptAt) return;
+    if (closed || inFlight) return;
+    await flushCompletion();
+    if (now() < status.nextAttemptAt) return;
     let pending = null;
     try { pending = await request("/native-host/check-refresh"); }
     catch { logger("warn", "no se pudo leer orden remota"); }
-    if (pending?.pending && pending.requestedAt !== lastRequest) {
-      lastRequest = pending.requestedAt;
-      status.lastRequest = lastRequest;
+    if (pending?.pending && typeof pending.requestedAt === "string" &&
+        pending.requestedAt !== status.lastCompletedRequest) {
+      status.lastRequest = pending.requestedAt;
+      status.pendingRequest = pending.requestedAt;
       persist();
-      const result = await runCycle("on-demand");
-      if (!result.skipped) {
-        await report("/native-host/refresh-complete", {
-          ok: result.ok,
-          message: result.ok ? "Sesión persistente verificada" : "Recuperación pendiente; se respeta el intervalo de reintento",
-        });
-      }
+      await runCycle("on-demand");
       return;
     }
     if (now() >= (status.nextScheduledAt || 0)) await runCycle("scheduled");

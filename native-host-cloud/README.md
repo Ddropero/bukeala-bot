@@ -48,6 +48,48 @@ El modo persistente no aplica el reciclaje periódico por edad o número de usos
 del modo anterior. Tampoco importa automáticamente cookies antiguas ni borra el
 perfil como mecanismo de recuperación.
 
+## Recuperación automática y Telegram
+
+El Worker comprueba el JSON autenticado de Bukeala cada tres minutos. Si falta
+acceso, crea una solicitud que consume la VM. Las solicitudes automáticas se
+agrupan con cualquier recuperación pendiente; no reemplazan a sus destinatarios
+ni reinician la espera. `/sesion_renew` sigue disponible para solicitar una
+comprobación, pero no es necesario repetirlo para que haya reintentos.
+
+Cada solicitud conserva `requestedAt` como identificador. El watcher lo devuelve
+en `/native-host/refresh-complete`, junto con `ok`, `completedAt`, el código de
+fallo si corresponde y `nextAttemptAt`. Un resultado viejo no debe cerrar otra
+solicitud. Los resultados fallidos conservan la solicitud y su próxima espera.
+La retención en KV es de siete días y se renueva con cada intento.
+
+El watcher persiste `pendingRequest` y `completionOutbox` en su estado local.
+Una recuperación posterior, incluso después de reiniciar el servicio, completa
+la misma solicitud. Si el callback falla, vuelve a entregarlo sin repetir un
+login solo para enviar la confirmación. Una comprobación más reciente que falla
+reemplaza cualquier éxito anterior que todavía no se hubiera entregado.
+
+Los incidentes automáticos rápidos se resuelven sin avisos. Si la caída dura al
+menos seis minutos, el siguiente control informa que la recuperación sigue en
+curso. Un desafío de autenticación puede avisarse antes. Tras un aviso, la
+recuperación confirmada envía su cierre a los doctores; las solicitudes manuales
+se confirman a sus propios chats. Las etiquetas internas `auto-*` nunca son
+destinatarios de Telegram. Las confirmaciones parcialmente entregadas solo se
+reintentan para los destinatarios pendientes.
+
+KV no ofrece compare-and-swap: la correlación y la relectura reducen carreras,
+pero no equivalen a una exclusión distribuida entre regiones. El despliegue
+actual utiliza un único renovador activo en la VM.
+
+Pruebas sin servicios externos:
+
+```bash
+# Desde native-host-cloud
+npm test
+# Desde worker
+node --test test/sessionRecovery.test.mjs test/sessionRecoveryHandlers.test.mjs
+npm run typecheck
+```
+
 ## Variables
 
 | Variable | Uso y valor predeterminado |

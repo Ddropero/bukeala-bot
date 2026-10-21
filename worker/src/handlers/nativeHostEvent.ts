@@ -14,6 +14,7 @@ import type { Env } from "../env";
 import { getDoctorRecipients } from "../users";
 import { processPendingRequests } from "../claudeBookingAgent";
 import { loadSession } from "../kv";
+import { requestRecovery, pollRecovery, completeRecovery, type RefreshCompletion } from "../sessionRecovery";
 
 const TG = (token: string) => `https://api.telegram.org/bot${token}`;
 const KV_KEY = "nativeHost:events";
@@ -345,27 +346,12 @@ export async function handleGetSession(c: Context<{ Bindings: Env }>) {
 // Refresh-on-demand: Telegram → triggers Native Host to run --setup
 // ====================================================================
 
-const KV_REFRESH_REQUEST = "nativeHost:refreshRequest";
-
-interface RefreshRequest {
-  requestedAt: string;
-  requestedBy: string; // chatId or name
-  pickedUpAt?: string; // when watcher saw it
-  completedAt?: string;
-}
-
 /**
- * Used by /sesion_renew Telegram command. Sets the flag for the local watcher
- * to pick up.
+ * Telegram and automatic checks share one recovery; cron does not replace
+ * its manual recipients, correlation ID, or retry deadline.
  */
 export async function requestRefresh(env: Env, requestedBy: string): Promise<void> {
-  const req: RefreshRequest = {
-    requestedAt: new Date().toISOString(),
-    requestedBy,
-  };
-  await env.STATE.put(KV_REFRESH_REQUEST, JSON.stringify(req), {
-    expirationTtl: 60 * 30, // request expires in 30 min if not picked up
-  });
+  await requestRecovery(env, requestedBy);
 }
 
 /**
@@ -378,34 +364,12 @@ export async function handleCheckRefresh(c: Context<{ Bindings: Env }>) {
     return c.json({ error: "unauthorized" }, 401);
   }
 
-  const raw = await c.env.STATE.get(KV_REFRESH_REQUEST);
-  if (!raw) return c.json({ pending: false });
-
-  let req: RefreshRequest;
-  try {
-    req = JSON.parse(raw);
-  } catch {
-    return c.json({ pending: false });
-  }
-
-  if (req.pickedUpAt) {
-    // Already picked up — don't re-trigger unless completed > 5 min ago
-    const since = Date.now() - new Date(req.pickedUpAt).getTime();
-    if (since < 5 * 60 * 1000) {
-      return c.json({ pending: false, alreadyPickedUp: true });
-    }
-  }
-
-  // Mark as picked up
-  req.pickedUpAt = new Date().toISOString();
-  await c.env.STATE.put(KV_REFRESH_REQUEST, JSON.stringify(req), { expirationTtl: 60 * 30 });
-
-  return c.json({ pending: true, requestedBy: req.requestedBy, requestedAt: req.requestedAt });
+  return c.json(await pollRecovery(c.env), 200, { "Cache-Control": "no-store" });
 }
 
 /**
- * Called by the Native Host after --setup completes (success or failure).
- * Clears the request and notifies whoever asked.
+ * The watcher echoes requestedAt. Failures retain the request and retry time;
+ * only a matching successful completion closes it.
  */
 export async function handleRefreshComplete(c: Context<{ Bindings: Env }>) {
   const token = c.req.header("X-Capture-Token");
@@ -413,43 +377,23 @@ export async function handleRefreshComplete(c: Context<{ Bindings: Env }>) {
     return c.json({ error: "unauthorized" }, 401);
   }
 
-  let body: { ok?: boolean; message?: string };
+  let body: RefreshCompletion;
   try {
     body = await c.req.json();
   } catch {
-    body = { ok: false, message: "invalid json" };
+    return c.json({ error: "invalid json" }, 400);
   }
-
-  const raw = await c.env.STATE.get(KV_REFRESH_REQUEST);
-  if (raw) {
-    try {
-      const req: RefreshRequest = JSON.parse(raw);
-      // Notify whoever requested
-      const txt = body.ok
-        ? "✅ <b>Sesión Bukeala renovada</b>\n\nYa puedes usar el bot normalmente."
-        : `❌ <b>La sesión aún no se pudo recuperar</b>\n\nMensaje: ${body.message ?? "n/a"}\n\nPuedes consultar /estado. El servicio respetará la espera antes de reintentar; repetir /sesion_renew no la acorta. Si se requiere verificación humana, habrá que completarla en el navegador que mantiene la sesión.`;
-      try {
-        await fetch(`${TG(c.env.TELEGRAM_BOT_TOKEN)}/sendMessage`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            chat_id: req.requestedBy,
-            text: txt,
-            parse_mode: "HTML",
-          }),
-        });
-      } catch (e) {
-        console.log("[refresh-complete] notify failed:", (e as Error).message);
-      }
-    } catch {
-      // ignore
-    }
+  if (!body || typeof body.ok !== "boolean" ||
+      (body.requestedAt !== undefined && typeof body.requestedAt !== "string") ||
+      (body.reasonCode !== undefined && typeof body.reasonCode !== "string")) {
+    return c.json({ error: "invalid completion" }, 400);
   }
-
-  await c.env.STATE.delete(KV_REFRESH_REQUEST);
+  const result = await completeRecovery(c.env, body);
+  // The watcher's durable outbox retries undelivered notifications without a new login.
+  if (!result.ok) return c.json(result, 503);
 
   // After a successful manual refresh, also process the pending queue
-  if (body.ok) {
+  if (body.ok && result.accepted) {
     c.executionCtx.waitUntil(
       processPendingRequests(c.env).catch((err) => {
         console.log("[refresh-complete] processPendingRequests failed:", err.message);
@@ -457,5 +401,5 @@ export async function handleRefreshComplete(c: Context<{ Bindings: Env }>) {
     );
   }
 
-  return c.json({ ok: true });
+  return c.json(result);
 }
