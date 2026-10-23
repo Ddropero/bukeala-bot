@@ -33,6 +33,7 @@ import { espejoCalendarCron } from "./cron/espejoCalendar";
 import { getDoctorRecipients } from "./users";
 import { processPendingRequests, loadPendingRequests } from "./claudeBookingAgent";
 import { requestRefresh } from "./handlers/nativeHostEvent";
+import { closeAutomaticRecovery, notifyRecoveryDelay, validComponentsResponse } from "./sessionRecovery";
 import { handleHandoffWebhook, setupHandoffWebhook } from "./handoffBot";
 import { handleQuotesWebhook, setupQuotesWebhook } from "./quotesBot";
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
@@ -937,6 +938,7 @@ async function keepAlive(env: Env): Promise<void> {
         console.log("[keepalive] refresh sin-sesión falló:", (e as Error).message);
       }
     }
+    await notifyRecoveryDelay(env);
     return;
   }
 
@@ -951,21 +953,11 @@ async function keepAlive(env: Env): Promise<void> {
 
   const b = new Bukeala(env);
   try {
-    // Doble ping: findCustomerPage + findAvailabilityPage — actividad genuina
-    // en ambos servlets (ambos comparten la JVM session, pero hacer 2 calls
-    // refuerza el "session is alive" en el backend).
-    const r1 = await b.findCustomerPage();
-    await r1.text();
-    console.log(`[keepalive] /findCustomer → ${r1.status}`);
-
-    try {
-      const r2 = await b.findAvailabilityPage();
-      await r2.text();
-      console.log(`[keepalive] /findAvailability → ${r2.status}`);
-    } catch (e2) {
-      // No bloqueante — la idea es que si una funciona, la otra puede fallar
-      console.log("[keepalive] findAvailability falló (no crítico):", (e2 as Error).message);
-    }
+    // Match the VM's authenticated check. A login page or HTTP 500 is not health.
+    const response = await b.loadComponents();
+    if (!(await validComponentsResponse(response))) throw new SessionExpiredError();
+    console.log("[keepalive] componentes autenticados verificados");
+    await closeAutomaticRecovery(env);
 
     // Telemetría: recordar el último ping OK de ESTA sesión (por capturedAt)
     // para medir su vida real cuando muera → stats:sessionLifetimes.
@@ -1060,37 +1052,9 @@ async function keepAlive(env: Env): Promise<void> {
       }
     }
 
-    // 2) Avisar al doctor. Ya NO se silencia de noche: la VM renueva 24/7, así
-    //    que una expiración nocturna es una falla real, no algo esperado.
-    // Throttle: máximo 1 aviso cada 30 min (antes borrábamos el flag con cada
-    // éxito, lo que causaba spam si la sesión fluctuaba). 30 min da tiempo a
-    // que el refresh auto se complete antes de un segundo aviso.
-    const alreadyNotified = await env.STATE.get("keepalive:notified");
-    if (alreadyNotified) {
-      console.log("[keepalive] notice already sent recently, skip");
-      return;
-    }
-    try {
-      const doctors = await getDoctorRecipients(env);
-      for (const doctorChatId of doctors) {
-        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            chat_id: doctorChatId,
-            text:
-              "⚠️ <b>Sesión Bukeala expirada</b>\n\n" +
-              "🤖 Auto-disparé un refresh. Si no se resuelve en ~2 min, corre /sesion_renew.",
-            parse_mode: "HTML",
-          }),
-        });
-      }
-      // Flag con TTL 30 min + timestamp para la lógica de limpieza de arriba.
-      await env.STATE.put("keepalive:notified", "1", { expirationTtl: 60 * 30 });
-      await env.STATE.put("keepalive:notifiedAt", String(Date.now()), { expirationTtl: 60 * 60 });
-    } catch (notifyErr) {
-      console.log("[keepalive] notify failed:", (notifyErr as Error).message);
-    }
+    // Let the cloud watcher recover first. A sustained incident is notified
+    // once, then its successful completion closes the notice automatically.
+    await notifyRecoveryDelay(env);
   }
 }
 

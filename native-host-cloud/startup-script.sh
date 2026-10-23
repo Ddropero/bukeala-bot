@@ -8,7 +8,8 @@ exec > /var/log/bukeala-setup.log 2>&1
 echo "=== Bukeala setup START $(date) ==="
 
 APP=/opt/bukeala
-mkdir -p "$APP"
+mkdir -p "$APP" /var/lib/bukeala/browser-profile
+chmod 700 /var/lib/bukeala /var/lib/bukeala/browser-profile
 
 # --- Node 20 (si no está) ---
 if ! command -v node >/dev/null 2>&1; then
@@ -26,18 +27,24 @@ CAS_PASSWORD=$(curl -s -H "$HDR" "$META/cas-password")
 TWO_CAPTCHA_API_KEY=$(curl -s -H "$HDR" "$META/twocaptcha-key")
 CAPTURE_TOKEN=$(curl -s -H "$HDR" "$META/capture-token")
 WORKER_URL=$(curl -s -H "$HDR" "$META/worker-url")
+BROWSER_SESSION_MODE=$(curl -fsS -H "$HDR" "$META/browser-session-mode" 2>/dev/null || true)
+ENABLE_FULL_LOGIN=$(curl -fsS -H "$HDR" "$META/enable-full-login" 2>/dev/null || true)
+BROWSER_SESSION_MODE=${BROWSER_SESSION_MODE:-persistent}
+ENABLE_FULL_LOGIN=${ENABLE_FULL_LOGIN:-0}
 
 cat > $APP/package.json <<'PKGEOF'
 {
   "name": "bukeala-native-host-cloud",
   "version": "1.0.0",
-  "description": "Bukeala session keeper 24/7 en Fly.io (sin PC/Mac prendido)",
+  "description": "Bukeala session keeper con perfil persistente en GCE o Fly.io",
   "private": true,
   "scripts": {
-    "start": "node watcher.js"
+    "start": "node watcher.js",
+    "test": "node --test persistentSession.test.js test/persistentWatcher.test.js",
+    "probe": "node persistentProbe.js"
   },
   "dependencies": {
-    "playwright": "^1.59.1",
+    "playwright": "1.59.1",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
@@ -76,10 +83,17 @@ cat > $APP/autoLogin.js <<'ALEOF'
 const path = require("node:path");
 const os = require("node:os");
 const fs = require("node:fs");
-const { chromium } = require("playwright-extra");
-const StealthPlugin = require("puppeteer-extra-plugin-stealth");
-
-try { chromium.use(StealthPlugin()); } catch { /* already applied */ }
+// Load legacy plugins only when a legacy entry point is used. The persistent
+// browser uses unmodified Playwright and the installed browser's actual UA.
+let legacyChromium;
+function getLegacyChromium() {
+  if (!legacyChromium) {
+    legacyChromium = require("playwright-extra").chromium;
+    const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+    try { legacyChromium.use(StealthPlugin()); } catch { /* already applied */ }
+  }
+  return legacyChromium;
+}
 
 const TWO_CAPTCHA_BASE = "https://2captcha.com";
 const TWO_CAPTCHA_POLL_INTERVAL_MS = 5000;
@@ -111,7 +125,7 @@ async function solveRecaptcha(twoCaptchaKey, sitekey, pageUrl, log) {
   const submitParams = new URLSearchParams({
     key: twoCaptchaKey, method: "userrecaptcha", googlekey: sitekey, pageurl: pageUrl, json: "1",
   });
-  const subRes = await fetch(`${TWO_CAPTCHA_BASE}/in.php?${submitParams}`);
+  const subRes = await fetch(`${TWO_CAPTCHA_BASE}/in.php?${submitParams}`, { signal: AbortSignal.timeout(20_000) });
   const subJson = await subRes.json();
   if (subJson.status !== 1) {
     // Saldo agotado u otro error fatal: propagar claro para abortar el ciclo.
@@ -121,7 +135,7 @@ async function solveRecaptcha(twoCaptchaKey, sitekey, pageUrl, log) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < TWO_CAPTCHA_MAX_WAIT_MS) {
     await new Promise((r) => setTimeout(r, TWO_CAPTCHA_POLL_INTERVAL_MS));
-    const pollRes = await fetch(`${TWO_CAPTCHA_BASE}/res.php?key=${twoCaptchaKey}&action=get&id=${captchaId}&json=1`);
+    const pollRes = await fetch(`${TWO_CAPTCHA_BASE}/res.php?key=${twoCaptchaKey}&action=get&id=${captchaId}&json=1`, { signal: AbortSignal.timeout(20_000) });
     const pollJson = await pollRes.json();
     if (pollJson.status === 1) { log("info", "2Captcha solved", { elapsedMs: Date.now() - startedAt }); return pollJson.request; }
     if (pollJson.request !== "CAPCHA_NOT_READY") throw new Error(`2Captcha poll failed: ${pollJson.request}`);
@@ -146,7 +160,7 @@ async function hasBukealaSession(context) {
  * 10 min durante ~28 min. /agenda caído todo ese rato sin que nadie lo supiera.
  * Con esta prueba, ese caso cae a login completo (~90 s) en el primer ciclo.
  */
-async function verifySessionWorks(context, log) {
+async function verifySessionWorks(context, log, opts = {}) {
   try {
     const url = `${BUKEALA_BASE}${VERIFY_PATH}&_=${Date.now()}`;
     const res = await context.request.get(url, {
@@ -161,24 +175,39 @@ async function verifySessionWorks(context, log) {
     const status = res.status();
     if (status !== 200) {
       log("warn", "verificación de sesión falló", { status });
-      return { ok: false, detail: `status ${status}` };
+      return { ok: false, detail: `status ${status}`, status, authRequired: status === 401 || status === 403 || status === 302, retryable: status >= 500 };
     }
     const body = (await res.text().catch(() => "")).trim();
     // Con sesión viva loadComponents devuelve un array JSON.
-    if (!body.startsWith("[") && !body.startsWith("{")) {
-      log("warn", "verificación de sesión: respuesta no-JSON", { head: body.slice(0, 60) });
-      return { ok: false, detail: "respuesta no-JSON" };
+    let parsed;
+    try { parsed = JSON.parse(body); } catch {
+      log("warn", "verificación de sesión: respuesta no-JSON");
+      return { ok: false, detail: "respuesta no-JSON", inconclusive: true };
+    }
+    if (opts.strict && !isComponentsResponse(parsed)) {
+      log("warn", "verificación de sesión: estructura no reconocida");
+      return { ok: false, detail: "estructura loadComponents no reconocida", inconclusive: true };
     }
     return { ok: true, detail: `200 (${body.length} bytes)` };
   } catch (e) {
     log("warn", "verificación de sesión lanzó", { error: e.message });
-    return { ok: false, detail: e.message };
+    return { ok: false, detail: e.message, retryable: true };
   }
+}
+
+/** Strict success shape for the authenticated loadComponents endpoint. */
+function isComponentsResponse(value) {
+  return Array.isArray(value) && value.length > 0 && value.every((row) =>
+    row && typeof row === "object" && !Array.isArray(row) &&
+    Number.isFinite(row.id) && typeof row.code === "string" && row.code.trim().length > 0 &&
+    typeof row.description === "string"
+  );
 }
 
 /**
  * Verificación AUTORITATIVA: le pregunta al WORKER si la sesión que acabamos
- * de empujar le sirve (GET /debug/measure → {alive:true|false}).
+ * de empujar le sirve. El modo estricto consulta /debug/components y valida
+ * el cuerpo real; el modo legacy conserva /debug/measure.
  *
  * Por qué no basta verifySessionWorks(): esa prueba usa las cookies del
  * NAVEGADOR, y el Worker solo recibe el subconjunto que captureAndPush filtra
@@ -187,15 +216,36 @@ async function verifySessionWorks(context, log) {
  * el Worker recibe 302. Eso es lo que pasó el 29/jul: pushes de 14 cookies
  * "OK" con /agenda caído. Esta prueba mide justo lo que importa.
  */
-async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log) {
+async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log, opts = {}) {
   const base = WORKER_URL.replace(/\/capture$/, "");
-  const url = `${base}/debug/measure?token=${encodeURIComponent(CAPTURE_TOKEN)}`;
+  const resource = opts.strict ? "components" : "measure";
+  const url = `${base}/debug/${resource}?token=${encodeURIComponent(CAPTURE_TOKEN)}`;
 
   // Un intento: distingue VEREDICTO ({alive:true/false}) de AMBIGUO (5xx, red,
   // cuerpo no-JSON). Solo un veredicto explícito de "no sirve" descarta la sesión.
   async function attempt() {
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+      const res = await fetch(url, {
+        signal: AbortSignal.timeout(20_000),
+        ...(opts.strict ? { redirect: "manual" } : {}),
+      });
+      if (opts.strict) {
+        const status = res.status;
+        if (status !== 200) {
+          return {
+            verdict: status === 401 || status === 403 ? "malo" : "ambiguo",
+            detail: `worker-components-http-${status}`, status,
+          };
+        }
+        let components;
+        try { components = JSON.parse(await res.text()); } catch {
+          return { verdict: "malo", detail: "worker-components-invalid-json", status };
+        }
+        if (!isComponentsResponse(components)) {
+          return { verdict: "malo", detail: "worker-components-invalid-shape", status };
+        }
+        return { verdict: "ok", detail: "worker-components-verified", status, componentCount: components.length };
+      }
       if (!res.ok) return { verdict: "ambiguo", detail: `worker HTTP ${res.status}` };
       const text = await res.text();
       let data;
@@ -209,7 +259,7 @@ async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log) {
       }
       return { verdict: "ambiguo", detail: "respuesta sin campo alive" };
     } catch (e) {
-      return { verdict: "ambiguo", detail: e.message };
+      return { verdict: "ambiguo", detail: opts.strict ? "worker-components-network-error" : e.message };
     }
   }
 
@@ -220,10 +270,17 @@ async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log) {
     r = await attempt();
   }
 
-  if (r.verdict === "ok") return { ok: true, detail: r.detail };
+  if (r.verdict === "ok") return {
+    ok: true, detail: r.detail,
+    ...(opts.strict ? { status: r.status, componentCount: r.componentCount } : {}),
+  };
   if (r.verdict === "malo") {
     log("warn", "verify via worker: el Worker NO puede usar la sesión", { detail: r.detail });
-    return { ok: false, detail: r.detail };
+    return { ok: false, detail: r.detail, ...(opts.strict ? { status: r.status } : {}) };
+  }
+  if (opts.strict) {
+    log("warn", "verify via worker inconcluso tras reintento");
+    return { ok: false, inconclusive: true, retryable: true, detail: "worker-verification-inconclusive" };
   }
   // AMBIGUO tras reintento: asumir OK. verifySessionWorks() ya validó la sesión
   // contra Bukeala desde el navegador; tirar el navegador vivo por no poder
@@ -334,6 +391,7 @@ async function captureAndPush(context, WORKER_URL, CAPTURE_TOKEN, log) {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Capture-Token": CAPTURE_TOKEN },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(20_000),
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Worker rejected: ${res.status} ${JSON.stringify(body).slice(0, 200)}`);
@@ -439,7 +497,7 @@ async function runAutoLogin(env, opts = {}) {
   const STATE_FILE = env.STATE_FILE || path.join(os.homedir(), ".bukeala-tgc.json");
   log("info", "credentials from env", { user: creds.username });
 
-  const browser = await chromium.launch({
+  const browser = await getLegacyChromium().launch({
     headless: true,
     args: ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
   });
@@ -712,7 +770,7 @@ async function adoptSession(env) {
     }
     log("info", "sesión recibida del Worker", { cookies: data.cookies.length, edadMin: data.edadMin });
 
-    browser = await chromium.launch({
+    browser = await getLegacyChromium().launch({
       headless: true,
       args: ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
     });
@@ -746,7 +804,13 @@ async function adoptSession(env) {
   }
 }
 
-module.exports = { runAutoLogin, keepAliveInPlace, adoptSession };
+module.exports = {
+  runAutoLogin, keepAliveInPlace, adoptSession,
+  sessionHelpers: {
+    BUKEALA_HOME, hasBukealaSession, submitCasForm, verifySessionWorks,
+    captureAndPush, verifyViaWorker, isComponentsResponse,
+  },
+};
 
 ALEOF
 
@@ -1112,12 +1176,704 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  log("error", "fatal", { error: err.message, stack: err.stack });
+const start = process.env.BROWSER_SESSION_MODE === "persistent"
+  ? () => require("./persistentWatcher").main()
+  : main;
+
+start().catch(() => {
+  log("error", "fatal", { mode: process.env.BROWSER_SESSION_MODE || "legacy" });
   process.exit(2);
 });
 
 WEOF
+
+cat > "$APP/persistentSession.js" <<'MODULEEOF'
+/**
+ * One persistent Chromium profile, including CAS/browser state across restarts.
+ * No legacy cookie import, profile reset, UA override, or stealth plugin.
+ *
+ * Full login requires ENABLE_FULL_LOGIN=1. A failed attempt has a durable
+ * cooldown (at least 30 minutes), including after process restarts.
+ * publish:false verifies in the browser without writing to the Worker.
+ */
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { randomUUID } = require("node:crypto");
+const { sessionHelpers } = require("./autoLogin");
+
+const CAS_ENTRY = "https://app01.colsanitas.com/cas/login?service=" +
+  encodeURIComponent("https://appoint.tuscitasmedicas.com/keraltyadscritos/cas/login");
+const MIN_LOGIN_COOLDOWN_MS = 30 * 60 * 1000;
+const SAFE_PATHS = new Set(["/", "/cas/login", "/authentication/login",
+  "/keraltyadscritos/cas/login", "/keraltyadscritos/findAvailability"]);
+
+function safeLocation(value) {
+  try {
+    const url = new URL(value);
+    return url.origin + (SAFE_PATHS.has(url.pathname) ? url.pathname : "/[redacted]");
+  } catch { return null; }
+}
+
+function isCasFormLocation(value) {
+  try {
+    const url = new URL(value);
+    return url.hostname === "app01.colsanitas.com" && url.pathname === "/cas/login";
+  } catch { return false; }
+}
+
+function isAuthChallenge(value) {
+  try {
+    const host = new URL(value).hostname;
+    return host !== "appoint.tuscitasmedicas.com" && host !== "app01.colsanitas.com";
+  } catch { return true; }
+}
+
+function relevantDomain(value) {
+  const domain = String(value || "").toLowerCase().replace(/^\./, "");
+  return domain === "tuscitasmedicas.com" || domain.endsWith(".tuscitasmedicas.com") ||
+    domain === "colsanitas.com" || domain.endsWith(".colsanitas.com");
+}
+
+function prepareProfile(directory) {
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const stat = fs.lstatSync(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe-profile-directory");
+  if (process.platform !== "win32") fs.chmodSync(directory, 0o700);
+}
+
+function createPersistentSessionManager(env, options = {}) {
+  const profileDir = path.resolve(env.BROWSER_PROFILE_DIR || path.join(os.homedir(), ".bukeala-browser"));
+  const stateFile = path.join(profileDir, "session-keeper.json");
+  const publish = options.publish !== false;
+  const helpers = { ...sessionHelpers, ...options.helpers };
+  const now = options.now || Date.now;
+  const configuredCooldown = Number(env.FULL_LOGIN_COOLDOWN_MS);
+  const cooldownMs = Number.isFinite(configuredCooldown)
+    ? Math.max(MIN_LOGIN_COOLDOWN_MS, configuredCooldown) : MIN_LOGIN_COOLDOWN_MS;
+  let context = null;
+  let page = null;
+  let inFlight = false;
+  let closed = false;
+  let seeded = false;
+  let state;
+
+  // Messages/metadata from legacy helpers may contain full URLs or server
+  // bodies. Forward only fixed messages and numeric diagnostics.
+  function log(level, event, metadata = {}) {
+    if (typeof env.log !== "function") return;
+    const safe = {};
+    for (const key of ["status", "elapsedMs", "cookieCount", "count"]) {
+      if (typeof metadata[key] === "number") safe[key] = metadata[key];
+    }
+    env.log(level, event, safe);
+  }
+  function helperLog(level, _message, metadata) {
+    log(level, "persistent-session helper diagnostic", metadata);
+  }
+
+  function readState() {
+    if (state) return state;
+    prepareProfile(profileDir);
+    if (!fs.existsSync(stateFile)) return (state = {});
+    if (fs.lstatSync(stateFile).isSymbolicLink()) throw new Error("unsafe-profile-state");
+    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid-profile-state");
+    for (const key of ["lastFullLoginAttemptAt", "lastFullLoginSuccessAt", "seededAt"]) {
+      if (parsed[key] !== undefined && (!Number.isFinite(parsed[key]) || parsed[key] < 0)) {
+        throw new Error("invalid-profile-state");
+      }
+    }
+    return (state = parsed);
+  }
+
+  function saveState() {
+    prepareProfile(profileDir);
+    const temp = `${stateFile}.${randomUUID()}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(state), { encoding: "utf8", mode: 0o600, flag: "wx" });
+    if (process.platform !== "win32") fs.chmodSync(temp, 0o600);
+    fs.renameSync(temp, stateFile);
+  }
+
+  async function ensureContext() {
+    if (closed) throw new Error("manager-closed");
+    readState();
+    if (context) {
+      if (!page || page.isClosed()) page = await context.newPage();
+      return;
+    }
+    const chromium = options.chromium || require("playwright").chromium;
+    const headless = options.headless === undefined ? env.BROWSER_HEADLESS !== "0" : options.headless !== false;
+    const launched = await chromium.launchPersistentContext(profileDir, {
+      headless,
+      viewport: headless ? { width: 1366, height: 800 } : null,
+      locale: "es-CO",
+      timezoneId: "America/Bogota",
+      args: ["--no-sandbox", "--disable-dev-shm-usage", "--restore-last-session",
+        ...(!headless ? ["--start-maximized"] : [])],
+      timeout: 60_000,
+    });
+    context = launched;
+    context.on("close", () => {
+      if (context === launched) { context = null; page = null; }
+    });
+    page = context.pages().find(candidate => !candidate.isClosed()) || await context.newPage();
+    log("info", "persistent browser profile opened");
+  }
+
+  function result(overrides = {}) {
+    return {
+      ok: false, via: seeded ? "persistent-adopted" : "persistent",
+      authenticated: false, published: false, captureAccepted: false,
+      workerVerified: false, loginAttempted: false, needsFullLogin: false,
+      retryable: false, authBlocked: false,
+      postNavUrl: page && !page.isClosed() ? safeLocation(page.url()) : null,
+      ...overrides,
+    };
+  }
+
+  async function navigate(target) {
+    await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForTimeout(1500);
+  }
+
+  async function renew(renewOptions = {}) {
+    if (inFlight) return result({ reasonCode: "busy", reason: "persistent-operation-in-progress", retryable: true });
+    inFlight = true;
+    let authenticated = false;
+    let loginAttempted = false;
+    let captureAccepted = false;
+    let stage = "profile";
+    try {
+      await ensureContext();
+      stage = "navigation";
+      await navigate(helpers.BUKEALA_HOME);
+      if (isAuthChallenge(page.url())) {
+        return result({ reasonCode: "auth-challenge", reason: "authentication-challenge", authBlocked: true });
+      }
+
+      stage = "verification";
+      let verification = isCasFormLocation(page.url()) ? { ok: false, authRequired: true }
+        : await helpers.verifySessionWorks(context, helperLog, { strict: true });
+      // Only an explicit authentication rejection can initiate CAS renewal.
+      // A timeout, invalid JSON or server error preserves the current context.
+      if (!verification.ok && verification.authRequired && !isCasFormLocation(page.url())) {
+        stage = "navigation";
+        await navigate(CAS_ENTRY);
+        if (isAuthChallenge(page.url())) {
+          return result({ reasonCode: "auth-challenge", reason: "authentication-challenge", authBlocked: true });
+        }
+        stage = "verification";
+        verification = isCasFormLocation(page.url()) ? { ok: false, authRequired: true }
+          : await helpers.verifySessionWorks(context, helperLog, { strict: true });
+      }
+
+      if (!verification.ok && isCasFormLocation(page.url())) {
+        const visibleForm = await Promise.all([
+          page.locator('input[name="username"], input#username').first().waitFor({ state: "visible", timeout: 10000 }),
+          page.locator('input[name="password"], input#password').first().waitFor({ state: "visible", timeout: 10000 }),
+        ]).then(() => true, () => false);
+        if (!visibleForm) {
+          return result({ reasonCode: "login-form-unavailable", reason: "login-form-unavailable", authBlocked: true });
+        }
+        if (env.ENABLE_FULL_LOGIN !== "1" || renewOptions.allowFullLogin === false) {
+          return result({ reasonCode: "full-login-disabled", reason: "full-login-disabled", needsFullLogin: true });
+        }
+        if (!env.CAS_USERNAME || !env.CAS_PASSWORD || !env.TWO_CAPTCHA_API_KEY) {
+          return result({ reasonCode: "login-config-missing", reason: "login-config-missing", needsFullLogin: true });
+        }
+        const lastAttempt = state.lastFullLoginAttemptAt || 0;
+        const lastSuccess = state.lastFullLoginSuccessAt || 0;
+        if (lastAttempt > lastSuccess && now() - lastAttempt < cooldownMs) {
+          return result({
+            reasonCode: "full-login-cooldown", reason: "full-login-cooldown",
+            needsFullLogin: true, retryable: true,
+            nextLoginAt: new Date(lastAttempt + cooldownMs).toISOString(),
+          });
+        }
+        // Persist before submission, so a crash cannot reset the attempt limit.
+        state.lastFullLoginAttemptAt = now();
+        state.lastFullLoginSuccessAt = 0;
+        saveState();
+        loginAttempted = true;
+        stage = "full-login";
+        await helpers.submitCasForm(page, {
+          username: env.CAS_USERNAME, password: env.CAS_PASSWORD,
+        }, env.TWO_CAPTCHA_API_KEY, helperLog);
+        if (isAuthChallenge(page.url()) || isCasFormLocation(page.url())) {
+          return result({
+            via: "persistent-login", loginAttempted, needsFullLogin: true,
+            reasonCode: "full-login-rejected", reason: "full-login-rejected", authBlocked: true,
+          });
+        }
+        stage = "verification";
+        verification = await helpers.verifySessionWorks(context, helperLog, { strict: true });
+      }
+
+      if (!verification.ok || !(await helpers.hasBukealaSession(context))) {
+        return result({
+          loginAttempted, via: loginAttempted ? "persistent-login" : result().via,
+          reasonCode: "browser-verification-failed", reason: "browser-verification-failed",
+          needsFullLogin: !!verification.authRequired, retryable: !verification.authRequired,
+        });
+      }
+      authenticated = true;
+      state.validated = true;
+      if (loginAttempted) state.lastFullLoginSuccessAt = now();
+      saveState();
+      const via = loginAttempted ? "persistent-login" : result().via;
+      if (!publish) {
+        const cookieCount = (await context.cookies()).filter(cookie => relevantDomain(cookie.domain)).length;
+        return result({ ok: true, via, authenticated, loginAttempted, cookieCount });
+      }
+      if (!env.WORKER_URL || !env.CAPTURE_TOKEN) {
+        return result({ via, authenticated, loginAttempted, reasonCode: "publish-config-missing", reason: "publish-config-missing" });
+      }
+      stage = "publication";
+      const cookieCount = await helpers.captureAndPush(context, env.WORKER_URL, env.CAPTURE_TOKEN, helperLog);
+      captureAccepted = true;
+      const worker = await helpers.verifyViaWorker(env.WORKER_URL, env.CAPTURE_TOKEN, helperLog, { strict: true });
+      if (!worker.ok) {
+        return result({
+          via, authenticated, loginAttempted, captureAccepted, cookieCount, retryable: true,
+          reasonCode: worker.inconclusive ? "worker-verification-inconclusive" : "worker-verification-failed",
+          reason: worker.inconclusive ? "worker-verification-inconclusive" : "worker-verification-failed",
+        });
+      }
+      return result({
+        ok: true, via, authenticated, loginAttempted, captureAccepted,
+        published: true, workerVerified: true, cookieCount,
+      });
+    } catch (error) {
+      // Do not return browser errors: they can embed login URLs, submitted
+      // credential values, cookies, or server bodies. Fixed codes suffice.
+      const reasonCode = `${stage}-failed`;
+      log("warn", "persistent session operation failed");
+      return result({
+        authenticated, loginAttempted, captureAccepted,
+        via: loginAttempted ? "persistent-login" : result().via,
+        reasonCode, reason: reasonCode, retryable: stage !== "full-login",
+        needsFullLogin: stage === "full-login", authBlocked: stage === "full-login",
+      });
+    } finally {
+      inFlight = false;
+    }
+  }
+
+  /**
+   * Explicit one-time migration only. Never called by renew(). Refuses to
+   * overwrite any existing relevant cookies or a previously validated profile.
+   * Caller must obtain an authorized fresh snapshot and then call renew().
+   */
+  async function seedCookies(cookies, { capturedAt } = {}) {
+    if (inFlight) return result({ reasonCode: "busy", reason: "persistent-operation-in-progress" });
+    inFlight = true;
+    try {
+      await ensureContext();
+      const timestamp = Date.parse(capturedAt);
+      if (!Number.isFinite(timestamp) || timestamp > now() + 60_000 || now() - timestamp > 30 * 60_000) {
+        return result({ reasonCode: "seed-not-fresh", reason: "seed-not-fresh" });
+      }
+      if (state.validated || state.seededAt || (await context.cookies()).some(cookie => relevantDomain(cookie.domain))) {
+        return result({ reasonCode: "profile-already-populated", reason: "profile-already-populated" });
+      }
+      if (!Array.isArray(cookies) || !cookies.length) return result({ reasonCode: "seed-empty", reason: "seed-empty" });
+      const filtered = cookies.filter(cookie =>
+        cookie && relevantDomain(cookie.domain) && typeof cookie.name === "string" &&
+        typeof cookie.value === "string" && cookie.value.length > 0 &&
+        (cookie.expires === undefined || cookie.expires === -1 || cookie.expires > now() / 1000) &&
+        !(cookie.name === "JSESSIONID" && !String(cookie.domain).includes("tuscitasmedicas.com"))
+      ).map(cookie => ({
+        name: cookie.name, value: cookie.value, domain: cookie.domain,
+        path: cookie.path || "/", httpOnly: !!cookie.httpOnly, secure: cookie.secure !== false,
+        ...(typeof cookie.expires === "number" && cookie.expires > 0 ? { expires: cookie.expires } : {}),
+        ...(["Strict", "Lax", "None"].includes(cookie.sameSite) ? { sameSite: cookie.sameSite } : {}),
+      }));
+      if (!filtered.some(cookie => cookie.name === "JSESSIONID")) {
+        return result({ reasonCode: "seed-no-bukeala-session", reason: "seed-no-bukeala-session" });
+      }
+      state.seededAt = timestamp;
+      saveState();
+      await context.addCookies(filtered);
+      seeded = true;
+      return result({ ok: true, seeded: true, cookieCount: filtered.length });
+    } catch {
+      return result({ reasonCode: "seed-failed", reason: "seed-failed" });
+    } finally { inFlight = false; }
+  }
+
+  async function close() {
+    if (inFlight) throw new Error("persistent-operation-in-progress");
+    closed = true;
+    const active = context;
+    context = null;
+    page = null;
+    if (active) await active.close();
+  }
+
+  // Available only to the explicit, non-publishing probe. This simulates
+  // losing local auth cookies; it never logs out CAS/server-side.
+  async function simulateAppSessionLoss({ includeSso = false } = {}) {
+    if (publish || options.expiryProbe !== true) throw new Error("probe-only-operation");
+    if (inFlight) throw new Error("persistent-operation-in-progress");
+    inFlight = true;
+    try {
+      await ensureContext();
+      if (!state.validated) throw new Error("probe-requires-validated-session");
+      const cookies = await context.cookies();
+      const sessions = cookies.filter(cookie => cookie.name === "JSESSIONID" &&
+        /(^|\.)tuscitasmedicas\.com$/i.test(cookie.domain.replace(/^\./, "")));
+      if (!sessions.length) throw new Error("probe-session-missing");
+      const sso = includeSso ? cookies.filter(cookie =>
+        /(^|\.)colsanitas\.com$/i.test(cookie.domain.replace(/^\./, "")) &&
+        (cookie.name === "JSESSIONID" || /^(?:TGC|CASTGC)/i.test(cookie.name))) : [];
+      if (includeSso && !sso.some(cookie => /^(?:TGC|CASTGC)/i.test(cookie.name))) {
+        throw new Error("probe-sso-session-missing");
+      }
+      for (const cookie of [...sessions, ...sso]) {
+        await context.clearCookies({ name: cookie.name, domain: cookie.domain, path: cookie.path });
+      }
+      return { removedSessionCookies: sessions.length, ...(includeSso ? { removedSsoCookies: sso.length } : {}) };
+    } finally { inFlight = false; }
+  }
+
+  return {
+    renew, seedCookies, close, profileDir,
+    ...(!publish && options.expiryProbe === true ? { simulateAppSessionLoss } : {}),
+  };
+}
+
+module.exports = { createPersistentSessionManager, safeLocation };
+
+MODULEEOF
+
+cat > "$APP/persistentWatcher.js" <<'MODULEEOF'
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+const { setTimeout: sleep } = require("node:timers/promises");
+
+function numberOption(value, fallback, minimum) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= minimum ? n : fallback;
+}
+
+function safeResult(result) {
+  return {
+    ok: result?.ok === true,
+    authenticated: result?.authenticated === true,
+    published: result?.published === true,
+    workerVerified: result?.workerVerified === true,
+    loginAttempted: result?.loginAttempted === true,
+    via: result?.via || "persistent",
+    reasonCode: result?.reasonCode || null,
+  };
+}
+
+function createPersistentWatcher(env, options = {}) {
+  if (!env.WORKER_URL || !env.CAPTURE_TOKEN) throw new Error("WORKER_URL y CAPTURE_TOKEN son obligatorios");
+  const base = new URL(env.WORKER_URL);
+  if (base.protocol !== "https:" || base.username || base.password) throw new Error("WORKER_URL debe ser HTTPS");
+  base.pathname = base.pathname.replace(/\/capture\/?$/, "").replace(/\/$/, "");
+  base.search = "";
+  base.hash = "";
+  const profileDir = env.BROWSER_PROFILE_DIR || path.join(os.homedir(), ".bukeala-browser");
+  fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  const statusFile = path.join(profileDir, "watcher-status.json");
+  const manager = options.manager || require("./persistentSession").createPersistentSessionManager(env);
+  const fetchImpl = options.fetch || fetch;
+  const now = options.now || Date.now;
+  const logger = options.log || ((level, message, meta = {}) =>
+    console.log(JSON.stringify({ ts: new Date(now()).toISOString(), level, message, ...meta })));
+  const intervalMs = numberOption(env.PROACTIVE_INTERVAL_MS, 600000, 60000);
+  const pollMs = numberOption(env.POLL_INTERVAL_MS, 30000, 1000);
+  let status = { version: 1, successfulCycles: 0, fullLogins: 0, failures: 0, nextAttemptAt: 0 };
+  try {
+    const previous = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+    if (previous.version === 1) status = { ...status, ...previous };
+  } catch { /* First boot or interrupted status file: profile itself remains authoritative. */ }
+  status.startedAt = new Date(now()).toISOString();
+  let inFlight = false;
+  let closed = false;
+  let reportingCompletion = false;
+
+  function persist() {
+    const temp = `${statusFile}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(status, null, 2), { mode: 0o600 });
+    fs.renameSync(temp, statusFile);
+  }
+
+  async function request(route, body) {
+    const response = await fetchImpl(`${base.href.replace(/\/$/, "")}${route}`, {
+      method: body ? "POST" : "GET",
+      headers: { "X-Capture-Token": env.CAPTURE_TOKEN, ...(body ? { "Content-Type": "application/json" } : {}) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok) throw new Error(`HTTP_${response.status}`);
+    return await response.json();
+  }
+
+  async function report(route, body) {
+    try { await request(route, body); }
+    catch { logger("warn", "telemetría no disponible", { route }); }
+  }
+
+  async function flushCompletion() {
+    const completion = status.completionOutbox;
+    if (!completion || reportingCompletion || now() < (status.completionRetryAt || 0)) return;
+    reportingCompletion = true;
+    try {
+      // Keep the result across restarts/network failures. A stale result is
+      // acknowledged by the Worker without changing a different request.
+      const acknowledgement = await request("/native-host/refresh-complete", completion);
+      if (acknowledgement?.ok !== true) throw new Error("completion-not-acknowledged");
+      if (status.completionOutbox === completion) {
+        delete status.completionOutbox;
+        delete status.completionRetryAt;
+        persist();
+      }
+    } catch {
+      status.completionRetryAt = now() + pollMs;
+      persist();
+      logger("warn", "confirmación de renovación pendiente");
+    } finally {
+      reportingCompletion = false;
+    }
+  }
+
+  function retryMs(result) {
+    // The session manager also persists its full-login cooldown across restarts.
+    if (/captcha|blocked|credential|login|cooldown|challenge|config/i.test(result.reasonCode || "")) {
+      return Math.min(3600000, 1800000 * Math.max(1, status.failures));
+    }
+    return Math.min(600000, 90000 * Math.max(1, status.failures));
+  }
+
+  async function runCycle(reason = "scheduled") {
+    if (closed || inFlight) return { skipped: true, reason: "busy" };
+    // A new process must reopen a healthy profile immediately, even if it
+    // stopped during the previous success's short polling throttle. Failed
+    // cycles retain their durable retry deadline, including on startup.
+    const resumeHealthyProfile = reason === "startup" && status.failures === 0;
+    if (now() < status.nextAttemptAt && !resumeHealthyProfile) return { skipped: true, reason: "backoff" };
+    inFlight = true;
+    const completionRequest = status.pendingRequest || status.completionOutbox?.requestedAt;
+    status.lastAttemptAt = new Date(now()).toISOString();
+    let result;
+    try {
+      result = await manager.renew();
+    } catch {
+      result = { ok: false, authenticated: false, reasonCode: "cycle_exception" };
+    }
+    try {
+      const summary = safeResult(result);
+      // A browser that works alone is not yet a working Worker session.
+      summary.ok = summary.ok && summary.authenticated && summary.published && summary.workerVerified;
+      status.lastResult = summary;
+      status.lastCompletedAt = new Date(now()).toISOString();
+      if (summary.ok) {
+        status.lastSuccessAt = status.lastCompletedAt;
+        status.successfulCycles++;
+        status.failures = 0;
+        status.nextAttemptAt = now() + Math.min(pollMs, 30000);
+        status.nextScheduledAt = now() + intervalMs;
+      } else {
+        status.failures++;
+        status.nextAttemptAt = now() + retryMs(summary);
+        status.nextScheduledAt = status.nextAttemptAt;
+      }
+      if (summary.loginAttempted && summary.authenticated) {
+        status.fullLogins++;
+        status.lastFullLoginAt = status.lastCompletedAt;
+      }
+      if (completionRequest) {
+        status.completionOutbox = {
+          requestedAt: completionRequest,
+          completedAt: status.lastCompletedAt,
+          ok: summary.ok,
+          ...(summary.reasonCode ? { reasonCode: summary.reasonCode } : {}),
+          nextAttemptAt: summary.ok ? undefined : status.nextAttemptAt,
+          message: summary.ok ? "Sesión persistente verificada" : "La VM reintentará automáticamente",
+        };
+        delete status.completionRetryAt;
+        if (summary.ok) {
+          status.lastCompletedRequest = completionRequest;
+          delete status.pendingRequest;
+        } else {
+          // A newer verification supersedes an undelivered old success, also
+          // when a process restart discovers that the session no longer works.
+          status.pendingRequest = completionRequest;
+          if (status.lastCompletedRequest === completionRequest) delete status.lastCompletedRequest;
+        }
+      }
+      persist();
+      logger(summary.ok ? "info" : "warn", "ciclo persistente", { reason, ...summary });
+      await report("/native-host/event", {
+        type: summary.ok ? "ok" : "error",
+        via: summary.via,
+        at: status.lastCompletedAt,
+        hadBukealaJsession: summary.authenticated,
+        message: summary.ok ? "persistent: navegador y Worker verificados" : `persistent: ${summary.reasonCode || "unverified"}`,
+      });
+      await flushCompletion();
+      return summary;
+    } finally {
+      inFlight = false;
+    }
+  }
+
+  async function tick() {
+    if (closed || inFlight) return;
+    await flushCompletion();
+    if (now() < status.nextAttemptAt) return;
+    let pending = null;
+    try { pending = await request("/native-host/check-refresh"); }
+    catch { logger("warn", "no se pudo leer orden remota"); }
+    if (pending?.pending && typeof pending.requestedAt === "string" &&
+        pending.requestedAt !== status.lastCompletedRequest) {
+      status.lastRequest = pending.requestedAt;
+      status.pendingRequest = pending.requestedAt;
+      persist();
+      await runCycle("on-demand");
+      return;
+    }
+    if (now() >= (status.nextScheduledAt || 0)) await runCycle("scheduled");
+  }
+
+  async function close() {
+    if (closed) return;
+    closed = true;
+    // SIGTERM should finish the current cycle before Chromium flushes its profile.
+    while (inFlight) await sleep(100);
+    await manager.close();
+    status.stoppedAt = new Date(now()).toISOString();
+    persist();
+  }
+
+  async function run(signal) {
+    // Failed attempts keep their deadline; healthy profiles reopen immediately.
+    await runCycle("startup");
+    while (!signal?.aborted && !closed) {
+      try { await sleep(pollMs, undefined, { signal }); }
+      catch (error) { if (error.name === "AbortError") break; throw error; }
+      if (!signal?.aborted) await tick();
+    }
+    await close();
+  }
+  return { run, runCycle, tick, close, getStatus: () => ({ ...status }) };
+}
+
+async function main(env = process.env) {
+  const controller = new AbortController();
+  const stop = () => controller.abort();
+  process.once("SIGTERM", stop);
+  process.once("SIGINT", stop);
+  const watcher = createPersistentWatcher(env);
+  try { await watcher.run(controller.signal); }
+  finally {
+    await watcher.close();
+    process.removeListener("SIGTERM", stop);
+    process.removeListener("SIGINT", stop);
+  }
+}
+
+module.exports = { createPersistentWatcher, safeResult, main };
+if (require.main === module) {
+  main().catch(() => {
+    console.error(JSON.stringify({ level: "error", message: "persistent watcher stopped unexpectedly" }));
+    process.exitCode = 2;
+  });
+}
+
+MODULEEOF
+
+cat > "$APP/persistentProbe.js" <<'MODULEEOF'
+"use strict";
+
+// This diagnostic never publishes a session or invokes messaging endpoints.
+// --seed-worker is explicit migration only; normal tests never import cookies.
+const fs = require("node:fs");
+const { createPersistentSessionManager } = require("./persistentSession");
+const { safeResult } = require("./persistentWatcher");
+
+async function main() {
+  if (!process.env.BROWSER_PROFILE_DIR) throw new Error("BROWSER_PROFILE_DIR required");
+  const seed = process.argv.includes("--seed-worker");
+  const restart = process.argv.includes("--restart");
+  const allowLogin = process.argv.includes("--allow-login");
+  const simulateSso = process.argv.includes("--simulate-sso-expiry");
+  const simulateExpiry = simulateSso || process.argv.includes("--simulate-app-expiry");
+  if (simulateSso && !allowLogin) throw new Error("SSO expiry simulation requires --allow-login");
+  const results = [];
+  let manager;
+  try {
+    manager = createPersistentSessionManager(process.env, { publish: false, expiryProbe: simulateExpiry });
+    if (seed) {
+      const base = process.env.WORKER_URL.replace(/\/capture\/?$/, "");
+      const response = await fetch(`${base}/native-host/session`, {
+        headers: { "X-Capture-Token": process.env.CAPTURE_TOKEN },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok) throw new Error("seed-fetch-failed");
+      const snapshot = await response.json();
+      const seeded = await manager.seedCookies(snapshot.cookies, { capturedAt: snapshot.capturedAt });
+      results.push({ phase: "explicit-migration", ok: seeded.ok, reasonCode: seeded.reasonCode || null });
+      if (!seeded.ok) return results;
+    }
+    const first = await manager.renew({ allowFullLogin: allowLogin });
+    results.push({ phase: "initial", ...safeResult(first) });
+    let last = first;
+    if (simulateExpiry && first.authenticated) {
+      const reset = await manager.simulateAppSessionLoss({ includeSso: simulateSso });
+      last = await manager.renew({ allowFullLogin: allowLogin });
+      results.push({ phase: simulateSso ? "after-controlled-sso-session-loss" : "after-controlled-app-session-loss",
+        ...reset, ...safeResult(last) });
+    }
+    await manager.close();
+    manager = null;
+    if (restart && last.authenticated) {
+      manager = createPersistentSessionManager(process.env, { publish: false });
+      const restored = await manager.renew({ allowFullLogin: false });
+      results.push({ phase: "after-browser-restart", ...safeResult(restored) });
+    }
+    return results;
+  } catch {
+    results.push({ phase: "probe-error", ok: false, reasonCode: "probe-failed" });
+    return results;
+  } finally {
+    if (manager) {
+      try { await manager.close(); }
+      catch { results.push({ phase: "browser-close", ok: false, reasonCode: "browser-close-failed" }); }
+    }
+    const report = {
+      at: new Date().toISOString(),
+      workerWrites: 0,
+      importedWorkerSession: seed,
+      fullLoginAllowed: allowLogin,
+      expirySimulation: simulateSso ? "local-application-and-cas-cookie-removal"
+        : simulateExpiry ? "local-application-cookie-removal" : null,
+      results,
+    };
+    // Report is inside the protected profile and contains no cookies/credentials.
+    if (fs.existsSync(process.env.BROWSER_PROFILE_DIR)) {
+      fs.writeFileSync(`${process.env.BROWSER_PROFILE_DIR}/probe-result.json`, JSON.stringify(report, null, 2), { mode: 0o600 });
+    }
+    console.log(JSON.stringify(report, null, 2));
+    if (!results.length || results.some(result => !result.ok)) process.exitCode = 1;
+  }
+}
+
+if (require.main === module) {
+  main().catch(() => {
+    console.error(JSON.stringify({ ok: false, reasonCode: "probe-failed" }));
+    process.exitCode = 1;
+  });
+}
+
+MODULEEOF
 
 cd "$APP"
 echo "npm install..."
@@ -1130,6 +1886,29 @@ npm install --omit=dev --no-audit --no-fund
 export PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
 echo "Instalando Chromium + deps del SO..."
 npx playwright install --with-deps chromium
+
+# Chromium headed on a private virtual display. The site rejected the
+# headless shell from this VM before showing its login form.
+apt-get install -y xvfb xauth
+touch /var/lib/bukeala/Xauthority
+chmod 600 /var/lib/bukeala/Xauthority
+if [ ! -s /var/lib/bukeala/Xauthority ]; then
+  xauth -f /var/lib/bukeala/Xauthority add :99 . "$(openssl rand -hex 16)"
+fi
+cat > /etc/systemd/system/bukeala-display.service <<'DISPLAYUNIT'
+[Unit]
+Description=Private virtual display for Bukeala Chromium
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1366x800x24 -nolisten tcp -auth /var/lib/bukeala/Xauthority
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+DISPLAYUNIT
 
 # --- Swap 1GB (la e2-micro tiene 1GB de RAM y Chromium vive 24/7) ---
 # Sin swap, un pico de memoria mata Chromium: el ciclo siguiente hace login
@@ -1165,6 +1944,8 @@ cat > /etc/systemd/system/bukeala.service <<UNIT
 Description=Bukeala session keeper (cloud watcher)
 After=network-online.target
 Wants=network-online.target
+After=bukeala-display.service
+Requires=bukeala-display.service
 
 [Service]
 Type=simple
@@ -1179,7 +1960,17 @@ Environment=POLL_INTERVAL_MS=30000
 # muertas entre renovaciones. Renovar es gratis (navegador vivo).
 Environment=PROACTIVE_INTERVAL_MS=600000
 Environment=PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
+Environment=BROWSER_SESSION_MODE=$BROWSER_SESSION_MODE
+Environment=BROWSER_PROFILE_DIR=/var/lib/bukeala/browser-profile
+Environment=BROWSER_HEADLESS=0
+Environment=DISPLAY=:99
+Environment=XAUTHORITY=/var/lib/bukeala/Xauthority
+Environment=ENABLE_FULL_LOGIN=$ENABLE_FULL_LOGIN
+Environment=FULL_LOGIN_COOLDOWN_MS=1800000
 ExecStart=/usr/bin/node $APP/watcher.js
+UMask=0077
+TimeoutStopSec=420
+KillMode=mixed
 Restart=always
 RestartSec=15
 StandardOutput=append:/var/log/bukeala.log
@@ -1189,7 +1980,9 @@ StandardError=append:/var/log/bukeala.log
 WantedBy=multi-user.target
 UNIT
 
+chmod 600 /etc/systemd/system/bukeala.service
 systemctl daemon-reload
+systemctl enable --now bukeala-display.service
 systemctl enable bukeala.service
 systemctl restart bukeala.service
 echo "=== Bukeala setup DONE $(date) ==="

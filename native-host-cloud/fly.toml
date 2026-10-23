@@ -13,8 +13,16 @@ primary_region = "bog"
 
 [env]
   POLL_INTERVAL_MS = "30000"
-  PROACTIVE_INTERVAL_MS = "900000"
+  PROACTIVE_INTERVAL_MS = "600000"
   WORKER_URL = "https://bukeala-bot.ddropero.workers.dev/capture"
+  BROWSER_SESSION_MODE = "persistent"
+  BROWSER_PROFILE_DIR = "/data/browser-profile"
+  # Enable only after an isolated full-login probe succeeds.
+  ENABLE_FULL_LOGIN = "0"
+
+[[mounts]]
+  source = "bukeala_browser_data"
+  destination = "/data"
 
 # Worker de fondo: no expone servicios HTTP, así que NO queremos que Fly
 # lo apague por falta de tráfico. Una sola máquina, siempre encendida.
