@@ -67,15 +67,58 @@ function hhmmToSeconds(hhmm: string): number | null {
 
 function pad2(n: number): string { return String(n).padStart(2, "0"); }
 
-function todayBogotaDdMmYyyy(offsetDays = 0): string {
-  const now = new Date();
+function todayBogotaDdMmYyyy(now: Date, offsetDays = 0): string {
   const bog = new Date(now.getTime() - 5 * 3600 * 1000 + offsetDays * 86400 * 1000);
   return `${pad2(bog.getUTCDate())}/${pad2(bog.getUTCMonth() + 1)}/${bog.getUTCFullYear()}`;
 }
 
-function validDate(s: string): boolean {
-  return /^\d{2}\/\d{2}\/\d{4}$/.test(s);
+/** Medianoche UTC del día de hoy en Bogotá (UTC-5, sin horario de verano). */
+function hoyBogotaUtc(now: Date): Date {
+  const bog = new Date(now.getTime() - 5 * 3600 * 1000);
+  return new Date(Date.UTC(bog.getUTCFullYear(), bog.getUTCMonth(), bog.getUTCDate()));
 }
+
+export type FechaLeida = { ok: true; fecha: string; utc: Date } | { ok: false; motivo: string };
+
+/**
+ * Lee una fecha escrita por el Dr. y la devuelve normalizada a DD/MM/YYYY, o
+ * dice exactamente por qué no sirve.
+ *
+ * POR QUÉ (defecto reproducido en ESTADO_2026-10-20.md:131): antes solo se
+ * aceptaba DD/MM/YYYY exacto y, si la única fecha no cumplía ese molde, el
+ * comando la ignoraba EN SILENCIO y abría las 2 semanas por defecto:
+ * "jueves 8:00-12:00 22-10-2026" creó cupos del 20/10 al 03/11 en ambos
+ * perfiles. Además solo se miraba la forma: "31/02/2026" pasaba y Date la
+ * corría al 3 de marzo.
+ *
+ * Acepta separadores / - . y día/mes de 1 o 2 dígitos, que es como se escribe
+ * en Colombia (día primero). Exige el año completo: "22/10/26" es ambiguo.
+ * Comprueba que la fecha exista de verdad (ida y vuelta por Date.UTC).
+ */
+export function parseFechaUsuario(s: string): FechaLeida {
+  const t = String(s ?? "").trim();
+  const m = t.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{1,4})$/);
+  if (!m) return { ok: false, motivo: `"${t}" no es una fecha (usa DD/MM/AAAA)` };
+  if (m[3].length !== 4) return { ok: false, motivo: `"${t}": escribe el año completo (DD/MM/AAAA)` };
+  const d = parseInt(m[1], 10), mo = parseInt(m[2], 10), y = parseInt(m[3], 10);
+  const utc = new Date(Date.UTC(y, mo - 1, d));
+  if (utc.getUTCFullYear() !== y || utc.getUTCMonth() !== mo - 1 || utc.getUTCDate() !== d) {
+    return { ok: false, motivo: `"${t}" no existe en el calendario` };
+  }
+  return { ok: true, fecha: `${pad2(d)}/${pad2(mo)}/${y}`, utc };
+}
+
+/** Día de la semana en numeración Bukeala (Domingo=1 … Sábado=7). */
+function diaBukeala(utc: Date): string {
+  return String(utc.getUTCDay() + 1);
+}
+
+/** "Lunes" → "Lunes", "Sábado" → "Sábados" (antes salía "Miércoless"). */
+function pluralDia(label: string): string {
+  return /s$/i.test(label) ? label : `${label}s`;
+}
+
+const MAX_RANGO_DIAS = 366; // un año: más que eso es casi seguro un error de tipeo
 
 export interface AbrirAgendaResult { reply: string; needsRenew?: boolean; }
 
@@ -83,7 +126,14 @@ export interface AbrirAgendaResult { reply: string; needsRenew?: boolean; }
  * Parsea y ejecuta /abrir_agenda. Devuelve el mensaje a enviar al doctor.
  * @param argsText  lo que viene después de "/abrir_agenda"
  */
-export async function handleAbrirAgenda(env: Env, argsText: string): Promise<AbrirAgendaResult> {
+export async function handleAbrirAgenda(
+  env: Env,
+  argsText: string,
+  // `now` solo lo pasan los tests; los llamadores reales (telegram.ts y
+  // mcp/server.ts) no cambian.
+  opts: { now?: Date } = {},
+): Promise<AbrirAgendaResult> {
+  const now = opts.now ?? new Date();
   let parts = argsText.trim().split(/\s+/).filter(Boolean);
   if (parts.length < 2) {
     return { reply: helpText() };
@@ -129,33 +179,66 @@ export async function handleAbrirAgenda(env: Env, argsText: string): Promise<Abr
     return { reply: `❌ Horas inválidas o fin ≤ inicio: "${parts[1]}".` };
   }
 
-  // 3. Fechas opcionales
-  let startDate = todayBogotaDdMmYyyy(0);
-  let endDate = todayBogotaDdMmYyyy(DEFAULT_WEEKS * 7);
-  if (parts.length >= 4) {
-    if (!validDate(parts[2]) || !validDate(parts[3])) {
-      return { reply: `❌ Fechas inválidas. Usa DD/MM/YYYY DD/MM/YYYY.\n\n${helpText()}` };
+  // 3. Fechas opcionales: 0 = próximas 2 semanas, 1 = solo ese día, 2 = rango.
+  //    Todo lo que viene después del horario TIENE que ser una fecha válida:
+  //    nada se ignora en silencio (antes una fecha mal escrita o un token de
+  //    más se descartaban y el comando abría otra cosa). Si algo no cuadra, se
+  //    responde con el motivo y NO se crea nada en Bukeala.
+  const fechasTxt = parts.slice(2);
+  if (fechasTxt.length > 2) {
+    return { reply: `❌ Sobra texto después de las fechas: "${escapeHtml(fechasTxt.slice(2).join(" "))}". No abrí nada.\n\n${helpText()}` };
+  }
+  const fechas: Array<{ fecha: string; utc: Date }> = [];
+  for (const f of fechasTxt) {
+    const p = parseFechaUsuario(f);
+    if (!p.ok) return { reply: `❌ ${escapeHtml(p.motivo)}. No abrí nada.\n\n${helpText()}` };
+    fechas.push({ fecha: p.fecha, utc: p.utc });
+  }
+  const hoy = hoyBogotaUtc(now);
+
+  let startDate = todayBogotaDdMmYyyy(now, 0);
+  let endDate = todayBogotaDdMmYyyy(now, DEFAULT_WEEKS * 7);
+  if (fechas.length === 1) {
+    // UNA sola fecha = abrir SOLO ese día (pedido del Dr., 20-sep-2026).
+    const [f] = fechas;
+    if (f.utc.getTime() < hoy.getTime()) {
+      return { reply: `❌ El ${f.fecha} ya pasó. No abrí nada.` };
     }
-    startDate = parts[2];
-    endDate = parts[3];
-  } else if (parts.length === 3 && validDate(parts[2])) {
-    // UNA sola fecha = abrir SOLO ese día. Antes era "inicio de un bloque de
-    // 2 semanas", y el Dr. (20-sep-2026) quiere poder abrir un día suelto sin
-    // comprometer quince. Para un bloque, se dan dos fechas.
-    startDate = parts[2];
-    endDate = parts[2];
     // Bukeala abre el DÍA DE LA SEMANA dentro del rango: si la fecha no cae en
     // ese día, el rango de un día no contiene nada y no se abre ningún cupo.
     // Mejor avisar que crear una agenda vacía en silencio.
-    const [d, mo, y] = parts[2].split("/").map((n) => parseInt(n, 10));
-    const bukealaDay = String(new Date(Date.UTC(y, mo - 1, d)).getUTCDay() + 1); // Domingo=1 … Sábado=7
-    if (bukealaDay !== day.num) {
+    if (diaBukeala(f.utc) !== day.num) {
       return {
         reply:
-          `❌ El ${parts[2]} no es ${parts[0]}. ` +
+          `❌ El ${f.fecha} no es ${day.label.toLowerCase()}. ` +
           `Para abrir solo ese día, pon el día de la semana que le corresponde.`,
       };
     }
+    startDate = f.fecha;
+    endDate = f.fecha;
+  } else if (fechas.length === 2) {
+    const [ini, fin] = fechas;
+    if (fin.utc.getTime() < ini.utc.getTime()) {
+      return { reply: `❌ La fecha final (${fin.fecha}) es anterior a la inicial (${ini.fecha}). No abrí nada.` };
+    }
+    if (ini.utc.getTime() < hoy.getTime()) {
+      return { reply: `❌ El rango empieza el ${ini.fecha}, que ya pasó. Empieza hoy o después. No abrí nada.` };
+    }
+    const dias = Math.round((fin.utc.getTime() - ini.utc.getTime()) / 86400000) + 1;
+    if (dias > MAX_RANGO_DIAS) {
+      return { reply: `❌ El rango ${ini.fecha} → ${fin.fecha} tiene ${dias} días; el máximo es ${MAX_RANGO_DIAS}. No abrí nada.` };
+    }
+    // Un rango que no contiene ese día de la semana crea una agenda sin un solo
+    // cupo (p. ej. "lunes" del miércoles al viernes).
+    let contiene = false;
+    for (let i = 0; i < Math.min(dias, 7); i++) {
+      if (diaBukeala(new Date(ini.utc.getTime() + i * 86400000)) === day.num) { contiene = true; break; }
+    }
+    if (!contiene) {
+      return { reply: `❌ Entre el ${ini.fecha} y el ${fin.fecha} no hay ningún ${day.label.toLowerCase()}. No abrí nada.` };
+    }
+    startDate = ini.fecha;
+    endDate = fin.fecha;
   }
 
   const b = new Bukeala(env);
@@ -202,7 +285,8 @@ export async function handleAbrirAgenda(env: Env, argsText: string): Promise<Abr
   const lines: string[] = [];
   if (ok.length > 0) {
     lines.push(`✅ <b>Agenda abierta</b>`, ``);
-    lines.push(`📅 ${day.label}s · ⏰ ${rangeM[1]}–${rangeM[2]} (≈${slots} cupos de 20 min)`);
+    const cuando = startDate === endDate ? `${day.label} ${startDate}` : pluralDia(day.label);
+    lines.push(`📅 ${cuando} · ⏰ ${rangeM[1]}–${rangeM[2]} (≈${slots} cupos de 20 min)`);
     lines.push(`🗓️ ${startDate} → ${endDate}`);
     lines.push(`👥 Perfil(es): ${ok.join(" + ")}`);
   }
