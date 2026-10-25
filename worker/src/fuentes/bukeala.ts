@@ -91,6 +91,10 @@ export const fuenteBukeala: FuenteAgenda = {
           presencial: typeof bk?.isPresential === "boolean" ? bk.isPresential : null,
           notas: (bk?.comment ?? "").trim(),
           extra: {
+            // Toda cita de esta fuente sale del portal de citas: es un paciente
+            // por definición. Se marca para que, si pasa por citaABookingDoc,
+            // los recordatorios no la confundan con un evento hecho a mano.
+            origen: "bukeala",
             plan: bk?.planName ?? null,
             codigo: bk?.bookingCode ?? null,
             tieneCelularValido:

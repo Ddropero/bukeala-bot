@@ -21,7 +21,7 @@
 import type { Env } from "../env";
 import { Bukeala, SessionExpiredError } from "../bukeala";
 import { loadSession } from "../kv";
-import { sendAppointmentConfirmRequest, normalizeColombianPhone } from "../whatsapp";
+import { sendAppointmentConfirmRequest } from "../whatsapp";
 import { getAllRecipients } from "../users";
 import type { AgendaBookingDoc } from "../agendaDoc";
 
@@ -47,20 +47,6 @@ function dateToFriendly(d: Date): string {
   const day = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"][d.getUTCDay()];
   const yy = String(d.getUTCFullYear()).slice(2);
   return `${day} ${pad2(d.getUTCDate())}/${pad2(d.getUTCMonth() + 1)}/${yy}`;
-}
-
-function extractPhone(bk: AgendaBookingDoc): string {
-  if (typeof bk.cellPhone === "string" && bk.cellPhone.trim()) return bk.cellPhone.trim();
-  if (
-    bk.cellPhone &&
-    typeof bk.cellPhone === "object" &&
-    typeof (bk.cellPhone as { phoneNumber?: string }).phoneNumber === "string"
-  ) {
-    return ((bk.cellPhone as { phoneNumber?: string }).phoneNumber ?? "").trim();
-  }
-  if (typeof bk.phone === "string" && bk.phone.trim()) return bk.phone.trim();
-  if (typeof bk.customerPhone === "string" && bk.customerPhone.trim()) return bk.customerPhone.trim();
-  return "";
 }
 
 export async function eveningReminderCron(env: Env): Promise<void> {
@@ -90,10 +76,16 @@ export async function eveningReminderCron(env: Env): Promise<void> {
     const reservationCode = String(bk.id ?? "");
     const name = bk.name ?? "Paciente";
     const time12h = bk.startHourFormatted ?? "";
-    // Sin telefono no se manda nada (guardia contra eventos que no son pacientes).
-    const { telefonoDeCita } = await import("../agendaFuente");
-    const phone = (await telefonoDeCita(env, bk)) || normalizeColombianPhone(extractPhone(bk));
-    if (!phone || phone.length < 10) { skippedCount++; continue; }
+    // Misma puerta que el de la manana (destinoDeRecordatorio): solo pacientes
+    // identificables, nunca el equipo. Ver agendaFuente.ts para la regla.
+    const { destinoDeRecordatorio } = await import("../agendaFuente");
+    const destino = await destinoDeRecordatorio(env, bk);
+    const phone = destino.telefono;
+    if (!phone) {
+      console.log(`[eveningReminder] cita ${reservationCode}: no se envia (${destino.motivo})`);
+      skippedCount++;
+      continue;
+    }
 
     // Throttle propio (distinto al de la mañana, para permitir doble toque)
     const sentKey = `evening-reminder:sent:${reservationCode}`;
@@ -129,7 +121,7 @@ export async function eveningReminderCron(env: Env): Promise<void> {
     `🌆 <b>Recordatorios de la TARDE enviados</b> para ${friendly}\n\n` +
     `Total citas: ${active.length}\n` +
     `✅ Enviados: ${sentCount}\n` +
-    `⏭️ Saltados (sin tel, ya enviado, o consent=human): ${skippedCount}\n` +
+    `⏭️ Saltados (no es paciente, sin tel, ya enviado, o consent=human): ${skippedCount}\n` +
     (errors.length > 0 ? `❌ Errores: ${errors.length}\n${errors.slice(0, 5).map((e) => "• " + e).join("\n")}` : "");
 
   for (const chat of recipients) {

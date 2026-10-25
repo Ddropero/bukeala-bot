@@ -23,6 +23,20 @@ export type AgendaBookingDoc = {
   cellPhone?: string | { phoneNumber?: string } | null;
   customerPhone?: string;
   email?: string;
+  /**
+   * Quién originó la cita: "bukeala" (espejo o respaldo directo del portal),
+   * "secretaria" (flujo del equipo por WhatsApp) o "manual" (evento creado a
+   * mano en Calendar). Los generadores de documentos lo ignoran; lo usan los
+   * recordatorios automáticos para no escribirle a un evento que no es un
+   * paciente (ver esCitaDePaciente en agendaFuente.ts).
+   */
+  origen?: string;
+  /**
+   * Cómo se obtuvo `cellPhone` en un evento de Calendar: "etiqueta" (tel:/cel:),
+   * "emoji" (línea 📞), "suelto" (un celular cualquiera en la descripción) o ""
+   * si no hubo. Solo cambia la decisión de enviar, no lo que se muestra.
+   */
+  telefonoFuente?: string;
 };
 
 function escapeHtml(s: string): string {
