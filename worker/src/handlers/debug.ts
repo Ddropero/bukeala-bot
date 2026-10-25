@@ -82,7 +82,16 @@ export async function handleDebug(c: Context<{ Bindings: Env }>) {
           const r = await b.selectBookingComponent(id);
           const j = await r.json<any>().catch(() => null);
           const cals = j?.bookingComponent?.bookingCalendars ?? [];
-          out.push({ componentId: id, count: cals.length, calendars: cals.map((cc: any) => ({ id: cc.id, desc: cc.description, start: cc.startDateFormatted, state: cc.stateDescription })) });
+          out.push({
+            componentId: id,
+            count: cals.length,
+            calendars: cals.map((cc: any) => ({ id: cc.id, desc: cc.description, start: cc.startDateFormatted, state: cc.stateDescription })),
+            // Claves reales del objeto calendario y el primero crudo (son moldes,
+            // sin datos de pacientes). Sirve para fijar qué campo trae el día de
+            // la semana, del que depende leerDiasSemana() en cancelarAgenda.ts.
+            claves: cals[0] ? Object.keys(cals[0]) : [],
+            crudo: cals[0] ?? null,
+          });
         }
         return c.json(out);
       }
