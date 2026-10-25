@@ -19,6 +19,12 @@ function safeResult(result) {
     loginAttempted: result?.loginAttempted === true,
     via: result?.via || "persistent",
     reasonCode: result?.reasonCode || null,
+    // La URL (ya redactada por safeLocation en persistentSession) es el ÚNICO
+    // dato que distingue un bloqueo del anti-bot de un redirect legítimo a un
+    // host nuevo del portal. Se perdía aquí: el 24-25/oct/2026 hubo 101
+    // "auth-challenge" sin saber a dónde nos desviaban, y la alerta de Telegram
+    // del Worker (que busca "perfdrive") quedó muda por falta de este campo.
+    postNavUrl: result?.postNavUrl || null,
   };
 }
 
@@ -167,6 +173,10 @@ function createPersistentWatcher(env, options = {}) {
         at: status.lastCompletedAt,
         hadBukealaJsession: summary.authenticated,
         message: summary.ok ? "persistent: navegador y Worker verificados" : `persistent: ${summary.reasonCode || "unverified"}`,
+        // El Worker ya declara, copia y persiste postNavUrl, y su alerta de
+        // Radware lo concatena al mensaje: mandarlo revive esa alerta sin
+        // tocar el Worker.
+        ...(summary.postNavUrl ? { postNavUrl: summary.postNavUrl } : {}),
       });
       await flushCompletion();
       return summary;

@@ -436,3 +436,24 @@ test("failed startup supersedes an undelivered success instead of announcing sta
   assert.equal(restarted.getStatus().lastCompletedRequest, undefined);
   assert.equal(restarted.getStatus().completionOutbox, undefined);
 });
+
+// Sin la URL del desvío no se puede distinguir un bloqueo del anti-bot de un
+// redirect legítimo a un host nuevo del portal, y la alerta del Worker (que
+// busca "perfdrive") queda muda. Se perdió en la reescritura y costó dos días
+// de caída a ciegas el 24-25/oct/2026: este assert evita que vuelva a pasar.
+test("el evento de fallo lleva la URL del desvío", async (t) => {
+  const f = fixture(t);
+  const watcher = f.create({
+    renew: async () => ({
+      ok: false, authenticated: false, published: false, workerVerified: false,
+      loginAttempted: false, via: "persistent", reasonCode: "auth-challenge",
+      postNavUrl: "https://validate.perfdrive.com/[redacted]",
+    }),
+    close: async () => {},
+  });
+  assert.equal((await watcher.runCycle("startup")).ok, false);
+  const events = f.requests.filter((request) => request.pathname === "/native-host/event");
+  assert.equal(events.length, 1);
+  assert.equal(events[0].body.postNavUrl, "https://validate.perfdrive.com/[redacted]");
+  await watcher.close();
+});

@@ -58,6 +58,8 @@ function createPersistentSessionManager(env, options = {}) {
   const publish = options.publish !== false;
   const helpers = { ...sessionHelpers, ...options.helpers };
   const now = options.now || Date.now;
+  // Inyectable para que las pruebas de adopción no toquen la red.
+  const fetchImpl = options.fetch || ((...args) => globalThis.fetch(...args));
   const configuredCooldown = Number(env.FULL_LOGIN_COOLDOWN_MS);
   const cooldownMs = Number.isFinite(configuredCooldown)
     ? Math.max(MIN_LOGIN_COOLDOWN_MS, configuredCooldown) : MIN_LOGIN_COOLDOWN_MS;
@@ -178,6 +180,27 @@ function createPersistentSessionManager(env, options = {}) {
           : await helpers.verifySessionWorks(context, helperLog, { strict: true });
       }
 
+      // Antes de pensar en un login completo (que el anti-bot rechaza), heredar
+      // la sesión que el Dr. ya sembró desde su navegador. Este es el camino de
+      // recuperación automática: el humano se loguea UNA vez y la VM la adopta
+      // sola, sin credenciales ni captcha. Sin esto, una sesión muerta dejaba a
+      // la VM sin salida (caída del 24-25/oct/2026).
+      if (!verification.ok && verification.authRequired) {
+        stage = "adoption";
+        const adopted = await adoptWorkerSession();
+        log("info", "persistent-session adoption attempt", { cookieCount: adopted.cookieCount });
+        if (adopted.ok) {
+          stage = "navigation";
+          await navigate(helpers.BUKEALA_HOME);
+          if (isAuthChallenge(page.url())) {
+            return result({ reasonCode: "auth-challenge", reason: "authentication-challenge", authBlocked: true });
+          }
+          stage = "verification";
+          verification = isCasFormLocation(page.url()) ? { ok: false, authRequired: true }
+            : await helpers.verifySessionWorks(context, helperLog, { strict: true });
+        }
+      }
+
       if (!verification.ok && isCasFormLocation(page.url())) {
         const visibleForm = await Promise.all([
           page.locator('input[name="username"], input#username').first().waitFor({ state: "visible", timeout: 10000 }),
@@ -275,20 +298,33 @@ function createPersistentSessionManager(env, options = {}) {
    * overwrite any existing relevant cookies or a previously validated profile.
    * Caller must obtain an authorized fresh snapshot and then call renew().
    */
-  async function seedCookies(cookies, { capturedAt } = {}) {
-    if (inFlight) return result({ reasonCode: "busy", reason: "persistent-operation-in-progress" });
-    inFlight = true;
-    try {
-      await ensureContext();
-      const timestamp = Date.parse(capturedAt);
-      if (!Number.isFinite(timestamp) || timestamp > now() + 60_000 || now() - timestamp > 30 * 60_000) {
-        return result({ reasonCode: "seed-not-fresh", reason: "seed-not-fresh" });
-      }
-      if (state.validated || state.seededAt || (await context.cookies()).some(cookie => relevantDomain(cookie.domain))) {
-        return result({ reasonCode: "profile-already-populated", reason: "profile-already-populated" });
-      }
-      if (!Array.isArray(cookies) || !cookies.length) return result({ reasonCode: "seed-empty", reason: "seed-empty" });
-      const filtered = cookies.filter(cookie =>
+  /**
+   * Núcleo de la siembra de cookies. NO toca `inFlight` a propósito: lo llaman
+   * tanto `seedCookies` (migración manual, que sí lo toma) como
+   * `adoptWorkerSession` desde dentro de `renew()`, que ya lo tiene tomado —
+   * si lo tomara otra vez, la adopción se auto-respondería "busy".
+   *
+   * `replace` distingue los dos usos: la migración manual solo siembra en un
+   * perfil virgen, mientras que la recuperación automática DEBE poder pisar una
+   * sesión muerta con la nueva que sembró el humano.
+   */
+  async function applyCookieSnapshot(cookies, capturedAt, { replace = false } = {}) {
+    await ensureContext();
+    const timestamp = Date.parse(capturedAt);
+    if (!Number.isFinite(timestamp) || timestamp > now() + 60_000 || now() - timestamp > 30 * 60_000) {
+      return result({ reasonCode: "seed-not-fresh", reason: "seed-not-fresh" });
+    }
+    if (!replace &&
+        (state.validated || state.seededAt || (await context.cookies()).some(cookie => relevantDomain(cookie.domain)))) {
+      return result({ reasonCode: "profile-already-populated", reason: "profile-already-populated" });
+    }
+    // En recuperación, no re-sembrar la MISMA captura una y otra vez: si el Dr.
+    // no ha vuelto a loguearse, la foto es la misma y volvería a fallar igual.
+    if (replace && Number.isFinite(state.seededAt) && state.seededAt > 0 && timestamp <= state.seededAt) {
+      return result({ reasonCode: "seed-not-newer", reason: "seed-not-newer" });
+    }
+    if (!Array.isArray(cookies) || !cookies.length) return result({ reasonCode: "seed-empty", reason: "seed-empty" });
+    const filtered = cookies.filter(cookie =>
         cookie && relevantDomain(cookie.domain) && typeof cookie.name === "string" &&
         typeof cookie.value === "string" && cookie.value.length > 0 &&
         (cookie.expires === undefined || cookie.expires === -1 || cookie.expires > now() / 1000) &&
@@ -299,17 +335,67 @@ function createPersistentSessionManager(env, options = {}) {
         ...(typeof cookie.expires === "number" && cookie.expires > 0 ? { expires: cookie.expires } : {}),
         ...(["Strict", "Lax", "None"].includes(cookie.sameSite) ? { sameSite: cookie.sameSite } : {}),
       }));
-      if (!filtered.some(cookie => cookie.name === "JSESSIONID")) {
-        return result({ reasonCode: "seed-no-bukeala-session", reason: "seed-no-bukeala-session" });
+    if (!filtered.some(cookie => cookie.name === "JSESSIONID")) {
+      return result({ reasonCode: "seed-no-bukeala-session", reason: "seed-no-bukeala-session" });
+    }
+    if (replace) {
+      // Quitar primero las cookies vivas del portal: si queda una JSESSIONID
+      // muerta en el mismo dominio y path, addCookies no garantiza cuál gana.
+      for (const cookie of (await context.cookies()).filter(entry => relevantDomain(entry.domain))) {
+        await context.clearCookies({ name: cookie.name, domain: cookie.domain, path: cookie.path });
       }
-      state.seededAt = timestamp;
-      saveState();
-      await context.addCookies(filtered);
-      seeded = true;
-      return result({ ok: true, seeded: true, cookieCount: filtered.length });
+      state.validated = false;
+    }
+    state.seededAt = timestamp;
+    saveState();
+    await context.addCookies(filtered);
+    seeded = true;
+    return result({ ok: true, seeded: true, cookieCount: filtered.length });
+  }
+
+  async function seedCookies(cookies, { capturedAt } = {}) {
+    if (inFlight) return result({ reasonCode: "busy", reason: "persistent-operation-in-progress" });
+    inFlight = true;
+    try {
+      return await applyCookieSnapshot(cookies, capturedAt, { replace: false });
     } catch {
       return result({ reasonCode: "seed-failed", reason: "seed-failed" });
     } finally { inFlight = false; }
+  }
+
+  /**
+   * Adopta la sesión que el Dr. capturó con la extensión de su navegador.
+   *
+   * POR QUÉ EXISTE: el login completo automatizado lo rechaza el anti-bot del
+   * portal, así que cuando la sesión del perfil muere el único camino legítimo
+   * es heredar la que sembró un humano. Eso solo existía como migración manual
+   * (`persistentProbe --seed-worker`), de modo que una sesión muerta dejaba a la
+   * VM sin salida automática: fue la causa de la caída del 24-25/oct/2026, dos
+   * días enteros sin una sola renovación exitosa.
+   */
+  async function adoptWorkerSession() {
+    const base = String(env.WORKER_URL || "").replace(/\/capture\/?$/, "");
+    if (!base || !env.CAPTURE_TOKEN) {
+      return result({ reasonCode: "adopt-config-missing", reason: "adopt-config-missing" });
+    }
+    let snapshot;
+    try {
+      const response = await fetchImpl(`${base}/native-host/session`, {
+        headers: { "X-Capture-Token": env.CAPTURE_TOKEN },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) {
+        return result({ reasonCode: "adopt-fetch-failed", reason: "adopt-fetch-failed", retryable: true });
+      }
+      snapshot = await response.json();
+    } catch {
+      return result({ reasonCode: "adopt-fetch-failed", reason: "adopt-fetch-failed", retryable: true });
+    }
+    try {
+      return await applyCookieSnapshot(snapshot?.cookies, snapshot?.capturedAt, { replace: true });
+    } catch {
+      return result({ reasonCode: "adopt-failed", reason: "adopt-failed" });
+    }
   }
 
   async function close() {

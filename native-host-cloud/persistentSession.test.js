@@ -501,3 +501,41 @@ test("diagnostic locations omit query, fragment, userinfo and unknown paths", ()
   assert.equal(safeLocation(CAS), "https://app01.colsanitas.com/cas/login");
   assert.equal(safeLocation("https://user:password@example.invalid/SECRET_PATH?token=SECRET#SECRET"), "https://example.invalid/[redacted]");
 });
+
+// El login completo lo rechaza el anti-bot del portal, así que la ÚNICA salida
+// automática de una sesión muerta es heredar la que sembró el humano con la
+// extensión. Antes esto solo existía como migración manual y la VM se quedaba
+// sin camino: dos días caída el 24-25/oct/2026.
+test("una sesión muerta se recupera adoptando la captura del navegador, sin login completo", async (t) => {
+  const f = fixture(t, { startAuthenticated: false });
+  const snapshot = { capturedAt: "2026-10-20T15:00:00.000Z", cookies: [{ ...COOKIE }] };
+  let pedidos = 0;
+  const manager = f.manager({
+    fetch: async (url, options) => {
+      pedidos++;
+      assert.ok(String(url).endsWith("/native-host/session"), "pide la sesión capturada, no otro endpoint");
+      assert.equal(options.headers["X-Capture-Token"], f.env.CAPTURE_TOKEN);
+      return { ok: true, json: async () => snapshot };
+    },
+  });
+  const result = await manager.renew();
+  assert.equal(pedidos, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.authenticated, true);
+  assert.equal(result.via, "persistent-adopted");
+  assert.equal(f.calls.submit.length, 0, "no debe intentar el login completo: el anti-bot lo rechaza");
+  await manager.close();
+});
+
+// Si el Dr. no ha vuelto a loguearse, la foto del Worker es la misma: volver a
+// sembrarla gastaría ciclos y borraría cookies para nada.
+test("no re-siembra la misma captura dos veces", async (t) => {
+  const f = fixture(t, { startAuthenticated: false });
+  const snapshot = { capturedAt: "2026-10-20T15:00:00.000Z", cookies: [{ ...COOKIE }] };
+  const fetchStub = async () => ({ ok: true, json: async () => snapshot });
+  const manager = f.manager({ fetch: fetchStub });
+  assert.equal((await manager.renew()).ok, true);
+  const segunda = await manager.seedCookies(snapshot.cookies, { capturedAt: snapshot.capturedAt });
+  assert.equal(segunda.ok, false);
+  await manager.close();
+});
