@@ -194,8 +194,13 @@ const PAGE = /* html */ `<!doctype html>
     html+=fila("⚠️ Errores hoy", errs, errs?"warn":"ok");
     s.innerHTML=html;
 
-    var free=(rc["ok:alive"]||0)+(rc["ok:tgc"]||0);
-    var cap=(rc["ok:captcha"]||0)+(rc["ok:captcha-fallback"]||0);
+    // Suma TODA via "ok:*" que no sea de captcha, en vez de nombrarlas una por
+    // una: las vias cambiaron a "ok:persistent" y la barra mostraba 0 de 0.
+    var free=0, cap=0;
+    for (var k in rc){
+      if (k.indexOf("ok:")!==0) continue;
+      if (k.indexOf("captcha")>=0) cap+=rc[k]||0; else free+=rc[k]||0;
+    }
     var tot=free+cap||1;
     $("bar-free").style.width=Math.round(free/tot*100)+"%";
     $("lbl-free").textContent=free+" sin captcha";

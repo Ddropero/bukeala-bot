@@ -584,14 +584,21 @@ app.get("/debug/session-stats", async (c) => {
 
   // Contadores de hoy y ayer (UTC) por vía de renovación
   const days = [0, 1].map((d) => new Date(Date.now() - d * 86400000).toISOString().slice(0, 10));
-  // "ok:alive" = renovación en sitio con el navegador vivo (0 captchas).
-  const buckets = ["ok:alive", "ok:tgc", "ok:captcha", "ok:captcha-fallback", "ok:unknown", "error"];
+  // Se LISTAN las llaves que existan, en vez de pedir una lista fija de vías.
+  // La lista fija ("ok:alive", "ok:tgc", "ok:captcha"...) quedó obsoleta cuando
+  // la VM pasó al navegador persistente y empezó a contar "ok:persistent": el
+  // 25/oct/2026 este endpoint reportó solo {error:18} ocultando 36 renovaciones
+  // exitosas del mismo día, y me llevó a decirle al Dr. que el sistema no había
+  // renovado nada en dos días. Listar evita que vuelva a podrirse con el
+  // próximo nombre de vía.
   const renewCounters: Record<string, Record<string, number>> = {};
   for (const day of days) {
     renewCounters[day] = {};
-    for (const bucket of buckets) {
-      const v = await c.env.STATE.get(`stats:renew:${day}:${bucket}`);
-      if (v) renewCounters[day][bucket] = parseInt(v, 10) || 0;
+    const prefix = `stats:renew:${day}:`;
+    const listed = await c.env.STATE.list({ prefix, limit: 100 });
+    for (const key of listed.keys) {
+      const v = await c.env.STATE.get(key.name);
+      if (v) renewCounters[day][key.name.slice(prefix.length)] = parseInt(v, 10) || 0;
     }
   }
 
