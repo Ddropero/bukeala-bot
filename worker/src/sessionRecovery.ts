@@ -57,16 +57,32 @@ function manualRecipients(request: RefreshRequest): string[] {
 }
 
 /** The source is diagnostic data; only numeric chat IDs are Telegram recipients. */
-export async function requestRecovery(env: Env, requestedBy: string, now = Date.now()): Promise<void> {
+/** Lo que hay que poder CONTARLE a quien pidió la renovación. */
+export interface EstadoSolicitud {
+  /** Si hay una espera en curso, el momento del próximo intento (epoch ms). */
+  esperaHasta?: number;
+}
+
+export async function requestRecovery(
+  env: Env,
+  requestedBy: string,
+  now = Date.now(),
+): Promise<EstadoSolicitud> {
   const current = await readRequest(env);
   const manual = numericChat(requestedBy);
+  // La espera NO se salta (es deliberada, para no insistirle al portal), pero
+  // hay que poder contarla: antes la orden quedaba en cola en silencio y quien
+  // la pidió se quedaba esperando sin saber hasta cuándo. El 25/oct/2026 se
+  // encontró una orden del Dr. que llevaba 3 horas así.
+  const esperaHasta =
+    current?.nextAttemptAt && current.nextAttemptAt > now ? current.nextAttemptAt : undefined;
   if (current) {
     // Cron never replaces an in-flight manual request or resets its retry deadline.
-    if (!manual || manualRecipients(current).includes(requestedBy)) return;
+    if (!manual || manualRecipients(current).includes(requestedBy)) return { esperaHasta };
     current.notifyChatIds = [...manualRecipients(current), requestedBy];
     if (!numericChat(current.requestedBy)) current.requestedBy = requestedBy;
     await saveRequest(env, current);
-    return;
+    return { esperaHasta };
   }
   await saveRequest(env, {
     version: 2,
@@ -76,6 +92,8 @@ export async function requestRecovery(env: Env, requestedBy: string, now = Date.
     notifyChatIds: manual ? [requestedBy] : [],
     attempts: 0,
   });
+  // Solicitud nueva: no hay espera heredada que reportar.
+  return {};
 }
 
 export async function pollRecovery(env: Env, now = Date.now()) {

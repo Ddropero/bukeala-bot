@@ -345,3 +345,30 @@ test("health accepts only HTTP 200 with the authenticated components schema", as
     new Response("{", { headers: { "content-type": "application/json" } }),
   ]) assert.equal(await validComponentsResponse(response), false);
 });
+
+// Antes la orden quedaba en cola EN SILENCIO: el 25/oct/2026 aparecio una del
+// Dr. que llevaba 3 horas esperando sin que nadie le dijera nada. La espera es
+// deliberada (no se salta), pero hay que poder contarla.
+test("pedir renovacion durante la espera devuelve hasta cuando, sin saltarsela", async (t) => {
+  const f = fixture(t);
+  await requestRecovery(f.env, "202", START);
+  const request = f.request();
+  await completeRecovery(f.env, {
+    requestedAt: request.requestedAt, ok: false, reasonCode: "external-auth-challenge",
+    nextAttemptAt: START + 30 * MINUTE,
+  }, START + MINUTE);
+
+  const estado = await requestRecovery(f.env, "202", START + 2 * MINUTE);
+  assert.equal(estado.esperaHasta, START + 30 * MINUTE, "debe decir hasta cuando espera");
+
+  // Y la espera sigue vigente: la orden no se entrega antes de tiempo.
+  const poll = await pollRecovery(f.env, START + 2 * MINUTE);
+  assert.equal(poll.pending, false, "no se salta la espera");
+  assert.equal(poll.nextAttemptAt, START + 30 * MINUTE);
+});
+
+test("sin espera en curso no se inventa una", async (t) => {
+  const f = fixture(t);
+  const estado = await requestRecovery(f.env, "202", START);
+  assert.equal(estado.esperaHasta, undefined);
+});

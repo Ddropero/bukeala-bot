@@ -863,11 +863,26 @@ ${formatearResumenEspejo(u)}` : "Todavía no ha corrido ninguna sincronización.
 
   // /sesion_renew — request session recovery from the configured renewal host
   if (text === "/sesion_renew") {
-    await requestRefresh(env, chatId);
+    const estado = await requestRefresh(env, chatId);
+    // Decir la HORA concreta de la espera. Antes el mensaje mencionaba que
+    // "respetará su tiempo de espera" sin decir cuál, así que una orden podía
+    // quedarse horas en cola sin que el Dr. supiera que no estaba pasando nada
+    // (el 25/oct/2026 apareció una de 3 horas atrás).
+    const espera = estado?.esperaHasta
+      ? "\n\n⏳ <b>Quedó en espera</b> hasta las <b>" +
+        new Date(estado.esperaHasta).toLocaleTimeString("es-CO", {
+          timeZone: "America/Bogota",
+          hour: "2-digit",
+          minute: "2-digit",
+        }) +
+        "</b>.\nEl sistema espera a propósito para no insistirle al portal, así que repetir el comando no lo acelera. Se ejecuta solo a esa hora y te aviso aquí."
+      : "\n\n<i>Te aviso aquí con el resultado.</i>";
     await sendMessage(
       env,
       chatId,
-      "🔔 <b>Solicitud registrada</b>\n\nEl servicio de renovación intentará recuperar la sesión. El host remoto puede hacerlo con tu PC apagado.\n\nSi hay un reintento pendiente, respetará su tiempo de espera; repetir el comando no lo acelera. Si el proveedor exige una verificación humana, habrá que completarla en el navegador que mantiene la sesión.\n\n<i>Cuando se procese la solicitud, recibirás aquí el resultado. Puedes consultar /estado.</i>",
+      "🔔 <b>Solicitud registrada</b>\n\nVoy a recuperar la sesión. No necesitas tener el PC encendido." +
+        "\n\nSi el portal exige verificación humana, hay que entrar a Bukeala en tu navegador." +
+        espera,
     );
     return;
   }

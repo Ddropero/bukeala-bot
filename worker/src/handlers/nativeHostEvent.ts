@@ -350,8 +350,12 @@ export async function handleGetSession(c: Context<{ Bindings: Env }>) {
  * Telegram and automatic checks share one recovery; cron does not replace
  * its manual recipients, correlation ID, or retry deadline.
  */
-export async function requestRefresh(env: Env, requestedBy: string): Promise<void> {
-  await requestRecovery(env, requestedBy);
+export async function requestRefresh(
+  env: Env,
+  requestedBy: string,
+): Promise<{ esperaHasta?: number }> {
+  // Devuelve si la orden quedo EN ESPERA, para poder decirselo a quien la pidio.
+  return requestRecovery(env, requestedBy);
 }
 
 /**
