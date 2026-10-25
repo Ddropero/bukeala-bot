@@ -39,7 +39,9 @@ function fixture(t, overrides = {}) {
             isClosed: () => this.closed,
             goto: async () => {
               if (config.navigationFailure) throw new Error("https://app01.colsanitas.com/cas/login?ticket=SECRET_TICKET");
-              this.page.current = this.authenticated ? HOME : CAS;
+              // challengeHost permite expresar un TERCER host (el del anti-bot),
+              // que es el escenario real de producción y antes no se podía probar.
+              this.page.current = this.authenticated ? HOME : (config.challengeHost || CAS);
             },
             waitForTimeout: async () => {},
             locator: () => ({ first: () => ({ waitFor: async () => {
@@ -524,6 +526,32 @@ test("una sesión muerta se recupera adoptando la captura del navegador, sin log
   assert.equal(result.authenticated, true);
   assert.equal(result.via, "persistent-adopted");
   assert.equal(f.calls.submit.length, 0, "no debe intentar el login completo: el anti-bot lo rechaza");
+  await manager.close();
+});
+
+// ESTE es el escenario de producción medido el 25/oct/2026: sin sesión, el
+// portal rebota a CAS y el anti-bot desvía a validate.perfdrive.com ya en la
+// PRIMERA navegación. Si el ciclo se rinde ahí, la adopción nunca se alcanza.
+test("un desvío del anti-bot en la primera navegación se rescata adoptando la captura", async (t) => {
+  const f = fixture(t, { startAuthenticated: false, challengeHost: "https://validate.perfdrive.com/" });
+  const snapshot = { capturedAt: "2026-10-20T15:00:00.000Z", cookies: [{ ...COOKIE }] };
+  const manager = f.manager({ fetch: async () => ({ ok: true, json: async () => snapshot }) });
+  const result = await manager.renew();
+  assert.equal(result.ok, true, "con las cookies del Dr. la navegación ya no pasa por CAS");
+  assert.equal(result.authenticated, true);
+  assert.equal(f.calls.submit.length, 0, "jamás el login completo: el anti-bot lo rechaza");
+  await manager.close();
+});
+
+// Y si ni siquiera hay captura fresca que adoptar, el ciclo debe rendirse
+// diciendo a dónde lo desviaron, no en silencio.
+test("sin captura que adoptar, el fallo reporta la URL del desvío", async (t) => {
+  const f = fixture(t, { startAuthenticated: false, challengeHost: "https://validate.perfdrive.com/" });
+  const manager = f.manager({ fetch: async () => ({ ok: false, json: async () => ({}) }) });
+  const result = await manager.renew();
+  assert.equal(result.ok, false);
+  assert.equal(result.reasonCode, "auth-challenge");
+  assert.equal(result.postNavUrl, "https://validate.perfdrive.com/");
   await manager.close();
 });
 

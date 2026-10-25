@@ -1346,12 +1346,39 @@ function createPersistentSessionManager(env, options = {}) {
     let loginAttempted = false;
     let captureAccepted = false;
     let stage = "profile";
+    // La adopción se intenta UNA vez por ciclo, desde cualquiera de los puntos
+    // donde el portal nos cierra la puerta.
+    let adopcionIntentada = false;
+    const intentarAdopcion = async () => {
+      if (adopcionIntentada) return result({ reasonCode: "adopt-already-tried", reason: "adopt-already-tried" });
+      adopcionIntentada = true;
+      stage = "adoption";
+      const adopted = await adoptWorkerSession();
+      log("info", "persistent-session adoption attempt", { cookieCount: adopted.cookieCount });
+      return adopted;
+    };
     try {
       await ensureContext();
       stage = "navigation";
       await navigate(helpers.BUKEALA_HOME);
       if (isAuthChallenge(page.url())) {
-        return result({ reasonCode: "auth-challenge", reason: "authentication-challenge", authBlocked: true });
+        // MEDIDO el 25/oct/2026: sin sesión, el portal rebota a CAS y el
+        // anti-bot desvía a validate.perfdrive.com ya en ESTA primera
+        // navegación. Si aquí nos rendimos, la adopción de más abajo nunca se
+        // alcanza y la VM queda sin salida. Con las cookies del Dr. puestas, la
+        // navegación no pasa por CAS y el anti-bot no entra en juego.
+        const rescate = await intentarAdopcion();
+        if (!rescate.ok) {
+          return result({ reasonCode: "auth-challenge", reason: "authentication-challenge", authBlocked: true });
+        }
+        stage = "navigation";
+        await navigate(helpers.BUKEALA_HOME);
+        if (isAuthChallenge(page.url())) {
+          return result({
+            reasonCode: "auth-challenge-after-adoption",
+            reason: "authentication-challenge", authBlocked: true,
+          });
+        }
       }
 
       stage = "verification";
@@ -1376,9 +1403,7 @@ function createPersistentSessionManager(env, options = {}) {
       // sola, sin credenciales ni captcha. Sin esto, una sesión muerta dejaba a
       // la VM sin salida (caída del 24-25/oct/2026).
       if (!verification.ok && verification.authRequired) {
-        stage = "adoption";
-        const adopted = await adoptWorkerSession();
-        log("info", "persistent-session adoption attempt", { cookieCount: adopted.cookieCount });
+        const adopted = await intentarAdopcion();
         if (adopted.ok) {
           stage = "navigation";
           await navigate(helpers.BUKEALA_HOME);
