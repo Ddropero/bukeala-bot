@@ -113,6 +113,34 @@ export async function checkSessionUsable(
   }
 }
 
+/**
+ * Qué hace el keepAlive con un veredicto: "alive" sigue normal, "expired"
+ * dispara recuperación y "inconclusive" solo registra (sin recuperación).
+ * Antes un 5xx de Bukeala (sin excepción) caía en "expired" y pedía una
+ * renovación innecesaria por un hipo del portal.
+ */
+export function keepAliveAction(check: SessionCheck): "alive" | "expired" | "inconclusive" {
+  if (check.alive) return "alive";
+  return check.inconclusive ? "inconclusive" : "expired";
+}
+
+/**
+ * Respuesta de GET /debug/session-check, separada de la ruta para poder
+ * probarla: 401 sin token válido, 503 sin veredicto (la VM reintenta), 200 con
+ * {alive, note} cuando Bukeala decidió. Nunca se consulta Bukeala sin token.
+ */
+export async function sessionCheckResponse(
+  token: string | undefined,
+  expectedToken: string | undefined,
+  loadComponents: () => Promise<Response>,
+  loadAgenda: () => Promise<Response>,
+): Promise<{ status: 200 | 401 | 503; body: Record<string, unknown> }> {
+  if (!expectedToken || token !== expectedToken) return { status: 401, body: { error: "unauthorized" } };
+  const { alive, note, inconclusive } = await checkSessionUsable(loadComponents, loadAgenda);
+  if (inconclusive) return { status: 503, body: { alive: false, inconclusive: true, note } };
+  return { status: 200, body: { alive, note } };
+}
+
 /** HTML/login pages and arbitrary JSON are not evidence that the API is usable. */
 export async function probeSessionStatus(
   loadComponents: () => Promise<Response>,

@@ -13,7 +13,7 @@ const bundle = buildSync({
   },
   bundle: true, write: false, platform: "node", format: "esm", target: "es2022",
 }).outputFiles[0].text;
-const { formatSessionStatus, probeSessionStatus, readRenewalCounts, checkSessionUsable, todayBogotaDashed, SessionExpiredError } = await import(`data:text/javascript;base64,${Buffer.from(bundle).toString("base64")}`);
+const { formatSessionStatus, probeSessionStatus, readRenewalCounts, checkSessionUsable, todayBogotaDashed, keepAliveAction, sessionCheckResponse, SessionExpiredError } = await import(`data:text/javascript;base64,${Buffer.from(bundle).toString("base64")}`);
 const NOW = Date.parse("2026-10-21T01:37:00Z"); // 20:37 in Bogotá on October 20.
 function status(overrides = {}) {
   return {
@@ -207,4 +207,50 @@ test("counts include all persistent renewal paths and identify the actual UTC da
   ]);
   const counts = await readRenewalCounts({ STATE: { get: async (key) => data.get(key) ?? null } }, NOW);
   assert.deepEqual(counts, { utcDay: "2026-10-21", reusedSession: 50, fullLogin: 1, legacyCaptcha: 11, errors: 2 });
+});
+
+// /debug/session-check: contrato que consume la VM (verifyViaWorker estricto).
+test("sessionCheckResponse: sin token válido => 401 y no consulta Bukeala", async () => {
+  let calls = 0;
+  const load = async () => { calls++; return COMPONENTS_OK(); };
+  for (const [token, expected] of [[undefined, "tok"], ["otro", "tok"], ["", ""], [undefined, undefined]]) {
+    const r = await sessionCheckResponse(token, expected, load, load);
+    assert.equal(r.status, 401);
+    assert.equal(r.body.alive, undefined);
+  }
+  assert.equal(calls, 0);
+});
+
+test("sessionCheckResponse: viva => 200 alive:true (también [] confirmado por la agenda)", async () => {
+  const full = await sessionCheckResponse("tok", "tok", async () => COMPONENTS_OK(), async () => AGENDA_OK());
+  assert.deepEqual([full.status, full.body.alive], [200, true]);
+  const empty = await sessionCheckResponse("tok", "tok", async () => EMPTY(), async () => AGENDA_OK());
+  assert.deepEqual([empty.status, empty.body.alive], [200, true]);
+  assert.match(empty.body.note, /agenda/);
+});
+
+test("sessionCheckResponse: rechazo real => 200 alive:false; sin veredicto => 503", async () => {
+  const dead = await sessionCheckResponse("tok", "tok",
+    async () => new Response(null, { status: 302, headers: { location: "/cas/login" } }), async () => AGENDA_OK());
+  assert.deepEqual([dead.status, dead.body.alive], [200, false]);
+  const expired = await sessionCheckResponse("tok", "tok", async () => { throw new SessionExpiredError(); }, async () => AGENDA_OK());
+  assert.deepEqual([expired.status, expired.body.alive], [200, false]);
+  const down = await sessionCheckResponse("tok", "tok", async () => new Response("err", { status: 502 }), async () => AGENDA_OK());
+  assert.deepEqual([down.status, down.body.alive, down.body.inconclusive], [503, false, true]);
+  const net = await sessionCheckResponse("tok", "tok", async () => EMPTY(), async () => { throw new TypeError("fetch failed"); });
+  assert.equal(net.status, 503);
+});
+
+// Hallazgo de revisión: el keepAlive pedía renovación ante un 5xx de Bukeala.
+test("keepAliveAction: 5xx o red => inconclusive (sin renovación); rechazo => expired", async () => {
+  assert.equal(keepAliveAction(await checkSessionUsable(async () => COMPONENTS_OK(), async () => AGENDA_OK())), "alive");
+  for (const status of [500, 502, 503]) {
+    assert.equal(keepAliveAction(await checkSessionUsable(async () => new Response("err", { status }), async () => AGENDA_OK())), "inconclusive");
+    assert.equal(keepAliveAction(await checkSessionUsable(async () => EMPTY(), async () => new Response("err", { status }))), "inconclusive");
+  }
+  assert.equal(keepAliveAction(await checkSessionUsable(async () => { throw new Error("proxy"); }, async () => AGENDA_OK())), "inconclusive");
+  assert.equal(keepAliveAction(await checkSessionUsable(
+    async () => new Response(null, { status: 302, headers: { location: "/cas/login" } }), async () => AGENDA_OK())), "expired");
+  assert.equal(keepAliveAction(await checkSessionUsable(async () => { throw new SessionExpiredError(); }, async () => AGENDA_OK())), "expired");
+  assert.equal(keepAliveAction(await checkSessionUsable(async () => EMPTY(), async () => Response.json({ areas: "x" }))), "expired");
 });
