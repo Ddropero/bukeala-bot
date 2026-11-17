@@ -147,6 +147,47 @@ test("checkSessionUsable: 302/HTML/JSON no-array en loadComponents => no viva y 
   assert.equal(agendaCalls, 0);
 });
 
+// Hallazgo de revisión (17-nov-2026): un 5xx o un error de red no es un
+// veredicto. Debe marcarse inconclusive para que /debug/session-check responda
+// 503 (ambiguo en la VM, con reintento) y no 200 {alive:false} ("malo").
+test("checkSessionUsable: 5xx en componentes o agenda, o error de red => no viva e inconclusive", async () => {
+  for (const status of [500, 502, 503]) {
+    const comp = await checkSessionUsable(async () => new Response("err", { status }), async () => AGENDA_OK());
+    assert.equal(comp.alive, false);
+    assert.equal(comp.inconclusive, true);
+    const agenda = await checkSessionUsable(async () => EMPTY(), async () => new Response("err", { status }));
+    assert.equal(agenda.alive, false);
+    assert.equal(agenda.inconclusive, true);
+  }
+  const net = await checkSessionUsable(async () => { throw new Error("synthetic proxy failure"); }, async () => AGENDA_OK());
+  assert.equal(net.alive, false);
+  assert.equal(net.inconclusive, true);
+  const netAgenda = await checkSessionUsable(async () => EMPTY(), async () => { throw new TypeError("fetch failed"); });
+  assert.equal(netAgenda.alive, false);
+  assert.equal(netAgenda.inconclusive, true);
+});
+
+test("checkSessionUsable: los rechazos reales NO son inconclusive (protección 29-jul)", async () => {
+  const rejections = [
+    [() => new Response(null, { status: 302, headers: { location: "/cas/login" } }), AGENDA_OK],
+    [() => new Response("<html>Login</html>", { headers: { "content-type": "text/html" } }), AGENDA_OK],
+    [() => Response.json({ error: "unauthorized" }), AGENDA_OK],
+    [() => Response.json([], { status: 401 }), AGENDA_OK],
+    [() => Response.json([], { status: 403 }), AGENDA_OK],
+    [EMPTY, () => new Response(null, { status: 302, headers: { location: "/cas/login" } })],
+    [EMPTY, () => new Response("<html>Login</html>", { status: 200, headers: { "content-type": "text/html" } })],
+    [EMPTY, () => Response.json({ areas: "no-array" })],
+  ];
+  for (const [components, agenda] of rejections) {
+    const r = await checkSessionUsable(async () => components(), async () => agenda());
+    assert.equal(r.alive, false);
+    assert.notEqual(r.inconclusive, true);
+  }
+  const expired = await checkSessionUsable(async () => { throw new SessionExpiredError(); }, async () => AGENDA_OK());
+  assert.equal(expired.alive, false);
+  assert.notEqual(expired.inconclusive, true);
+});
+
 test("todayBogotaDashed usa UTC-5 (las 03:00 UTC aún son el día anterior en Bogotá)", () => {
   assert.equal(todayBogotaDashed(Date.parse("2026-11-17T03:00:00Z")), "16-11-2026");
   assert.equal(todayBogotaDashed(Date.parse("2026-11-17T16:36:00Z")), "17-11-2026");

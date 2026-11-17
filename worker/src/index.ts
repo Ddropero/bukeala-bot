@@ -934,10 +934,15 @@ app.get("/debug/session-check", async (c) => {
     return c.json({ error: "unauthorized" }, 401, noStore);
   }
   const b = new Bukeala(c.env);
-  const { alive, note } = await checkSessionUsable(
+  const { alive, note, inconclusive } = await checkSessionUsable(
     () => b.loadComponents(),
     () => b.getAgenda(todayBogotaDashed(), AGENDA_AREA_ID, false),
   );
+  // Sin veredicto (5xx de Bukeala, red o proxy DO) => 503, que la VM trata
+  // como ambiguo y reintenta. Un 200 {alive:false} la haría descartar una
+  // sesión buena por un fallo de infraestructura. alive:false con 200 queda
+  // solo para rechazos reales (302/401/403/HTML/no-array/[] sin agenda).
+  if (inconclusive) return c.json({ alive: false, inconclusive: true, note }, 503, noStore);
   return c.json({ alive, note }, 200, noStore);
 });
 

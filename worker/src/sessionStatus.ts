@@ -43,7 +43,15 @@ async function agendaConfirmsSession(response: Response): Promise<boolean> {
   } catch { return false; }
 }
 
-export type SessionCheck = { alive: boolean; note: string; error?: unknown };
+/**
+ * `inconclusive: true` = no hubo veredicto: Bukeala respondió 5xx (en
+ * componentes o en la agenda) o la carga lanzó algo que NO es
+ * SessionExpiredError (red, proxy DO). alive sigue en false (nunca se da por
+ * buena una sesión sin pruebas), pero /debug/session-check lo responde como
+ * no-200 para que la VM lo trate como ambiguo y reintente en vez de descartar
+ * una sesión buena por un hipo de infraestructura.
+ */
+export type SessionCheck = { alive: boolean; note: string; error?: unknown; inconclusive?: boolean };
 
 /**
  * ÚNICA regla para decidir si la sesión guardada sirve (/estado, keepAlive y
@@ -78,18 +86,29 @@ export async function checkSessionUsable(
       return { alive: true, note: "acceso autenticado comprobado" };
     }
     if (!(await isEmptyComponentsList(response))) {
-      return { alive: false, note: `HTTP ${response.status}: acceso autenticado no confirmado` };
+      // 5xx = Bukeala caído, no un rechazo de la sesión: sin veredicto.
+      return {
+        alive: false, note: `HTTP ${response.status}: acceso autenticado no confirmado`,
+        ...(response.status >= 500 ? { inconclusive: true } : {}),
+      };
     }
     const agenda = await loadAgenda();
     if (await agendaConfirmsSession(agenda)) {
       return { alive: true, note: "acceso autenticado comprobado (componentes vacíos, confirmado por la agenda del día)" };
     }
-    return { alive: false, note: `componentes vacíos y agenda HTTP ${agenda.status} sin confirmar: acceso autenticado no confirmado` };
+    return {
+      alive: false, note: `componentes vacíos y agenda HTTP ${agenda.status} sin confirmar: acceso autenticado no confirmado`,
+      ...(agenda.status >= 500 ? { inconclusive: true } : {}),
+    };
   } catch (error) {
+    // SessionExpiredError (302 al login, 401/403, sin cookies) es un rechazo
+    // real; cualquier otra excepción es red/proxy y no decide nada.
+    const expired = error instanceof SessionExpiredError;
     return {
       alive: false,
-      note: error instanceof SessionExpiredError ? "sesión rechazada por Bukeala" : "no se pudo comprobar el acceso",
+      note: expired ? "sesión rechazada por Bukeala" : "no se pudo comprobar el acceso",
       error,
+      ...(expired ? {} : { inconclusive: true }),
     };
   }
 }
