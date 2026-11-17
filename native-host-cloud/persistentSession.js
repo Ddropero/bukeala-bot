@@ -15,6 +15,12 @@ const { sessionHelpers } = require("./autoLogin");
 const CAS_ENTRY = "https://app01.colsanitas.com/cas/login?service=" +
   encodeURIComponent("https://appoint.tuscitasmedicas.com/keraltyadscritos/cas/login");
 const MIN_LOGIN_COOLDOWN_MS = 30 * 60 * 1000;
+// Etapas de renew(). Son el ÚNICO texto libre que el registro deja pasar:
+// por eso es una lista cerrada y no lo que llegue en la metadata.
+const RENEW_STAGES = new Set(["profile", "navigation", "adoption", "verification", "full-login", "publication"]);
+// Códigos de motivo: minúsculas, dígitos y guiones. Una URL, cookie o cuerpo
+// del servidor nunca cumple este patrón (llevan ":", "/", "=", espacios...).
+const SAFE_CODE = /^[a-z][a-z0-9_-]{0,63}$/;
 const SAFE_PATHS = new Set(["/", "/cas/login", "/authentication/login",
   "/keraltyadscritos/cas/login", "/keraltyadscritos/findAvailability"]);
 
@@ -69,16 +75,26 @@ function createPersistentSessionManager(env, options = {}) {
   let closed = false;
   let seeded = false;
   let state;
+  // Etapa del renew() en vuelo (null si no hay ninguno). El watcher la lee al
+  // vencer el plazo del ciclo para reportar DÓNDE se colgó.
+  let currentStage = null;
 
   // Messages/metadata from legacy helpers may contain full URLs or server
   // bodies. Forward only fixed messages and numeric diagnostics.
+  // Excepción acotada: `stage` y `reasonCode` sí pasan, pero SOLO si son
+  // códigos fijos del propio archivo (lista blanca / patrón de código). Sin la
+  // etapa no hubo forma de saber dónde se colgó la VM del 10 al 17/nov/2026.
   function log(level, event, metadata = {}) {
     if (typeof env.log !== "function") return;
     const safe = {};
     for (const key of ["status", "elapsedMs", "cookieCount", "count"]) {
       if (typeof metadata[key] === "number") safe[key] = metadata[key];
     }
-    env.log(level, event, safe);
+    if (RENEW_STAGES.has(metadata.stage)) safe.stage = metadata.stage;
+    if (typeof metadata.reasonCode === "string" && SAFE_CODE.test(metadata.reasonCode)) {
+      safe.reasonCode = metadata.reasonCode;
+    }
+    try { env.log(level, event, safe); } catch { /* el registro nunca tumba la renovación */ }
   }
   function helperLog(level, _message, metadata) {
     log(level, "persistent-session helper diagnostic", metadata);
@@ -155,21 +171,31 @@ function createPersistentSessionManager(env, options = {}) {
     let authenticated = false;
     let loginAttempted = false;
     let captureAccepted = false;
-    let stage = "profile";
+    let stage;
+    const startedAt = now();
+    // Cada transición queda en el registro con su hora (la pone el logger del
+    // watcher) y el tiempo desde el inicio del ciclo. Si la VM vuelve a
+    // colgarse, la última línea "stage" dice en qué etapa quedó.
+    const enterStage = (next) => {
+      stage = next;
+      currentStage = next;
+      log("info", "persistent-session stage", { stage: next, elapsedMs: now() - startedAt });
+    };
+    enterStage("profile");
     // La adopción se intenta UNA vez por ciclo, desde cualquiera de los puntos
     // donde el portal nos cierra la puerta.
     let adopcionIntentada = false;
     const intentarAdopcion = async () => {
       if (adopcionIntentada) return result({ reasonCode: "adopt-already-tried", reason: "adopt-already-tried" });
       adopcionIntentada = true;
-      stage = "adoption";
+      enterStage("adoption");
       const adopted = await adoptWorkerSession();
       log("info", "persistent-session adoption attempt", { cookieCount: adopted.cookieCount });
       return adopted;
     };
     try {
       await ensureContext();
-      stage = "navigation";
+      enterStage("navigation");
       await navigate(helpers.BUKEALA_HOME);
       if (isAuthChallenge(page.url())) {
         // MEDIDO el 25/oct/2026: sin sesión, el portal rebota a CAS y el
@@ -181,7 +207,7 @@ function createPersistentSessionManager(env, options = {}) {
         if (!rescate.ok) {
           return result({ reasonCode: "auth-challenge", reason: "authentication-challenge", authBlocked: true });
         }
-        stage = "navigation";
+        enterStage("navigation");
         await navigate(helpers.BUKEALA_HOME);
         if (isAuthChallenge(page.url())) {
           return result({
@@ -191,18 +217,18 @@ function createPersistentSessionManager(env, options = {}) {
         }
       }
 
-      stage = "verification";
+      enterStage("verification");
       let verification = isCasFormLocation(page.url()) ? { ok: false, authRequired: true }
         : await helpers.verifySessionWorks(context, helperLog, { strict: true });
       // Only an explicit authentication rejection can initiate CAS renewal.
       // A timeout, invalid JSON or server error preserves the current context.
       if (!verification.ok && verification.authRequired && !isCasFormLocation(page.url())) {
-        stage = "navigation";
+        enterStage("navigation");
         await navigate(CAS_ENTRY);
         if (isAuthChallenge(page.url())) {
           return result({ reasonCode: "auth-challenge", reason: "authentication-challenge", authBlocked: true });
         }
-        stage = "verification";
+        enterStage("verification");
         verification = isCasFormLocation(page.url()) ? { ok: false, authRequired: true }
           : await helpers.verifySessionWorks(context, helperLog, { strict: true });
       }
@@ -215,12 +241,12 @@ function createPersistentSessionManager(env, options = {}) {
       if (!verification.ok && verification.authRequired) {
         const adopted = await intentarAdopcion();
         if (adopted.ok) {
-          stage = "navigation";
+          enterStage("navigation");
           await navigate(helpers.BUKEALA_HOME);
           if (isAuthChallenge(page.url())) {
             return result({ reasonCode: "auth-challenge", reason: "authentication-challenge", authBlocked: true });
           }
-          stage = "verification";
+          enterStage("verification");
           verification = isCasFormLocation(page.url()) ? { ok: false, authRequired: true }
             : await helpers.verifySessionWorks(context, helperLog, { strict: true });
         }
@@ -254,7 +280,7 @@ function createPersistentSessionManager(env, options = {}) {
         state.lastFullLoginSuccessAt = 0;
         saveState();
         loginAttempted = true;
-        stage = "full-login";
+        enterStage("full-login");
         await helpers.submitCasForm(page, {
           username: env.CAS_USERNAME, password: env.CAS_PASSWORD,
         }, env.TWO_CAPTCHA_API_KEY, helperLog);
@@ -264,7 +290,7 @@ function createPersistentSessionManager(env, options = {}) {
             reasonCode: "full-login-rejected", reason: "full-login-rejected", authBlocked: true,
           });
         }
-        stage = "verification";
+        enterStage("verification");
         verification = await helpers.verifySessionWorks(context, helperLog, { strict: true });
       }
 
@@ -287,7 +313,7 @@ function createPersistentSessionManager(env, options = {}) {
       if (!env.WORKER_URL || !env.CAPTURE_TOKEN) {
         return result({ via, authenticated, loginAttempted, reasonCode: "publish-config-missing", reason: "publish-config-missing" });
       }
-      stage = "publication";
+      enterStage("publication");
       const cookieCount = await helpers.captureAndPush(context, env.WORKER_URL, env.CAPTURE_TOKEN, helperLog);
       captureAccepted = true;
       const worker = await helpers.verifyViaWorker(env.WORKER_URL, env.CAPTURE_TOKEN, helperLog, { strict: true });
@@ -316,6 +342,20 @@ function createPersistentSessionManager(env, options = {}) {
     } finally {
       inFlight = false;
     }
+  }
+
+  // Envoltura de registro: deja constancia del final de cada ciclo (etapa en
+  // la que terminó y código fijo). Un "stage" sin su "renew finished" detrás es
+  // la firma de un cuelgue. El "busy" no toca la etapa del ciclo que sí corre.
+  async function renewLogged(renewOptions = {}) {
+    const startedAt = now();
+    const outcome = await renew(renewOptions);
+    if (outcome?.reasonCode === "busy") return outcome;
+    log(outcome?.ok ? "info" : "warn", "persistent-session renew finished", {
+      stage: currentStage, reasonCode: outcome?.reasonCode || "ok", elapsedMs: now() - startedAt,
+    });
+    currentStage = null;
+    return outcome;
   }
 
   /**
@@ -459,7 +499,8 @@ function createPersistentSessionManager(env, options = {}) {
   }
 
   return {
-    renew, seedCookies, close, profileDir,
+    renew: renewLogged, seedCookies, close, profileDir,
+    getStage: () => currentStage,
     ...(!publish && options.expiryProbe === true ? { simulateAppSessionLoss } : {}),
   };
 }

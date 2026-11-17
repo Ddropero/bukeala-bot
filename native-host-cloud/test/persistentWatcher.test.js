@@ -78,12 +78,13 @@ function fixture(t) {
     advance: (value) => { clock += value; },
     setPending: (value) => { pending = value; },
     failNetworkWhen: (value) => { networkFailure = value; },
-    create(manager) {
+    create(manager, extra = {}) {
       const watcher = createPersistentWatcher(env, {
         manager,
         fetch,
         now: () => clock,
         log: (level, message, meta) => logs.push({ level, message, meta }),
+        ...extra,
       });
       watchers.push(watcher);
       return watcher;
@@ -455,5 +456,117 @@ test("el evento de fallo lleva la URL del desvío", async (t) => {
   const events = f.requests.filter((request) => request.pathname === "/native-host/event");
   assert.equal(events.length, 1);
   assert.equal(events[0].body.postNavUrl, "https://validate.perfdrive.com/[redacted]");
+  await watcher.close();
+});
+
+// Caída del 10-17/nov/2026: el proceso siguió "active" para systemd pero un
+// renew() nunca resolvió y la VM quedó muda 7 días. Ahora el ciclo tiene plazo,
+// se reporta y el proceso sale con código != 0 para que systemd lo reinicie.
+test("un renew() que nunca resuelve termina en cycle-timeout, se reporta y pide salir", async (t) => {
+  const f = fixture(t);
+  const exits = [];
+  const watcher = f.create({
+    renew: () => new Promise(() => {}),
+    getStage: () => "navigation",
+    close: async () => { throw new Error("un proceso condenado no espera al navegador colgado"); },
+  }, { cycleTimeoutMs: 50, exit: (code) => exits.push(code) });
+  const result = await watcher.runCycle("startup");
+  assert.equal(result.ok, false);
+  assert.equal(result.reasonCode, "cycle-timeout");
+  assert.equal(exits.length, 1);
+  assert.notEqual(exits[0], 0, "systemd solo reinicia limpio con salida distinta de 0");
+  const events = f.requests.filter((request) => request.pathname === "/native-host/event");
+  assert.equal(events.length, 1);
+  assert.equal(events[0].body.type, "error");
+  assert.equal(events[0].body.reasonCode, "cycle-timeout");
+  assert.equal(events[0].body.stage, "navigation");
+  assert.match(events[0].body.message, /cycle-timeout \(etapa navigation/);
+  // El estado persistido sobrevive al reinicio y deja un backoff corto.
+  const saved = JSON.parse(fs.readFileSync(path.join(f.dir, "watcher-status.json"), "utf8"));
+  assert.equal(saved.failures, 1);
+  assert.equal(saved.lastResult.reasonCode, "cycle-timeout");
+  assert.equal(saved.nextAttemptAt, START + 90_000);
+  assert.equal((await watcher.runCycle("scheduled")).skipped, true, "ningún ciclo nuevo en el proceso condenado");
+  await watcher.close();
+  assert.equal(exits.length, 1);
+});
+
+test("el aviso de cycle-timeout tiene su propio plazo: un Worker colgado no impide la salida", async (t) => {
+  const f = fixture(t);
+  const exits = [];
+  const watcher = createPersistentWatcher(f.env, {
+    manager: { renew: () => new Promise(() => {}), close: async () => {} },
+    // Un fetch que jamás responde ni respeta la señal de aborto.
+    fetch: () => new Promise(() => {}),
+    now: f.now,
+    log: () => {},
+    cycleTimeoutMs: 30,
+    exit: (code) => exits.push(code),
+  });
+  const started = Date.now();
+  const result = await watcher.runCycle("startup");
+  assert.equal(result.reasonCode, "cycle-timeout");
+  assert.equal(exits.length, 1);
+  assert.ok(Date.now() - started < 15_000, "el reporte no puede bloquear más que su plazo corto");
+});
+
+test("el vigilante interno detecta un ciclo en vuelo demasiado tiempo, pero no un backoff", async (t) => {
+  const f = fixture(t);
+  const exits = [];
+  let clock = 0;
+  let renewCalls = 0;
+  const watcher = f.create({
+    renew: async () => { renewCalls++; return { ok: false, reasonCode: "auth-challenge" }; },
+    close: async () => {},
+  }, { monotonic: () => clock, exit: (code) => exits.push(code) });
+  // Falla de autenticación → backoff de 30 min sin ciclo en vuelo.
+  await watcher.runCycle("startup");
+  assert.equal(renewCalls, 1);
+  for (let minute = 1; minute <= 25; minute++) {
+    clock += MINUTE;
+    f.advance(MINUTE);
+    await watcher.tick();
+    assert.equal(watcher.checkStuck(), false, "un backoff legítimo no es un cuelgue");
+  }
+  assert.equal(exits.length, 0);
+  assert.equal(renewCalls, 1);
+  await watcher.close();
+
+  // Un ciclo que quedó colgado fuera del plazo envuelto (aquí: plazo enorme).
+  const stuck = f.create({ renew: () => new Promise(() => {}), close: async () => {} },
+    { monotonic: () => clock, exit: (code) => exits.push(code), cycleTimeoutMs: 24 * 60 * MINUTE });
+  f.advance(60 * MINUTE);
+  stuck.runCycle("scheduled");
+  await new Promise((resolve) => setImmediate(resolve));
+  clock += 8 * MINUTE;
+  assert.equal(stuck.checkStuck(), false, "dentro del plazo + margen sigue esperando");
+  clock += 24 * 60 * MINUTE;
+  assert.equal(stuck.checkStuck(), true);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(exits.length, 1);
+  assert.notEqual(exits[0], 0);
+  const events = f.requests.filter((request) => request.pathname === "/native-host/event"
+    && request.body.reasonCode === "cycle-timeout");
+  assert.equal(events.length, 1);
+  assert.match(events[0].body.message, /watchdog-cycle/);
+});
+
+test("el watcher le pasa su logger al manager real (antes env.log no existía)", async (t) => {
+  const f = fixture(t);
+  const sessionModule = require("../persistentSession");
+  const original = sessionModule.createPersistentSessionManager;
+  let receivedEnv;
+  sessionModule.createPersistentSessionManager = (env) => {
+    receivedEnv = env;
+    return { renew: async () => healthy(), close: async () => {} };
+  };
+  t.after(() => { sessionModule.createPersistentSessionManager = original; });
+  const watcher = createPersistentWatcher(f.env, { fetch: async () => ({ ok: true, json: async () => ({ ok: true }) }),
+    now: f.now, log: (level, message, meta) => f.logs.push({ level, message, meta }) });
+  assert.equal(typeof receivedEnv.log, "function");
+  assert.equal(receivedEnv.CAPTURE_TOKEN, f.env.CAPTURE_TOKEN);
+  receivedEnv.log("info", "persistent-session stage", { stage: "profile" });
+  assert.deepEqual(f.logs.at(-1), { level: "info", message: "persistent-session stage", meta: { stage: "profile" } });
+  assert.equal(f.env.log, undefined, "no se muta el env original (process.env en producción)");
   await watcher.close();
 });

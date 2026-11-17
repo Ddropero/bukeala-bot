@@ -160,3 +160,96 @@ test("a malformed or implausibly distant retry deadline cannot hide a stale repo
   await watchdogCron(f.env);
   assert.equal(f.messages.length, 2);
 });
+
+// Caída del 10-17/nov/2026: último evento de la VM el 10-nov 04:47 UTC y 7
+// días de silencio sin que nadie se enterara. Ahora el Dr. recibe un aviso
+// directo tras 2 h, como máximo uno cada 6 h, y un "volvió" una sola vez.
+const SILENT_KEY = "watchdog:vmSilent";
+const NOV_LAST = Date.parse("2026-11-10T04:47:00Z");
+const HOUR = 60 * MINUTE;
+const vmSilent = (messages) => messages.filter((m) => /La VM no reporta/.test(m.text));
+const vmBack = (messages) => messages.filter((m) => /La VM volvió a reportar/.test(m.text));
+
+function novFixture(t, now) {
+  const f = fixture(t, { now });
+  f.data.set(EVENTS_KEY, JSON.stringify([
+    { type: "error", at: new Date(NOV_LAST).toISOString(), via: "persistent", message: "persistent: auth-challenge" },
+  ]));
+  return f;
+}
+
+test("VM muda 2 h+: aviso directo al Dr. con qué hacer, máximo uno cada 6 h", async (t) => {
+  const f = novFixture(t, NOV_LAST + 2 * HOUR - 1);
+  await watchdogCron(f.env);
+  assert.equal(vmSilent(f.messages).length, 0, "por debajo de 2 h puede ser un backoff legítimo");
+
+  f.setNow(NOV_LAST + 2 * HOUR);
+  await watchdogCron(f.env);
+  const first = vmSilent(f.messages);
+  assert.equal(first.length, 1);
+  assert.equal(first[0].chat_id, "101");
+  assert.match(first[0].text, /no reporta hace 2 h/);
+  assert.match(first[0].text, /Brave/);
+  assert.match(first[0].text, /Avisa/);
+  assert.equal(first[0].parse_mode, "HTML");
+
+  for (let minutes = 15; minutes < 6 * 60; minutes += 15) {
+    f.setNow(NOV_LAST + 2 * HOUR + minutes * MINUTE);
+    await watchdogCron(f.env);
+  }
+  assert.equal(vmSilent(f.messages).length, 1, "throttle de 6 h mientras siga muda");
+  f.setNow(NOV_LAST + 8 * HOUR);
+  await watchdogCron(f.env);
+  assert.equal(vmSilent(f.messages).length, 2);
+
+  // Siete días después (el incidente real) sigue avisando y dice cuánto lleva.
+  f.setNow(NOV_LAST + 7 * 24 * HOUR);
+  await watchdogCron(f.env);
+  assert.equal(vmSilent(f.messages).length, 3);
+  assert.match(vmSilent(f.messages)[2].text, /no reporta hace 7 días/);
+  assert.equal(vmBack(f.messages).length, 0);
+});
+
+test("cuando la VM reaparece se avisa UNA sola vez y se rearma la alerta", async (t) => {
+  const f = novFixture(t, NOV_LAST + 3 * HOUR);
+  await watchdogCron(f.env);
+  assert.equal(vmSilent(f.messages).length, 1);
+  assert.ok(f.data.has(SILENT_KEY));
+
+  const back = NOV_LAST + 5 * HOUR;
+  f.data.set(EVENTS_KEY, JSON.stringify([
+    { type: "error", at: new Date(NOV_LAST).toISOString(), via: "persistent" },
+    { type: "error", at: new Date(back).toISOString(), via: "persistent", message: "persistent: cycle-timeout (etapa navigation, deadline)" },
+  ]));
+  f.setNow(back + 5 * MINUTE);
+  await watchdogCron(f.env);
+  assert.equal(vmBack(f.messages).length, 1);
+  assert.equal(f.data.has(SILENT_KEY), false);
+  f.setNow(back + 20 * MINUTE);
+  await watchdogCron(f.env);
+  assert.equal(vmBack(f.messages).length, 1, "el 'volvió' no se repite");
+
+  // Un silencio nuevo vuelve a alertar sin esperar las 6 h del anterior.
+  f.setNow(back + 2 * HOUR);
+  await watchdogCron(f.env);
+  assert.equal(vmSilent(f.messages).length, 2);
+});
+
+test("un backoff legítimo de 60 min con recuperación pendiente no dispara el aviso de VM muda", async (t) => {
+  const last = Date.parse("2026-11-10T03:00:00Z");
+  const f = fixture(t, { now: last + 65 * MINUTE, recovery: { ...pendingRecovery(), nextAttemptAt: last + 60 * MINUTE } });
+  f.data.set(EVENTS_KEY, JSON.stringify([{ type: "error", at: new Date(last).toISOString(), via: "persistent" }]));
+  const original = f.data.get(REQUEST_KEY);
+  await watchdogCron(f.env);
+  assert.equal(vmSilent(f.messages).length, 0);
+  assert.equal(f.data.has(SILENT_KEY), false);
+  assert.equal(f.data.get(REQUEST_KEY), original, "el aviso no toca la recuperación");
+});
+
+test("el aviso de VM muda no lee ni escribe el estado de recuperación", async (t) => {
+  const f = novFixture(t, NOV_LAST + 3 * HOUR);
+  f.failReads(REQUEST_KEY);
+  await watchdogCron(f.env);
+  assert.equal(vmSilent(f.messages).length, 1, "aunque la recuperación no se pueda leer, se avisa");
+  assert.equal(f.writes.filter(({ key }) => key === REQUEST_KEY).length, 0);
+});

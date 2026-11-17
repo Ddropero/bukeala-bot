@@ -7,7 +7,10 @@
  *   2. Pacientes en cola durante GRACE_MIN (20 min) o más.
  * El acceso real a Bukeala se verifica en keepalive y /estado.
  *
+ * Además (vigilancia 0) avisa al Dr. si la VM lleva 2 h+ sin NINGÚN evento.
+ *
  * KV:
+ *   watchdog:vmSilent            → VM muda: {alertedAt, lastEventAt} (TTL 30d)
  *   watchdog:renewerStaleAlerted → alerta por reportes atrasados (TTL 3h)
  *   watchdog:alerted             → alerta por pacientes en cola (TTL 6h)
  */
@@ -120,10 +123,103 @@ async function checkRenewerAlive(env: Env): Promise<void> {
   console.log(`[watchdog] ALERTA reporte del renovador atrasado hace ${Math.round(ageMin)} min`);
 }
 
+/**
+ * VM MUDA — aviso directo al Dr.
+ *
+ * POR QUÉ EXISTE: del 10 al 17/nov/2026 la VM quedó con el proceso vivo pero
+ * colgado y no mandó un solo evento en 7 días. checkRenewerAlive solo pedía
+ * requestRefresh (que un proceso colgado no puede atender) y su aviso quedaba
+ * tapado por la espera de recuperación, así que nadie se enteró.
+ *
+ * Este chequeo es INDEPENDIENTE de requestRecovery/pollRecovery: no pide nada,
+ * no lee su estado y no lo modifica; solo mira la hora del último evento.
+ *
+ * UMBRAL de 2 h: en un backoff legítimo la VM puede pasar hasta 60 min sin
+ * hablar con el Worker (no consulta órdenes durante la espera, por diseño).
+ * El doble de ese máximo evita falsas alarmas y aun así avisa el mismo día,
+ * no una semana después.
+ */
+const VM_SILENT_MS = 2 * 60 * 60 * 1000;
+const VM_SILENT_REPEAT_MS = 6 * 60 * 60 * 1000; // máximo una alerta cada 6 h
+const VM_SILENT_KEY = "watchdog:vmSilent";
+
+interface VmSilentMarker { alertedAt: number; lastEventAt: number }
+
+function describeAge(ms: number): string {
+  const hours = ms / 3600000;
+  if (hours < 48) return `${Math.floor(hours)} h`;
+  return `${Math.floor(hours / 24)} días`;
+}
+
+async function sendDoctors(env: Env, text: string): Promise<void> {
+  const doctors = await getDoctorRecipients(env);
+  for (const chat of doctors) {
+    await fetch(`${TG(env.TELEGRAM_BOT_TOKEN)}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chat, text, parse_mode: "HTML" }),
+    }).catch(() => {});
+  }
+}
+
+export async function checkVmSilent(env: Env, now = Date.now()): Promise<void> {
+  let lastAt = 0;
+  try {
+    for (const e of await getNativeHostEvents(env)) {
+      const t = new Date(e.at).getTime();
+      if (Number.isFinite(t) && t > lastAt) lastAt = t;
+    }
+  } catch { return; /* sin datos: no inventamos alarma */ }
+
+  let marker: VmSilentMarker | null = null;
+  try {
+    const raw = await env.STATE.get(VM_SILENT_KEY);
+    if (raw) marker = JSON.parse(raw);
+  } catch { return; /* sin el throttle podríamos repetir el aviso cada 15 min */ }
+
+  // Anillo vacío pero ya sabíamos de un silencio: sigue mudo desde entonces.
+  if (!lastAt && marker?.lastEventAt) lastAt = marker.lastEventAt;
+  if (!lastAt) return;
+  const silentMs = now - lastAt;
+
+  if (silentMs < VM_SILENT_MS) {
+    // Volvió a reportar: avisarlo UNA sola vez y soltar el marcador.
+    if (marker) {
+      await env.STATE.delete(VM_SILENT_KEY);
+      await sendDoctors(env,
+        "✅ <b>La VM volvió a reportar</b>\n\n" +
+        `El renovador de sesión de Bukeala mandó un evento de nuevo tras ${describeAge(Math.max(0, lastAt - marker.lastEventAt))} en silencio.`);
+      console.log("[watchdog] VM volvió a reportar");
+    }
+    return;
+  }
+
+  if (marker && now - marker.alertedAt < VM_SILENT_REPEAT_MS) return;
+  // Primero el marcador: si Telegram falla, no reintentamos en 15 min.
+  const next: VmSilentMarker = { alertedAt: now, lastEventAt: lastAt };
+  await env.STATE.put(VM_SILENT_KEY, JSON.stringify(next), { expirationTtl: 60 * 60 * 24 * 30 });
+  await sendDoctors(env,
+    `🔴 <b>La VM no reporta hace ${describeAge(silentMs)}</b>\n\n` +
+    "El renovador de sesión de Bukeala (VM de Google) no ha mandado ningún evento. " +
+    "Mientras siga así, la sesión no se renueva y el bot puede dejar de ver la agenda.\n\n" +
+    "<b>Qué hacer:</b>\n" +
+    "1. Entra a Bukeala en Brave en tu PC (con la extensión) para dejar una sesión fresca.\n" +
+    "2. Avisa para que revisen y reinicien la VM <code>bukeala-session-keeper</code>: " +
+    "el proceso puede estar vivo pero colgado.\n\n" +
+    "<i>Repito este aviso cada 6 h mientras siga muda y te escribo cuando vuelva.</i>");
+  console.log(`[watchdog] ALERTA VM muda hace ${Math.round(silentMs / 60000)} min`);
+}
+
 export async function watchdogCron(env: Env): Promise<void> {
   // 24/7: ya no hay gate de horario laboral. La VM renueva a toda hora, así
   // que una sesión caída de madrugada es una falla real (y los pacientes
   // escriben por WhatsApp a cualquier hora).
+
+  // VIGILANCIA 0 — ¿la VM lleva 2 h+ sin mandar NINGÚN evento? Va antes y
+  // aparte de la 1, cuyas salidas tempranas (espera de recuperación) no deben
+  // poder silenciar este aviso. Un fallo aquí no frena las demás vigilancias.
+  try { await checkVmSilent(env); }
+  catch (e) { console.log("[watchdog] chequeo de VM muda falló:", (e as Error).message); }
 
   // VIGILANCIA 1 — ¿faltan reportes fuera de la espera entre reintentos?
   // Esto NO depende de que haya pacientes en cola ni confirma acceso a Bukeala.

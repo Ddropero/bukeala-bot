@@ -567,3 +567,42 @@ test("no re-siembra la misma captura dos veces", async (t) => {
   assert.equal(segunda.ok, false);
   await manager.close();
 });
+
+// La VM estuvo colgada del 10 al 17/nov/2026 sin una sola línea útil en el
+// log: env.log nunca llegaba y no había forma de saber en qué etapa quedó.
+// Ahora cada etapa deja su rastro, sin filtrar ningún secreto de los fixtures.
+test("el registro muestra las etapas recorridas y ningún secreto", async (t) => {
+  const f = fixture(t);
+  const manager = f.manager({ fetch: async () => ({ ok: false, json: async () => ({}) }) });
+  assert.equal((await manager.renew()).ok, true);
+  f.context().authenticated = false;
+  f.calls.logs.length = 0;
+  const result = await manager.renew();
+  assert.equal(result.ok, true);
+  assert.equal(result.loginAttempted, true);
+  const stages = f.calls.logs.filter(entry => entry.message === "persistent-session stage")
+    .map(entry => entry.metadata.stage);
+  for (const stage of ["profile", "navigation", "verification", "adoption", "full-login", "publication"]) {
+    assert.ok(stages.includes(stage), `falta la etapa ${stage} en el registro`);
+  }
+  assert.equal(stages[0], "profile");
+  assert.equal(stages.at(-1), "publication");
+  assert.equal(manager.getStage(), null, "un ciclo terminado no deja etapa en vuelo");
+  const finished = f.calls.logs.filter(entry => entry.message === "persistent-session renew finished");
+  assert.equal(finished.length, 1);
+  assert.deepEqual(finished[0].metadata, { elapsedMs: 0, stage: "publication", reasonCode: "ok" });
+  assert.doesNotMatch(JSON.stringify(f.calls.logs), /SECRET|ticket=|token=|https?:/);
+
+  // Una falla con excepción que embebe secretos solo deja el código fijo.
+  f.calls.logs.length = 0;
+  f.config.navigationFailure = true;
+  const failed = await manager.renew();
+  assert.equal(failed.reasonCode, "navigation-failed");
+  const last = f.calls.logs.at(-1);
+  assert.equal(last.message, "persistent-session renew finished");
+  assert.equal(last.metadata.stage, "navigation");
+  assert.equal(last.metadata.reasonCode, "navigation-failed");
+  assert.doesNotMatch(JSON.stringify(f.calls.logs), /SECRET|ticket=|token=|https?:/);
+  await manager.close();
+});
+
