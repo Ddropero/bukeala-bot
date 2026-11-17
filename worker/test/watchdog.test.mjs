@@ -190,7 +190,9 @@ test("VM muda 2 h+: aviso directo al Dr. con qué hacer, máximo uno cada 6 h", 
   assert.equal(first[0].chat_id, "101");
   assert.match(first[0].text, /no reporta hace 2 h/);
   assert.match(first[0].text, /Brave/);
-  assert.match(first[0].text, /Avisa/);
+  // El paso 2 se puede hacer desde el celular (antes pedía gcloud).
+  assert.match(first[0].text, /console\.cloud\.google\.com/);
+  assert.match(first[0].text, /Restablecer/);
   assert.equal(first[0].parse_mode, "HTML");
 
   for (let minutes = 15; minutes < 6 * 60; minutes += 15) {
@@ -219,7 +221,7 @@ test("cuando la VM reaparece se avisa UNA sola vez y se rearma la alerta", async
   const back = NOV_LAST + 5 * HOUR;
   f.data.set(EVENTS_KEY, JSON.stringify([
     { type: "error", at: new Date(NOV_LAST).toISOString(), via: "persistent" },
-    { type: "error", at: new Date(back).toISOString(), via: "persistent", message: "persistent: cycle-timeout (etapa navigation, deadline)" },
+    { type: "error", at: new Date(back).toISOString(), via: "persistent", message: "persistent: auth-challenge" },
   ]));
   f.setNow(back + 5 * MINUTE);
   await watchdogCron(f.env);
@@ -233,6 +235,59 @@ test("cuando la VM reaparece se avisa UNA sola vez y se rearma la alerta", async
   f.setNow(back + 2 * HOUR);
   await watchdogCron(f.env);
   assert.equal(vmSilent(f.messages).length, 2);
+});
+
+// Hallazgo de revisión: una VM colgándose en bucle manda un cycle-timeout cada
+// ~18 min (8 min de plazo + ≤10 min de backoff + 15 s de RestartSec). Esos
+// avisos no prueban que funcione: no pueden tapar el silencio ni dar un "volvió".
+const cycleTimeout = (at) => ({
+  type: "error", at: new Date(at).toISOString(), via: "persistent",
+  message: "persistent: cycle-timeout (etapa profile, deadline)",
+});
+
+test("cycle-timeouts en bucle no cuentan como señal de vida: se avisa a las 2 h del último evento útil", async (t) => {
+  const f = novFixture(t, NOV_LAST);
+  const ring = [{ type: "error", at: new Date(NOV_LAST).toISOString(), via: "persistent", message: "persistent: auth-challenge" }];
+  for (let m = 18; m <= 3 * 60; m += 18) ring.push(cycleTimeout(NOV_LAST + m * MINUTE));
+  f.data.set(EVENTS_KEY, JSON.stringify(ring));
+  f.setNow(NOV_LAST + 2 * HOUR - 1);
+  await watchdogCron(f.env);
+  assert.equal(vmSilent(f.messages).length, 0);
+  f.setNow(NOV_LAST + 2 * HOUR);
+  await watchdogCron(f.env);
+  const alerts = vmSilent(f.messages);
+  assert.equal(alerts.length, 1, "un evento cada 18 min ya no esconde la falla");
+  assert.match(alerts[0].text, /avisos de cuelgue/);
+  assert.equal(vmBack(f.messages).length, 0);
+});
+
+test("tras un silencio, un cycle-timeout NO dispara el falso 'volvió'; un evento útil sí", async (t) => {
+  const f = novFixture(t, NOV_LAST + 3 * HOUR);
+  await watchdogCron(f.env);
+  assert.equal(vmSilent(f.messages).length, 1);
+
+  const ring = [{ type: "error", at: new Date(NOV_LAST).toISOString(), via: "persistent" }, cycleTimeout(NOV_LAST + 3 * HOUR + 5 * MINUTE)];
+  f.data.set(EVENTS_KEY, JSON.stringify(ring));
+  f.setNow(NOV_LAST + 3 * HOUR + 10 * MINUTE);
+  await watchdogCron(f.env);
+  assert.equal(vmBack(f.messages).length, 0, "la VM sigue rota aunque mande un cycle-timeout");
+  assert.ok(f.data.has(SILENT_KEY));
+
+  ring.push({ type: "ok", at: new Date(NOV_LAST + 3 * HOUR + 30 * MINUTE).toISOString(), via: "persistent" });
+  f.data.set(EVENTS_KEY, JSON.stringify(ring));
+  f.setNow(NOV_LAST + 3 * HOUR + 35 * MINUTE);
+  await watchdogCron(f.env);
+  assert.equal(vmBack(f.messages).length, 1);
+  assert.equal(f.data.has(SILENT_KEY), false);
+});
+
+test("un anillo hecho solo de cycle-timeouts también cuenta como VM muda", async (t) => {
+  const f = novFixture(t, NOV_LAST + 3 * HOUR);
+  const ring = [];
+  for (let m = 0; m <= 3 * 60; m += 18) ring.push(cycleTimeout(NOV_LAST + m * MINUTE));
+  f.data.set(EVENTS_KEY, JSON.stringify(ring));
+  await watchdogCron(f.env);
+  assert.equal(vmSilent(f.messages).length, 1);
 });
 
 test("un backoff legítimo de 60 min con recuperación pendiente no dispara el aviso de VM muda", async (t) => {

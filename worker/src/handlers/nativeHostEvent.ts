@@ -198,6 +198,37 @@ export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
     }
   }
 
+  // Alerta por CUELGUES EN BUCLE. Cada cycle-timeout llega justo antes de que
+  // la VM se reinicie, así que una VM que se cuelga siempre en la misma etapa
+  // (perfil trabado, Chromium que no arranca) manda un evento cada ~18 min:
+  // nunca parece muda para el watchdog y ninguna otra alerta mira este texto.
+  // Es la misma falla del 10-17/nov/2026, pero con eventos que la tapaban.
+  // Un solo cycle-timeout puede ser un tropiezo que el reinicio arregla; dos
+  // seguidos (sin nada útil entre ellos) ya es un bucle. Throttle 3 h.
+  if (isCycleTimeoutEvent(event)) {
+    const seguidos = trailingCycleTimeouts(events);
+    if (seguidos >= CYCLE_TIMEOUT_ALERT_AFTER) {
+      const lastRaw = await c.env.STATE.get(CYCLE_TIMEOUT_ALERT_KEY);
+      const now = Date.now();
+      if (!lastRaw || now - parseInt(lastRaw, 10) > CYCLE_TIMEOUT_ALERT_THROTTLE_MS) {
+        await c.env.STATE.put(CYCLE_TIMEOUT_ALERT_KEY, String(now), { expirationTtl: 60 * 60 * 12 });
+        try {
+          const etapa = cycleTimeoutStage(event.message);
+          const doctors = await getDoctorRecipients(c.env);
+          for (const chat of doctors) {
+            await fetch(`${TG(c.env.TELEGRAM_BOT_TOKEN)}/sendMessage`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ chat_id: chat, text: cycleTimeoutAlertText(seguidos, etapa), parse_mode: "HTML" }),
+            }).catch(() => {});
+          }
+        } catch (e) {
+          console.log("[native-host-event] cycle-timeout alert failed:", (e as Error).message);
+        }
+      }
+    }
+  }
+
   // On a successful refresh, kick off pending-queue processing in the background
   if (event.type === "ok") {
     c.executionCtx.waitUntil(
@@ -253,6 +284,53 @@ export async function handleNativeHostEvent(c: Context<{ Bindings: Env }>) {
   }
 
   return c.json({ ok: true, eventsLogged: events.length });
+}
+
+// ====================================================================
+// Cuelgues de la VM (cycle-timeout)
+// ====================================================================
+
+const CYCLE_TIMEOUT_ALERT_KEY = "nativeHost:cycleTimeoutAlertAt";
+const CYCLE_TIMEOUT_ALERT_AFTER = 2;
+const CYCLE_TIMEOUT_ALERT_THROTTLE_MS = 3 * 60 * 60 * 1000;
+// Copia de la lista cerrada de etapas de renew() en la VM: la etapa sale del
+// texto del evento y solo se repite al Dr. si es una de estas.
+const RENEW_STAGES = new Set(["profile", "navigation", "adoption", "verification", "full-login", "publication"]);
+
+/**
+ * ¿Es el aviso que la VM manda justo antes de reiniciarse por un cuelgue?
+ * No prueba que la VM funcione: prueba que el proceso se está reiniciando. Por
+ * eso el watchdog no lo cuenta como señal de vida.
+ */
+export function isCycleTimeoutEvent(e: { type?: string; message?: string } | null | undefined): boolean {
+  return e?.type === "error" && /cycle-timeout/i.test(e?.message ?? "");
+}
+
+/** Cuántos cycle-timeout seguidos cierran el anillo (sin evento útil después). */
+export function trailingCycleTimeouts(events: Array<{ type?: string; message?: string }>): number {
+  let n = 0;
+  for (let i = events.length - 1; i >= 0 && isCycleTimeoutEvent(events[i]); i--) n++;
+  return n;
+}
+
+function cycleTimeoutStage(message?: string): string | null {
+  const m = /etapa ([a-z-]+)/i.exec(message ?? "");
+  return m && RENEW_STAGES.has(m[1]) ? m[1] : null;
+}
+
+function cycleTimeoutAlertText(seguidos: number, etapa: string | null): string {
+  return (
+    `🔴 <b>La VM se está colgando en bucle</b> (${seguidos} reinicios seguidos)\n\n` +
+    "El renovador de sesión de Bukeala se queda pegado" +
+    (etapa ? ` en la etapa <code>${etapa}</code>` : "") +
+    ", se reinicia solo y se vuelve a pegar. Mientras siga así la sesión no se renueva.\n\n" +
+    "<b>Qué hacer:</b>\n" +
+    "1. Entra a Bukeala en Brave en tu PC (con la extensión) para dejar una sesión fresca.\n" +
+    "2. Si no se arregla, reinicia la máquina desde el celular: en el navegador abre " +
+    "console.cloud.google.com → Compute Engine → Instancias de VM → <code>bukeala-session-keeper</code> → " +
+    "<b>Restablecer</b>.\n\n" +
+    "<i>Repito este aviso como máximo cada 3 h mientras siga colgándose.</i>"
+  );
 }
 
 /**

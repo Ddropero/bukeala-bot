@@ -163,6 +163,8 @@ Environment=DISPLAY=:99
 Environment=XAUTHORITY=/var/lib/bukeala/Xauthority
 Environment=ENABLE_FULL_LOGIN=$ENABLE_FULL_LOGIN
 Environment=FULL_LOGIN_COOLDOWN_MS=1800000
+# Latido que lee bukeala-liveness (abajo); la ruta debe coincidir con la suya.
+Environment=HEARTBEAT_FILE=/var/lib/bukeala/browser-profile/watcher-heartbeat
 ExecStart=/usr/bin/node $APP/watcher.js
 UMask=0077
 TimeoutStopSec=420
@@ -177,10 +179,67 @@ WantedBy=multi-user.target
 UNIT
 
 chmod 600 /etc/systemd/system/bukeala.service
+
+# --- Vigilante de vida FUERA de Node ---
+# POR QUÉ: el plazo por ciclo y el vigilante interno del watcher corren en el
+# mismo bucle de eventos; un bucle síncrono o un proceso congelado los apaga a
+# ambos y Restart=always solo actúa si el proceso MUERE (10-17/nov/2026: 7
+# días "active" y mudo). Este timer mira el latido que el watcher reescribe
+# cada minuto y, si tiene 15 min o más, mata el servicio para que systemd lo
+# levante limpio. 15 min > plazo de ciclo (8) + margen del vigilante (2): un
+# ciclo lento pero vivo sigue latiendo y nunca llega aquí. Se mata con
+# SIGKILL porque un bucle bloqueado no atiende SIGTERM y TimeoutStopSec=420
+# lo dejaría 7 min más colgado.
+cat > /usr/local/bin/bukeala-liveness.sh <<'LIVENESS'
+#!/bin/sh
+HB=/var/lib/bukeala/browser-profile/watcher-heartbeat
+MAX_AGE=900
+# Solo un servicio arriba (no arrancando ni deteniéndose) y que ya late.
+[ "$(systemctl is-active bukeala.service)" = "active" ] || exit 0
+[ -f "$HB" ] || exit 0
+now=$(date +%s)
+# Un proceso recién arrancado aún no tuvo tiempo de latar en firme.
+started=$(date -d "$(systemctl show -p ActiveEnterTimestamp --value bukeala.service)" +%s 2>/dev/null || echo "$now")
+[ $((now - started)) -ge "$MAX_AGE" ] || exit 0
+beat=$(stat -c %Y "$HB" 2>/dev/null || echo "$now")
+age=$((now - beat))
+[ "$age" -ge "$MAX_AGE" ] || exit 0
+echo "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"level\":\"error\",\"message\":\"liveness: latido viejo, se mata el servicio\",\"heartbeatAgeS\":$age}" >> /var/log/bukeala.log
+systemctl kill --signal=SIGKILL --kill-whom=all bukeala.service
+LIVENESS
+chmod 700 /usr/local/bin/bukeala-liveness.sh
+cat > /etc/systemd/system/bukeala-liveness.service <<'LIVSVC'
+[Unit]
+Description=Reinicia bukeala.service si su latido envejece
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bukeala-liveness.sh
+LIVSVC
+cat > /etc/systemd/system/bukeala-liveness.timer <<'LIVTMR'
+[Unit]
+Description=Vigilante de vida de bukeala.service cada 5 min
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+LIVTMR
+
 systemctl daemon-reload
 systemctl enable --now bukeala-display.service
 systemctl enable bukeala.service
 systemctl restart bukeala.service
+# Solo el watcher persistente escribe el latido; en modo legacy no hay qué
+# vigilar y el timer quedaría matando un servicio sano.
+if [ "$BROWSER_SESSION_MODE" = "persistent" ]; then
+  systemctl enable --now bukeala-liveness.timer
+else
+  systemctl disable --now bukeala-liveness.timer 2>/dev/null || true
+fi
 echo "=== Bukeala setup DONE $(date) ==="
 systemctl status bukeala.service --no-pager || true
 FOOTER

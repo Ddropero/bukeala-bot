@@ -77,6 +77,13 @@ function createPersistentWatcher(env, options = {}) {
   // Código de salida distinto de 0: systemd (Restart=always, RestartSec=15)
   // levanta un proceso limpio con navegador nuevo; el estado en disco sigue.
   const CYCLE_TIMEOUT_EXIT_CODE = 3;
+  // LATIDO PARA UN VIGILANTE FUERA DE NODE. El plazo por ciclo y checkStuck
+  // corren en el mismo bucle de eventos que vigilan: un bucle síncrono o un
+  // proceso congelado los apaga a los dos, y Restart=always solo actúa si el
+  // proceso muere. Por eso el intervalo del vigilante reescribe este archivo
+  // cada minuto y un timer de systemd (bukeala-liveness, ver
+  // build-startup-script.sh) reinicia el servicio si su mtime envejece.
+  const heartbeatFile = options.heartbeatFile || env.HEARTBEAT_FILE || path.join(profileDir, "watcher-heartbeat");
   let status = { version: 1, successfulCycles: 0, fullLogins: 0, failures: 0, nextAttemptAt: 0 };
   try {
     const previous = JSON.parse(fs.readFileSync(statusFile, "utf8"));
@@ -180,6 +187,19 @@ function createPersistentWatcher(env, options = {}) {
     if (monotonic() - activity.since < cycleTimeoutMs + watchdogGraceMs) return false;
     failCycleTimeout(`watchdog-${activity.name}`).catch(() => exit(CYCLE_TIMEOUT_EXIT_CODE));
     return true;
+  }
+
+  // Late solo si el proceso sigue útil: condenado (fatal) o cerrando ya no
+  // debe parecer sano, para que el vigilante externo pueda actuar si la salida
+  // misma se traba. Nunca lanza: el latido no puede tumbar el watcher.
+  function beat() {
+    if (fatal || closed) return false;
+    try {
+      fs.writeFileSync(heartbeatFile, `${new Date(now()).toISOString()}\n`, { mode: 0o600 });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async function flushCompletion() {
@@ -338,8 +358,13 @@ function createPersistentWatcher(env, options = {}) {
   async function run(signal) {
     // El vigilante arranca ANTES del primer ciclo: el de arranque también puede
     // colgarse. unref() para que el temporizador no mantenga vivo el proceso.
+    // Late YA, antes del primer ciclo: un latido viejo del proceso anterior no
+    // debe hacer que el vigilante externo reinicie a este recién nacido.
+    beat();
     if (!watchdogTimer && !closed) {
-      watchdogTimer = setInterval(checkStuck, watchdogEveryMs);
+      // Un ciclo atascado no late: checkStuck lo termina; si ni eso corre, el
+      // latido envejece y el vigilante externo reinicia el servicio.
+      watchdogTimer = setInterval(() => { if (!checkStuck()) beat(); }, watchdogEveryMs);
       watchdogTimer.unref?.();
     }
     // Failed attempts keep their deadline; healthy profiles reopen immediately.
@@ -351,7 +376,7 @@ function createPersistentWatcher(env, options = {}) {
     }
     await close();
   }
-  return { run, runCycle, tick, close, checkStuck, getStatus: () => ({ ...status }) };
+  return { run, runCycle, tick, close, checkStuck, beat, heartbeatFile, getStatus: () => ({ ...status }) };
 }
 
 async function main(env = process.env) {

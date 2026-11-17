@@ -570,3 +570,57 @@ test("el watcher le pasa su logger al manager real (antes env.log no existía)",
   assert.equal(f.env.log, undefined, "no se muta el env original (process.env en producción)");
   await watcher.close();
 });
+
+// Hallazgo de revisión: el plazo y el vigilante interno viven en el mismo bucle
+// de eventos que vigilan. El latido alimenta un vigilante FUERA de Node
+// (bukeala-liveness); estas pruebas fijan su contrato del lado del watcher.
+test("el watcher late al arrancar (antes del primer ciclo) y deja de latar al cerrar", async (t) => {
+  const f = fixture(t);
+  let fileAtFirstRenew = null;
+  const watcher = f.create({
+    renew: async () => {
+      fileAtFirstRenew = fs.existsSync(path.join(f.dir, "watcher-heartbeat"));
+      return healthy();
+    },
+    close: async () => {},
+  });
+  assert.equal(watcher.heartbeatFile, path.join(f.dir, "watcher-heartbeat"));
+  const controller = new AbortController();
+  controller.abort();
+  await watcher.run(controller.signal);
+  assert.equal(fileAtFirstRenew, true, "un latido viejo del proceso anterior no puede matar al nuevo");
+  assert.equal(fs.readFileSync(watcher.heartbeatFile, "utf8").trim(), new Date(START).toISOString());
+  assert.equal(watcher.beat(), false, "un watcher cerrado no debe parecer sano");
+});
+
+test("un proceso condenado por cycle-timeout deja de latar para que el vigilante externo pueda actuar", async (t) => {
+  const f = fixture(t);
+  const exits = [];
+  const watcher = f.create({ renew: () => new Promise(() => {}), close: async () => {} },
+    { cycleTimeoutMs: 30, exit: (code) => exits.push(code) });
+  assert.equal(watcher.beat(), true);
+  await watcher.runCycle("startup");
+  assert.equal(exits.length, 1);
+  assert.equal(watcher.beat(), false);
+});
+
+test("un latido que no se puede escribir no tumba el watcher", async (t) => {
+  const f = fixture(t);
+  const watcher = f.create({ renew: async () => healthy(), close: async () => {} },
+    { heartbeatFile: path.join(f.dir, "no-existe", "sub", "watcher-heartbeat") });
+  assert.equal(watcher.beat(), false);
+  assert.equal((await watcher.runCycle("startup")).ok, true);
+});
+
+test("el vigilante externo lee el mismo latido que escribe el servicio y lo mata con SIGKILL", () => {
+  const script = fs.readFileSync(path.join(__dirname, "..", "build-startup-script.sh"), "utf8");
+  const written = /Environment=HEARTBEAT_FILE=(\S+)/.exec(script)?.[1];
+  const read = /^HB=(\S+)$/m.exec(script)?.[1];
+  assert.ok(written && read);
+  assert.equal(read, written, "si las rutas divergen el timer reinicia un servicio sano cada 15 min");
+  const maxAge = Number(/^MAX_AGE=(\d+)$/m.exec(script)?.[1]);
+  // Más que plazo de ciclo (8 min) + margen del vigilante interno (2 min).
+  assert.ok(maxAge * 1000 > 10 * MINUTE);
+  assert.match(script, /systemctl kill --signal=SIGKILL --kill-whom=all bukeala\.service/);
+  assert.match(script, /systemctl enable --now bukeala-liveness\.timer/);
+});

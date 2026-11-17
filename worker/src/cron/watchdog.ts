@@ -16,7 +16,7 @@
  */
 import type { Env } from "../env";
 import { getDoctorRecipients } from "../users";
-import { requestRefresh, getNativeHostEvents } from "../handlers/nativeHostEvent";
+import { requestRefresh, getNativeHostEvents, isCycleTimeoutEvent } from "../handlers/nativeHostEvent";
 import { loadPendingRequests } from "../claudeBookingAgent";
 import { getRecoveryStatus } from "../sessionRecovery";
 
@@ -163,11 +163,24 @@ async function sendDoctors(env: Env, text: string): Promise<void> {
 }
 
 export async function checkVmSilent(env: Env, now = Date.now()): Promise<void> {
+  // Se mide desde el último evento ÚTIL, no desde cualquiera. Un cycle-timeout
+  // lo manda la VM justo antes de reiniciarse por un cuelgue: si se contara,
+  // una VM colgándose en bucle (un evento cada ~18 min) nunca parecería muda y
+  // el primer cuelgue tras un silencio daría un falso "volvió a reportar".
   let lastAt = 0;
+  let oldestAt = 0;
+  let timeoutsSince = 0;
   try {
-    for (const e of await getNativeHostEvents(env)) {
+    const events = await getNativeHostEvents(env);
+    for (const e of events) {
       const t = new Date(e.at).getTime();
-      if (Number.isFinite(t) && t > lastAt) lastAt = t;
+      if (!Number.isFinite(t)) continue;
+      if (!oldestAt || t < oldestAt) oldestAt = t;
+      if (!isCycleTimeoutEvent(e) && t > lastAt) lastAt = t;
+    }
+    for (const e of events) {
+      const t = new Date(e.at).getTime();
+      if (isCycleTimeoutEvent(e) && Number.isFinite(t) && t > lastAt) timeoutsSince++;
     }
   } catch { return; /* sin datos: no inventamos alarma */ }
 
@@ -179,6 +192,9 @@ export async function checkVmSilent(env: Env, now = Date.now()): Promise<void> {
 
   // Anillo vacío pero ya sabíamos de un silencio: sigue mudo desde entonces.
   if (!lastAt && marker?.lastEventAt) lastAt = marker.lastEventAt;
+  // Anillo hecho SOLO de cycle-timeouts: no hay evento útil que fechar, pero
+  // el más viejo es una cota segura de cuándo empezó el bucle.
+  if (!lastAt && timeoutsSince) lastAt = oldestAt;
   if (!lastAt) return;
   const silentMs = now - lastAt;
 
@@ -200,12 +216,16 @@ export async function checkVmSilent(env: Env, now = Date.now()): Promise<void> {
   await env.STATE.put(VM_SILENT_KEY, JSON.stringify(next), { expirationTtl: 60 * 60 * 24 * 30 });
   await sendDoctors(env,
     `🔴 <b>La VM no reporta hace ${describeAge(silentMs)}</b>\n\n` +
-    "El renovador de sesión de Bukeala (VM de Google) no ha mandado ningún evento. " +
+    (timeoutsSince
+      ? `El renovador de sesión de Bukeala (VM de Google) solo ha mandado avisos de cuelgue (${timeoutsSince} reinicios) y ningún resultado útil. `
+      : "El renovador de sesión de Bukeala (VM de Google) no ha mandado ningún evento. ") +
     "Mientras siga así, la sesión no se renueva y el bot puede dejar de ver la agenda.\n\n" +
     "<b>Qué hacer:</b>\n" +
     "1. Entra a Bukeala en Brave en tu PC (con la extensión) para dejar una sesión fresca.\n" +
-    "2. Avisa para que revisen y reinicien la VM <code>bukeala-session-keeper</code>: " +
-    "el proceso puede estar vivo pero colgado.\n\n" +
+    "2. Si sigue igual, reinicia la máquina desde el celular: en el navegador abre " +
+    "console.cloud.google.com → Compute Engine → Instancias de VM → <code>bukeala-session-keeper</code> → " +
+    "<b>Restablecer</b>. La VM ya reinicia sola un proceso colgado; si aun así no reporta, " +
+    "la máquina entera está trabada.\n\n" +
     "<i>Repito este aviso cada 6 h mientras siga muda y te escribo cuando vuelva.</i>");
   console.log(`[watchdog] ALERTA VM muda hace ${Math.round(silentMs / 60000)} min`);
 }
