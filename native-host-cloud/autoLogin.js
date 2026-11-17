@@ -102,6 +102,48 @@ async function hasBukealaSession(context) {
  * 10 min durante ~28 min. /agenda caído todo ese rato sin que nadie lo supiera.
  * Con esta prueba, ese caso cae a login completo (~90 s) en el primer ciclo.
  */
+/**
+ * Segunda prueba de vida, independiente de que haya un paciente seleccionado:
+ * la agenda del día del área del Dr. Es el mismo endpoint que usa el Worker
+ * para /agenda, así que si responde aquí, la sesión sirve para lo que importa.
+ * Exige 200 + JSON con `areas` (array). Sin seguir redirects: un 302 al login
+ * es sesión muerta.
+ */
+async function agendaConfirmaSesion(context, log) {
+  try {
+    // Fecha de hoy en Bogotá (UTC-5, sin horario de verano) como DD-MM-YYYY.
+    const bogota = new Date(Date.now() - 5 * 3600 * 1000);
+    const dd = String(bogota.getUTCDate()).padStart(2, "0");
+    const mm = String(bogota.getUTCMonth() + 1).padStart(2, "0");
+    const fecha = `${dd}-${mm}-${bogota.getUTCFullYear()}`;
+    const origin = new URL(BUKEALA_BASE).origin;
+    const url = `${origin}/admin/daily/456/${fecha}/list?includeCanceled=false&areaId=1074`;
+    const res = await context.request.get(url, {
+      headers: { "X-Requested-With": "XMLHttpRequest", Accept: "application/json, text/javascript, */*; q=0.01" },
+      maxRedirects: 0,
+      timeout: 20_000,
+    });
+    const status = res.status();
+    if (status !== 200) {
+      log("warn", "confirmación por agenda falló", { status });
+      return { ok: false, detail: `agenda status ${status}`, status, authRequired: status === 401 || status === 403 || status === 302, retryable: status >= 500 };
+    }
+    let body;
+    try { body = JSON.parse((await res.text().catch(() => "")).trim()); } catch {
+      log("warn", "confirmación por agenda: respuesta no-JSON");
+      return { ok: false, detail: "agenda respuesta no-JSON", inconclusive: true };
+    }
+    if (!body || typeof body !== "object" || !Array.isArray(body.areas)) {
+      log("warn", "confirmación por agenda: estructura no reconocida");
+      return { ok: false, detail: "agenda sin 'areas'", inconclusive: true };
+    }
+    return { ok: true };
+  } catch (e) {
+    log("warn", "confirmación por agenda lanzó");
+    return { ok: false, detail: "agenda error", inconclusive: true };
+  }
+}
+
 async function verifySessionWorks(context, log, opts = {}) {
   try {
     const url = `${BUKEALA_BASE}${VERIFY_PATH}&_=${Date.now()}`;
@@ -125,6 +167,18 @@ async function verifySessionWorks(context, log, opts = {}) {
     try { parsed = JSON.parse(body); } catch {
       log("warn", "verificación de sesión: respuesta no-JSON");
       return { ok: false, detail: "respuesta no-JSON", inconclusive: true };
+    }
+    // MEDIDO el 17-nov-2026: con la sesión VIVA del Dr. (agenda respondiendo),
+    // loadComponents devolvió [] — vacío porque no había paciente seleccionado.
+    // Exigir lista no vacía hacía que la VM rechazara una sesión buena y
+    // reintentara cada 90 s para siempre. Un [] es JSON de una petición
+    // autenticada (una sesión muerta da 302 o HTML, que ya se atrapan arriba),
+    // pero por prudencia se confirma con una prueba que NO depende del
+    // paciente: la agenda del día. Así se mantiene la protección del 29/jul.
+    if (opts.strict && Array.isArray(parsed) && parsed.length === 0) {
+      const agenda = await agendaConfirmaSesion(context, log);
+      if (agenda.ok) return { ok: true, detail: "200 [] confirmado por la agenda del día" };
+      return agenda;
     }
     if (opts.strict && !isComponentsResponse(parsed)) {
       log("warn", "verificación de sesión: estructura no reconocida");

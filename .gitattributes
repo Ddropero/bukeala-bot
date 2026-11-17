@@ -1,0 +1,5 @@
+# Los scripts de shell corren en Linux (VM de GCE): forzarlos a LF aunque
+# Windows tenga core.autocrlf=true. Es una proteccion preventiva: el generador
+# ya normaliza su salida con sed, pero asi no depende de que el bash de Windows
+# tolere un .sh con CRLF.
+*.sh text eol=lf

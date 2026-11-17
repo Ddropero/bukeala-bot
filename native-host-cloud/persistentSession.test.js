@@ -49,10 +49,20 @@ function fixture(t, overrides = {}) {
             } }) }),
           };
           this.request = {
-            get: async () => ({
-              status: () => config.responseStatus || (this.authenticated ? 200 : 302),
-              text: async () => config.responseBody === null ? JSON.stringify(COMPONENTS) : config.responseBody,
-            }),
+            get: async (url) => {
+              // La agenda del día (/admin/daily) es la segunda prueba de vida
+              // cuando loadComponents viene vacío; se configura aparte.
+              if (String(url).includes("/admin/daily/") && config.agendaStatus !== undefined) {
+                return {
+                  status: () => config.agendaStatus,
+                  text: async () => config.agendaBody ?? JSON.stringify({ areas: [] }),
+                };
+              }
+              return {
+                status: () => config.responseStatus || (this.authenticated ? 200 : 302),
+                text: async () => config.responseBody === null ? JSON.stringify(COMPONENTS) : config.responseBody,
+              };
+            },
           };
         }
         pages() { return [this.page]; }
@@ -606,3 +616,32 @@ test("el registro muestra las etapas recorridas y ningún secreto", async (t) =>
   await manager.close();
 });
 
+
+// MEDIDO el 17-nov-2026: con la sesion VIVA del Dr., loadComponents devolvio []
+// (no habia paciente seleccionado) y la VM rechazaba la sesion para siempre.
+// Un [] se confirma con la agenda del dia, que no depende del paciente.
+test("loadComponents vacio con agenda viva: la sesion se acepta", async (t) => {
+  const f = fixture(t, { responseBody: "[]", agendaStatus: 200 });
+  const manager = f.manager();
+  const result = await manager.renew();
+  assert.equal(result.ok, true, "una sesion viva sin paciente seleccionado no debe rechazarse");
+  assert.equal(result.authenticated, true);
+  await manager.close();
+});
+
+// Y la proteccion del 29-jul se mantiene: si la agenda tambien falla, se rechaza.
+test("loadComponents vacio y agenda redirigiendo al login: la sesion se rechaza", async (t) => {
+  const f = fixture(t, { responseBody: "[]", agendaStatus: 302 });
+  const manager = f.manager({ fetch: async () => ({ ok: false, json: async () => ({}) }) });
+  const result = await manager.renew();
+  assert.equal(result.ok, false);
+  await manager.close();
+});
+
+test("loadComponents vacio y agenda sin estructura: la sesion se rechaza", async (t) => {
+  const f = fixture(t, { responseBody: "[]", agendaStatus: 200, agendaBody: "<html>login</html>" });
+  const manager = f.manager({ fetch: async () => ({ ok: false, json: async () => ({}) }) });
+  const result = await manager.renew();
+  assert.equal(result.ok, false);
+  await manager.close();
+});
