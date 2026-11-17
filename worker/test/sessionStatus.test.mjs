@@ -4,10 +4,16 @@ import { fileURLToPath } from "node:url";
 import { buildSync } from "esbuild";
 
 const bundle = buildSync({
-  entryPoints: [fileURLToPath(new URL("../src/sessionStatus.ts", import.meta.url))],
+  // Entrada virtual: exporta también SessionExpiredError del MISMO bundle, para
+  // que el instanceof de checkSessionUsable reconozca el error que lanzan las pruebas.
+  stdin: {
+    contents: 'export * from "./sessionStatus.ts"; export { SessionExpiredError } from "./bukeala.ts";',
+    resolveDir: fileURLToPath(new URL("../src/", import.meta.url)),
+    loader: "ts",
+  },
   bundle: true, write: false, platform: "node", format: "esm", target: "es2022",
 }).outputFiles[0].text;
-const { formatSessionStatus, probeSessionStatus, readRenewalCounts } = await import(`data:text/javascript;base64,${Buffer.from(bundle).toString("base64")}`);
+const { formatSessionStatus, probeSessionStatus, readRenewalCounts, checkSessionUsable, todayBogotaDashed, SessionExpiredError } = await import(`data:text/javascript;base64,${Buffer.from(bundle).toString("base64")}`);
 const NOW = Date.parse("2026-10-21T01:37:00Z"); // 20:37 in Bogotá on October 20.
 function status(overrides = {}) {
   return {
@@ -73,14 +79,77 @@ test("HTTP 200 with login HTML, error JSON or empty components does not report o
     Response.json([]),
     Response.json([{ id: 1, code: "ABC", description: "Specialty" }], { status: 503 }),
   ];
+  // La agenda tampoco confirma (302 al login): el [] debe seguir siendo "no viva".
+  const deadAgenda = async () => new Response(null, { status: 302, headers: { location: "/cas/login" } });
   for (const response of rejected) {
-    assert.equal((await probeSessionStatus(async () => response)).alive, false);
+    assert.equal((await probeSessionStatus(async () => response, deadAgenda)).alive, false);
   }
-  const valid = await probeSessionStatus(async () => Response.json([{ id: 1, code: "ABC", description: "Specialty" }]));
+  const valid = await probeSessionStatus(async () => Response.json([{ id: 1, code: "ABC", description: "Specialty" }]), deadAgenda);
   assert.equal(valid.alive, true);
   assert.match(valid.note, /autenticado comprobado/);
-  const network = await probeSessionStatus(async () => { throw new Error("synthetic network failure"); });
+  const network = await probeSessionStatus(async () => { throw new Error("synthetic network failure"); }, deadAgenda);
   assert.equal(network.alive, false);
+});
+
+// 17-nov-2026: con la sesión VIVA, loadComponents devolvió [] (sin paciente
+// seleccionado). La regla única confirma ese [] con la agenda del día.
+const COMPONENTS_OK = () => Response.json([{ id: 1, code: "ABC", description: "Specialty" }]);
+const EMPTY = () => Response.json([]);
+const AGENDA_OK = () => Response.json({ areas: [{ bookings: [] }], defaultDateFormatted: "17/11/2026" });
+
+test("checkSessionUsable: [] + agenda viva => viva", async () => {
+  const r = await checkSessionUsable(async () => EMPTY(), async () => AGENDA_OK());
+  assert.equal(r.alive, true);
+  assert.match(r.note, /agenda/);
+  assert.equal((await probeSessionStatus(async () => EMPTY(), async () => AGENDA_OK())).alive, true);
+});
+
+test("checkSessionUsable: [] + agenda 302, HTML, JSON sin areas, 401/403 o SessionExpired => no viva", async () => {
+  const agendas = [
+    () => new Response(null, { status: 302, headers: { location: "/cas/login" } }),
+    () => new Response("<html>Login</html>", { status: 200, headers: { "content-type": "text/html" } }),
+    () => Response.json({ error: "unauthorized" }),
+    () => Response.json({ areas: "no-array" }),
+    () => Response.json({ areas: [] }, { status: 401 }),
+    () => Response.json({ areas: [] }, { status: 403 }),
+  ];
+  for (const agenda of agendas) {
+    assert.equal((await checkSessionUsable(async () => EMPTY(), async () => agenda())).alive, false);
+  }
+  const expired = await checkSessionUsable(async () => EMPTY(), async () => { throw new SessionExpiredError(); });
+  assert.equal(expired.alive, false);
+  assert.ok(expired.error instanceof SessionExpiredError);
+});
+
+test("checkSessionUsable: lista no vacía => viva sin pedir la agenda", async () => {
+  let agendaCalls = 0;
+  const r = await checkSessionUsable(async () => COMPONENTS_OK(), async () => { agendaCalls++; return AGENDA_OK(); });
+  assert.equal(r.alive, true);
+  assert.equal(agendaCalls, 0);
+});
+
+test("checkSessionUsable: 302/HTML/JSON no-array en loadComponents => no viva y no consulta la agenda", async () => {
+  let agendaCalls = 0;
+  const loadAgenda = async () => { agendaCalls++; return AGENDA_OK(); };
+  for (const response of [
+    () => new Response(null, { status: 302, headers: { location: "/cas/login" } }),
+    () => new Response("<html>Login</html>", { headers: { "content-type": "text/html" } }),
+    () => Response.json({ error: "unauthorized" }),
+    () => Response.json([], { status: 401 }),
+    () => Response.json([], { status: 403 }),
+  ]) {
+    assert.equal((await checkSessionUsable(async () => response(), loadAgenda)).alive, false);
+  }
+  // Bukeala.req convierte el 302 en SessionExpiredError: también "no viva".
+  const thrown = await checkSessionUsable(async () => { throw new SessionExpiredError(); }, loadAgenda);
+  assert.equal(thrown.alive, false);
+  assert.match(thrown.note, /rechazada/);
+  assert.equal(agendaCalls, 0);
+});
+
+test("todayBogotaDashed usa UTC-5 (las 03:00 UTC aún son el día anterior en Bogotá)", () => {
+  assert.equal(todayBogotaDashed(Date.parse("2026-11-17T03:00:00Z")), "16-11-2026");
+  assert.equal(todayBogotaDashed(Date.parse("2026-11-17T16:36:00Z")), "17-11-2026");
 });
 
 test("counts include all persistent renewal paths and identify the actual UTC day", async () => {

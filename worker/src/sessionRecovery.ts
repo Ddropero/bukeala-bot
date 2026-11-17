@@ -298,6 +298,12 @@ export async function closeAutomaticRecovery(env: Env, now = Date.now()): Promis
   await completeRecovery(env, { requestedAt: request.requestedAt, ok: true }, now);
 }
 
+/**
+ * Solo responde "¿es una lista de componentes NO vacía y bien formada?". Un []
+ * da false aquí, pero NO significa sesión muerta (17-nov-2026: sesión viva con
+ * [] por no haber paciente seleccionado). Para decidir si la sesión sirve usar
+ * checkSessionUsable() de sessionStatus.ts, que confirma el [] con la agenda.
+ */
 export async function validComponentsResponse(response: Response): Promise<boolean> {
   if (response.status !== 200 || !(response.headers.get("content-type") ?? "").includes("json")) return false;
   try {

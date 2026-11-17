@@ -33,7 +33,8 @@ import { espejoCalendarCron } from "./cron/espejoCalendar";
 import { getDoctorRecipients } from "./users";
 import { processPendingRequests, loadPendingRequests } from "./claudeBookingAgent";
 import { requestRefresh } from "./handlers/nativeHostEvent";
-import { closeAutomaticRecovery, notifyRecoveryDelay, validComponentsResponse } from "./sessionRecovery";
+import { closeAutomaticRecovery, notifyRecoveryDelay } from "./sessionRecovery";
+import { AGENDA_AREA_ID, checkSessionUsable, todayBogotaDashed } from "./sessionStatus";
 import { handleHandoffWebhook, setupHandoffWebhook } from "./handoffBot";
 import { handleQuotesWebhook, setupQuotesWebhook } from "./quotesBot";
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
@@ -919,6 +920,27 @@ app.get("/debug/equipo-prueba", async (c) => {
   }
 });
 
+// ¿La sesión guardada sirve? → {alive, note}, con la MISMA regla que /estado
+// y el keepAlive (checkSessionUsable). La VM la consulta tras publicar cookies
+// en vez de /debug/components: el 17-nov-2026 ese endpoint devolvió [] con la
+// sesión viva (sin paciente seleccionado) y la VM rechazó su propia
+// publicación ("worker-verification-failed"). /debug/components queda como
+// herramienta cruda de depuración.
+// Registrada ANTES de /debug/:resource, que si no la capturaría.
+// no-store: el edge de workers.dev cachea GET de /debug y ya nos dio datos viejos.
+app.get("/debug/session-check", async (c) => {
+  const noStore = { "Cache-Control": "no-store" };
+  if (c.req.query("token") !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401, noStore);
+  }
+  const b = new Bukeala(c.env);
+  const { alive, note } = await checkSessionUsable(
+    () => b.loadComponents(),
+    () => b.getAgenda(todayBogotaDashed(), AGENDA_AREA_ID, false),
+  );
+  return c.json({ alive, note }, 200, noStore);
+});
+
 app.get("/debug/:resource", handleDebug);
 
 // Keep-alive cron:
@@ -960,10 +982,21 @@ async function keepAlive(env: Env): Promise<void> {
 
   const b = new Bukeala(env);
   try {
-    // Match the VM's authenticated check. A login page or HTTP 500 is not health.
-    const response = await b.loadComponents();
-    if (!(await validComponentsResponse(response))) throw new SessionExpiredError();
-    console.log("[keepalive] componentes autenticados verificados");
+    // Misma regla que /estado y la VM (checkSessionUsable): un login, un HTTP
+    // 500 o un [] sin agenda que confirme no son salud. Antes un [] (sesión
+    // viva sin paciente seleccionado, medido el 17-nov-2026) se daba por
+    // expirado y disparaba recuperaciones innecesarias.
+    const check = await checkSessionUsable(
+      () => b.loadComponents(),
+      () => b.getAgenda(todayBogotaDashed(), AGENDA_AREA_ID, false),
+    );
+    if (!check.alive) {
+      // Un fallo de red/inesperado conserva su ruta de antes ("unexpected
+      // error", sin recuperación); todo lo demás es sesión inutilizable.
+      if (check.error && !(check.error instanceof SessionExpiredError)) throw check.error;
+      throw new SessionExpiredError();
+    }
+    console.log(`[keepalive] sesión verificada: ${check.note}`);
     await closeAutomaticRecovery(env);
 
     // Telemetría: recordar el último ping OK de ESTA sesión (por capturedAt)

@@ -74,7 +74,7 @@ import { loadPendingRequests, clearPendingRequests, processPendingRequests } fro
 import { getNativeHostEvents, requestRefresh } from "./handlers/nativeHostEvent";
 import { requestExtensionSend, getExtensionLastSeenMin } from "./handlers/extensionCommand";
 import { getRecoveryStatus } from "./sessionRecovery";
-import { formatSessionStatus, probeSessionStatus, readRenewalCounts } from "./sessionStatus";
+import { AGENDA_AREA_ID, formatSessionStatus, probeSessionStatus, readRenewalCounts, todayBogotaDashed } from "./sessionStatus";
 import { isAllowed, isDoctor, getRole, getUserName, listUsers, addUser, removeUser, getDoctorRecipients, type Role } from "./users";
 import { encolarComando, cargarComandosPendientes } from "./tgPendingCommands";
 
@@ -507,7 +507,12 @@ export async function onText(env: Env, chatId: string, text: string): Promise<vo
     const esDoc = await isDoctor(env, chatId);
     const session = await loadSession(env);
     const health = session
-      ? await probeSessionStatus(() => new Bukeala(env).loadComponents())
+      // Con la agenda como segunda prueba: un [] de loadComponents (sin
+      // paciente seleccionado) no debe mostrar "caída" con la sesión viva.
+      ? await (async () => {
+        const b = new Bukeala(env);
+        return probeSessionStatus(() => b.loadComponents(), () => b.getAgenda(todayBogotaDashed(), AGENDA_AREA_ID, false));
+      })()
       : { alive: false, note: "no hay sesión guardada" };
     // Requesting recovery is not proof that a login is running or succeeded.
     // Read the coordinator afterwards to preserve its human-attention/backoff status.

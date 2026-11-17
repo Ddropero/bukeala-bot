@@ -360,12 +360,15 @@ test("actual strict Worker verifier rejects ambiguous responses after its bounde
   assert.equal(result.inconclusive, true);
 });
 
-test("strict Worker verifier requires real components JSON instead of alive:true", async t => {
-  const seenPaths = [];
+// 17-nov-2026: el modo estricto consulta /debug/session-check (regla única del
+// Worker, que confirma un [] de loadComponents con la agenda) en vez de exigir
+// componentes no vacíos, que rechazaba sesiones vivas sin paciente seleccionado.
+test("strict Worker verifier asks /debug/session-check with anti-cache and requires alive === true", async t => {
+  const seenUrls = [];
   const logs = [];
-  let body = JSON.stringify(COMPONENTS);
+  let body = JSON.stringify({ alive: true, note: "acceso autenticado comprobado" });
   t.mock.method(globalThis, "fetch", async (url, options) => {
-    seenPaths.push(new URL(url).pathname);
+    seenUrls.push(new URL(url));
     assert.equal(options.redirect, "manual");
     return new Response(body, { status: 200 });
   });
@@ -374,22 +377,52 @@ test("strict Worker verifier requires real components JSON instead of alive:true
     "https://example.invalid/capture", "SYNTHETIC_CAPTURE_SECRET", logger, { strict: true },
   );
   assert.equal(verified.ok, true);
-  assert.equal(verified.componentCount, 1);
   assert.equal(verified.status, 200);
+  assert.equal(seenUrls[0].pathname, "/debug/session-check");
+  assert.equal(seenUrls[0].searchParams.get("token"), "SYNTHETIC_CAPTURE_SECRET");
+  assert.match(seenUrls[0].searchParams.get("cb") ?? "", /^\d+$/);
+
+  body = JSON.stringify({ alive: false, note: "sesión rechazada por Bukeala" });
+  const dead = await sessionHelpers.verifyViaWorker(
+    "https://example.invalid/capture", "SYNTHETIC_CAPTURE_SECRET", logger, { strict: true },
+  );
+  assert.equal(dead.ok, false);
+  assert.notEqual(dead.inconclusive, true); // veredicto "malo", no ambiguo
+  assert.equal(dead.detail, "worker-session-check-not-alive");
+  assert.doesNotMatch(JSON.stringify(dead), /SECRET|token=/);
+
+  // Sin veredicto explícito (HTML del edge, alive ausente o no booleano): ambiguo.
   for (const invalid of [
     "<html>Login SYNTHETIC_BODY_SECRET</html>",
-    '{"alive":true}',
-    '[{"id":1218,"code":"x"}]',
+    "[]",
+    '{"alive":"true"}',
   ]) {
     body = invalid;
     const rejected = await sessionHelpers.verifyViaWorker(
       "https://example.invalid/capture", "SYNTHETIC_CAPTURE_SECRET", logger, { strict: true },
     );
     assert.equal(rejected.ok, false);
+    assert.equal(rejected.inconclusive, true);
     assert.doesNotMatch(JSON.stringify(rejected), /SECRET|token=/);
   }
-  assert.deepEqual(seenPaths, Array(4).fill("/debug/components"));
+  // 1 ok + 1 malo + 3 ambiguos con su reintento cada uno = 8 peticiones.
+  assert.equal(seenUrls.length, 8);
+  assert.ok(seenUrls.every(u => u.pathname === "/debug/session-check"));
   assert.doesNotMatch(JSON.stringify(logs), /SECRET|token=|<html>/);
+});
+
+test("strict Worker verifier treats HTTP 500 as ambiguous (one retry, inconclusive)", async t => {
+  let requests = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    requests++;
+    return new Response("synthetic error", { status: 500 });
+  });
+  const result = await sessionHelpers.verifyViaWorker(
+    "https://example.invalid/capture", "SYNTHETIC_CAPTURE_SECRET", () => {}, { strict: true },
+  );
+  assert.equal(requests, 2);
+  assert.equal(result.ok, false);
+  assert.equal(result.inconclusive, true);
 });
 
 test("strict Worker verifier rejects 401 and 403 immediately without exposing response bodies", async t => {
@@ -407,7 +440,7 @@ test("strict Worker verifier rejects 401 and 403 immediately without exposing re
     );
     assert.equal(result.ok, false);
     assert.equal(result.status, status);
-    assert.equal(result.detail, `worker-components-http-${status}`);
+    assert.equal(result.detail, `worker-session-check-http-${status}`);
   }
   assert.equal(requests, 2);
   assert.doesNotMatch(JSON.stringify(logs), /SECRET|token=/);
@@ -418,7 +451,7 @@ test("strict Worker verifier sanitizes network exceptions and fails after one re
   const logs = [];
   t.mock.method(globalThis, "fetch", async () => {
     requests++;
-    throw new Error("https://example.invalid/debug/components?token=SYNTHETIC_CAPTURE_SECRET");
+    throw new Error("https://example.invalid/debug/session-check?token=SYNTHETIC_CAPTURE_SECRET");
   });
   const result = await sessionHelpers.verifyViaWorker(
     "https://example.invalid/capture", "SYNTHETIC_CAPTURE_SECRET",

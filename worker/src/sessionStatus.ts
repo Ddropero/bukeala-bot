@@ -6,21 +6,102 @@ type RecoveryStatus = Awaited<ReturnType<typeof getRecoveryStatus>> | null;
 type ServiceEvent = { type: string; at: string; via?: string };
 const REUSED_SESSION = ["alive", "tgc", "persistent", "persistent-adopted"];
 
-/** HTML/login pages and arbitrary JSON are not evidence that the API is usable. */
-export async function probeSessionStatus(loadComponents: () => Promise<Response>) {
+/** Área de agenda del Dr. (la misma que usa /agenda). */
+export const AGENDA_AREA_ID = 1074;
+
+/**
+ * Hoy en Bogotá como DD-MM-YYYY (formato que pide getAgenda). Bogotá es UTC-5
+ * fijo, sin horario de verano, así que basta restar 5 h. Mismo cálculo que
+ * agendaConfirmaSesion() en native-host-cloud/autoLogin.js.
+ */
+export function todayBogotaDashed(now = Date.now()): string {
+  const d = new Date(now - 5 * 3600 * 1000);
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  return `${dd}-${mm}-${d.getUTCFullYear()}`;
+}
+
+/** 200 + JSON que es exactamente `[]` (loadComponents sin paciente seleccionado). */
+async function isEmptyComponentsList(response: Response): Promise<boolean> {
+  if (response.status !== 200 || !(response.headers.get("content-type") ?? "").includes("json")) return false;
+  try {
+    const body: unknown = await response.json();
+    return Array.isArray(body) && body.length === 0;
+  } catch { return false; }
+}
+
+/**
+ * La agenda confirma la sesión solo con 200 + JSON con `areas` array. No se
+ * exige content-type: se parsea el texto, y un HTML de login no es JSON.
+ * Un 302 ni llega aquí: Bukeala.req lo convierte en SessionExpiredError.
+ */
+async function agendaConfirmsSession(response: Response): Promise<boolean> {
+  if (response.status !== 200) return false;
+  try {
+    const body: unknown = JSON.parse((await response.text()).trim());
+    return !!body && typeof body === "object" && Array.isArray((body as { areas?: unknown }).areas);
+  } catch { return false; }
+}
+
+export type SessionCheck = { alive: boolean; note: string; error?: unknown };
+
+/**
+ * ÚNICA regla para decidir si la sesión guardada sirve (/estado, keepAlive y
+ * /debug/session-check, que es lo que consulta la VM antes de dar por buena
+ * una publicación).
+ *
+ * Por qué existe: MEDIDO el 17-nov-2026, con la sesión VIVA del Dr. (/agenda
+ * respondiendo), loadComponents devolvió [] (2 bytes) porque no había paciente
+ * seleccionado, cosa normal tras un login fresco. La regla vieja "lista vacía
+ * = sesión muerta" (7e74349, 20-oct) hacía que /estado dijera "caída", que el
+ * keepAlive disparara recuperaciones innecesarias y que la VM rechazara su
+ * propia publicación (log VM 16:36 UTC: 38 cookies HTTP 200 y luego
+ * "worker-verification-failed").
+ *
+ * Protección del 29-jul que NO se afloja: una sesión muerta da 302 (al login)
+ * o HTML, nunca 200 + JSON. Por eso un [] no basta solo: se confirma con la
+ * agenda del día, que no depende del paciente. 302/401/403/HTML/JSON no-array
+ * y [] sin agenda que confirme => no viva.
+ *
+ * Las funciones de carga se inyectan para poder probarla sin Bukeala real.
+ * Si una carga lanza, el error se devuelve en `error` para que el llamador
+ * distinga "Bukeala rechazó la sesión" de un fallo de red.
+ */
+export async function checkSessionUsable(
+  loadComponents: () => Promise<Response>,
+  loadAgenda: () => Promise<Response>,
+): Promise<SessionCheck> {
   try {
     const response = await loadComponents();
-    const alive = await validComponentsResponse(response);
-    return {
-      alive,
-      note: alive ? "acceso autenticado comprobado" : `HTTP ${response.status}: acceso autenticado no confirmado`,
-    };
+    // clone(): ambas pruebas leen el cuerpo y un Response solo se lee una vez.
+    if (await validComponentsResponse(response.clone())) {
+      return { alive: true, note: "acceso autenticado comprobado" };
+    }
+    if (!(await isEmptyComponentsList(response))) {
+      return { alive: false, note: `HTTP ${response.status}: acceso autenticado no confirmado` };
+    }
+    const agenda = await loadAgenda();
+    if (await agendaConfirmsSession(agenda)) {
+      return { alive: true, note: "acceso autenticado comprobado (componentes vacíos, confirmado por la agenda del día)" };
+    }
+    return { alive: false, note: `componentes vacíos y agenda HTTP ${agenda.status} sin confirmar: acceso autenticado no confirmado` };
   } catch (error) {
     return {
       alive: false,
       note: error instanceof SessionExpiredError ? "sesión rechazada por Bukeala" : "no se pudo comprobar el acceso",
+      error,
     };
   }
+}
+
+/** HTML/login pages and arbitrary JSON are not evidence that the API is usable. */
+export async function probeSessionStatus(
+  loadComponents: () => Promise<Response>,
+  loadAgenda: () => Promise<Response>,
+) {
+  // Se descarta `error`: /estado solo muestra alive + nota.
+  const { alive, note } = await checkSessionUsable(loadComponents, loadAgenda);
+  return { alive, note };
 }
 
 export async function readRenewalCounts(env: Env, now = Date.now()) {

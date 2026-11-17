@@ -202,8 +202,8 @@ function isComponentsResponse(value) {
 
 /**
  * Verificación AUTORITATIVA: le pregunta al WORKER si la sesión que acabamos
- * de empujar le sirve. El modo estricto consulta /debug/components y valida
- * el cuerpo real; el modo legacy conserva /debug/measure.
+ * de empujar le sirve. El modo estricto consulta /debug/session-check (exige
+ * alive === true); el modo legacy conserva /debug/measure.
  *
  * Por qué no basta verifySessionWorks(): esa prueba usa las cookies del
  * NAVEGADOR, y el Worker solo recibe el subconjunto que captureAndPush filtra
@@ -214,13 +214,24 @@ function isComponentsResponse(value) {
  */
 async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log, opts = {}) {
   const base = WORKER_URL.replace(/\/capture$/, "");
-  const resource = opts.strict ? "components" : "measure";
-  const url = `${base}/debug/${resource}?token=${encodeURIComponent(CAPTURE_TOKEN)}`;
+  // Modo estricto: /debug/session-check, que aplica en el Worker la MISMA regla
+  // que /estado y el keepAlive (loadComponents; si da [], confirma con la
+  // agenda del día). Antes se pedía /debug/components y se exigía lista no
+  // vacía: el 17-nov-2026 (log VM 16:36 UTC) el navegador verificó OK, la
+  // publicación dio HTTP 200 con 38 cookies, y aun así salió
+  // "worker-verification-failed" porque loadComponents devolvía [] con la
+  // sesión viva (sin paciente seleccionado). /debug/components sigue existiendo
+  // como herramienta cruda de depuración.
+  const resource = opts.strict ? "session-check" : "measure";
+  const baseUrl = `${base}/debug/${resource}?token=${encodeURIComponent(CAPTURE_TOKEN)}`;
 
   // Un intento: distingue VEREDICTO ({alive:true/false}) de AMBIGUO (5xx, red,
   // cuerpo no-JSON). Solo un veredicto explícito de "no sirve" descarta la sesión.
   async function attempt() {
     try {
+      // cb=<timestamp> por intento: el edge de workers.dev cachea GET de /debug
+      // y ya nos devolvió datos viejos; el reintento no puede leer la misma copia.
+      const url = opts.strict ? `${baseUrl}&cb=${Date.now()}` : baseUrl;
       const res = await fetch(url, {
         signal: AbortSignal.timeout(20_000),
         ...(opts.strict ? { redirect: "manual" } : {}),
@@ -228,19 +239,24 @@ async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log, opts = {}) {
       if (opts.strict) {
         const status = res.status;
         if (status !== 200) {
+          // 401/403 = el Worker rechaza explícitamente (se conserva "malo");
+          // cualquier otro no-200 es infraestructura, no un veredicto.
           return {
             verdict: status === 401 || status === 403 ? "malo" : "ambiguo",
-            detail: `worker-components-http-${status}`, status,
+            detail: `worker-session-check-http-${status}`, status,
           };
         }
-        let components;
-        try { components = JSON.parse(await res.text()); } catch {
-          return { verdict: "malo", detail: "worker-components-invalid-json", status };
+        let check;
+        try { check = JSON.parse(await res.text()); } catch {
+          // Nuestro endpoint siempre responde JSON: si no lo es, lo que habló
+          // fue el edge/infra, no el Worker. Sin veredicto => ambiguo.
+          return { verdict: "ambiguo", detail: "worker-session-check-invalid-json", status };
         }
-        if (!isComponentsResponse(components)) {
-          return { verdict: "malo", detail: "worker-components-invalid-shape", status };
-        }
-        return { verdict: "ok", detail: "worker-components-verified", status, componentCount: components.length };
+        // Solo alive === true literal es "ok": así un {} o alive:"true" no
+        // pueden colar una sesión muerta (protección del 29-jul).
+        if (check && check.alive === true) return { verdict: "ok", detail: "worker-session-check-alive", status };
+        if (check && check.alive === false) return { verdict: "malo", detail: "worker-session-check-not-alive", status };
+        return { verdict: "ambiguo", detail: "worker-session-check-no-alive-field", status };
       }
       if (!res.ok) return { verdict: "ambiguo", detail: `worker HTTP ${res.status}` };
       const text = await res.text();
@@ -255,7 +271,7 @@ async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log, opts = {}) {
       }
       return { verdict: "ambiguo", detail: "respuesta sin campo alive" };
     } catch (e) {
-      return { verdict: "ambiguo", detail: opts.strict ? "worker-components-network-error" : e.message };
+      return { verdict: "ambiguo", detail: opts.strict ? "worker-session-check-network-error" : e.message };
     }
   }
 
@@ -268,7 +284,7 @@ async function verifyViaWorker(WORKER_URL, CAPTURE_TOKEN, log, opts = {}) {
 
   if (r.verdict === "ok") return {
     ok: true, detail: r.detail,
-    ...(opts.strict ? { status: r.status, componentCount: r.componentCount } : {}),
+    ...(opts.strict ? { status: r.status } : {}),
   };
   if (r.verdict === "malo") {
     log("warn", "verify via worker: el Worker NO puede usar la sesión", { detail: r.detail });
