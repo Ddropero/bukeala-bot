@@ -14,6 +14,7 @@ import type { Env } from "../env";
 import { getDoctorRecipients } from "../users";
 import { processPendingRequests } from "../claudeBookingAgent";
 import { loadSession } from "../kv";
+import { sessionMark } from "../cron/sessionExpiryNotice";
 import { requestRecovery, pollRecovery, completeRecovery, type RefreshCompletion } from "../sessionRecovery";
 
 const TG = (token: string) => `https://api.telegram.org/bot${token}`;
@@ -418,6 +419,22 @@ export async function handleGetSession(c: Context<{ Bindings: Env }>) {
   const edadMin = Math.round((Date.now() - new Date(session.capturedAt).getTime()) / 60000);
   console.log(`[adopcion] entregando ${cookies.length} cookies (capturadas hace ${edadMin} min)`);
   return c.json({ found: true, capturedAt: session.capturedAt, edadMin, cookies });
+}
+
+/**
+ * Marca de la sesión guardada (huella, nunca el valor del TGC), solo si el
+ * keepAlive la comprobó viva y la captura es reciente: ver sessionMarkBody. La
+ * VM la consulta mientras está en backoff para reintentar en cuanto el Dr. se
+ * loguea, en vez de esperar hasta 60 min (19-nov-2026). No toca Bukeala. El
+ * token va SOLO por cabecera.
+ */
+export async function handleGetSessionMark(c: Context<{ Bindings: Env }>) {
+  const token = c.req.header("X-Capture-Token");
+  if (!token || token !== c.env.CAPTURE_TOKEN) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const body = await sessionMark(c.env, await loadSession(c.env));
+  return c.json(body, 200, { "Cache-Control": "no-store" });
 }
 
 // ====================================================================

@@ -63,8 +63,17 @@ export type LoginWatch = {
  * extensión publica el nuevo) y la sesión guardada alterna entre ambos. Volver
  * a ver un TGC conocido NO es un login nuevo. El reloj sigue al más reciente.
  */
-type WatchState = { logins: LoginWatch[] };
-type CookieLike = { name: string; value: string };
+type WatchState = {
+  logins: LoginWatch[];
+  /**
+   * Desde cuándo la sesión guardada está comprobada viva SIN interrupción (la
+   * pone el keepAlive al pasar de muerta/ausente a viva; se borra al morir).
+   * Es la señal para la VM (session-mark). No depende del TGC: las capturas
+   * guardadas a menudo no lo traen (medido el 19-nov-2026).
+   */
+  aliveSince?: number;
+};
+type CookieLike = { name: string; value: string; domain?: string };
 
 /** Bogotá es UTC-5 fijo (sin horario de verano). */
 function bogota(now: number): Date {
@@ -90,6 +99,46 @@ export async function tgcFingerprint(cookies: CookieLike[]): Promise<string | nu
   if (!tgc) return null;
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(tgc.value));
   return [...new Uint8Array(digest)].slice(0, 12).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** La VM solo adopta capturas de menos de 30 min (persistentSession.js, seed-not-fresh). */
+const MARK_MAX_CAPTURE_AGE_MIN = 25;
+
+/**
+ * Respuesta de /native-host/session-mark: "hay una sesión que vale la pena que
+ * la VM pruebe YA". Solo found:true si TODO se cumple, porque cada intento de
+ * la VM toca el portal:
+ *  - tiene JSESSIONID de Bukeala (algo que adoptar);
+ *  - el keepAlive del Worker la tiene comprobada viva (hay racha viva): una
+ *    sesión muerta que sigue en KV no cuenta;
+ *  - la captura es reciente (la VM rechaza las viejas).
+ * La marca identifica la racha viva (su hora de inicio): cambia cuando la
+ * sesión pasa de muerta/ausente a viva —un login nuevo del Dr.—, no cuando la
+ * VM o la extensión republican. `since` es esa misma hora: la VM descarta
+ * las rachas que ya estaban cuando hizo su último intento.
+ */
+export function sessionMarkBody(
+  session: { cookies?: CookieLike[]; capturedAt?: string } | null,
+  aliveSince: number | undefined,
+  now = Date.now(),
+): { found: boolean; mark?: string; since?: number } {
+  const cookies = session?.cookies ?? [];
+  const adoptable = cookies.some(
+    (k) => k.name === "JSESSIONID" && (k.domain ?? "").toLowerCase().includes("tuscitasmedicas"),
+  );
+  if (!adoptable) return { found: false };
+  const ageMin = (now - Date.parse(session?.capturedAt ?? "")) / 60000;
+  if (!(ageMin >= -2 && ageMin <= MARK_MAX_CAPTURE_AGE_MIN)) return { found: false };
+  if (!aliveSince || !(aliveSince <= now + 2 * 60000)) return { found: false };
+  return { found: true, mark: Math.floor(aliveSince).toString(16).padStart(12, "0"), since: aliveSince };
+}
+
+/** sessionMarkBody con el reloj de logins guardado en KV. */
+export async function sessionMark(
+  env: Env,
+  session: { cookies?: CookieLike[]; capturedAt?: string } | null,
+): Promise<{ found: boolean; mark?: string; since?: number }> {
+  return sessionMarkBody(session, (await readState(env)).aliveSince);
 }
 
 /**
@@ -152,13 +201,18 @@ async function readState(env: Env): Promise<WatchState> {
     const logins = Array.isArray(st?.logins)
       ? st.logins.filter((w) => w && typeof w.fp === "string" && Number.isFinite(w.loginAt))
       : [];
-    return { logins };
+    const aliveSince = Number.isFinite(st?.aliveSince) ? (st!.aliveSince as number) : undefined;
+    return { logins, ...(aliveSince ? { aliveSince } : {}) };
   } catch { return { logins: [] }; }
 }
 
 async function saveState(env: Env, state: WatchState): Promise<void> {
   const logins = [...state.logins].sort((a, b) => a.loginAt - b.loginAt).slice(-3);
-  await env.STATE.put(WATCH_KEY, JSON.stringify({ logins }), { expirationTtl: 60 * 60 * 24 * 3 });
+  await env.STATE.put(
+    WATCH_KEY,
+    JSON.stringify({ logins, ...(state.aliveSince ? { aliveSince: state.aliveSince } : {}) }),
+    { expirationTtl: 60 * 60 * 24 * 3 },
+  );
 }
 
 /** El login vigente: el más reciente conocido. */
@@ -204,15 +258,24 @@ export async function recordAliveSession(
 ): Promise<void> {
   const fp = await tgcFingerprint(session.cookies);
   const state = await readState(env);
+  // Paso de muerta/ausente a viva: arranca una "racha viva" (señal para la VM).
+  const becameAlive = !state.aliveSince;
+  if (becameAlive) state.aliveSince = now;
   // Sin TGC no se sabe de qué login es; si sirve, el vigente no está muerto.
   const known = fp ? state.logins.find((w) => w.fp === fp) : newest(state);
   if (known) {
-    if (!known.diedAt) return;
+    if (!known.diedAt) {
+      if (becameAlive) await saveState(env, state);
+      return;
+    }
     await undoDeath(env, known);
     await saveState(env, state);
     return;
   }
-  if (!fp) return;
+  if (!fp) {
+    if (becameAlive) await saveState(env, state);
+    return;
+  }
   const captured = Date.parse(session.capturedAt);
   state.logins.push({
     fp,
@@ -235,10 +298,27 @@ export async function recordSessionDeath(
   now = Date.now(),
 ): Promise<void> {
   const state = await readState(env);
+  const wasAlive = !!state.aliveSince;
+  delete state.aliveSince;
   const fp = session ? await tgcFingerprint(session.cookies) : null;
   const target = fp ? state.logins.find((w) => w.fp === fp) : newest(state);
-  if (!target || target.diedAt) return;
+  if (!target || target.diedAt) {
+    if (wasAlive) await saveState(env, state);
+    return;
+  }
   target.diedAt = now;
+  await saveState(env, state);
+}
+
+/**
+ * El keepAlive no encontró NINGUNA sesión guardada (caducó en KV). Solo corta
+ * la racha viva: la próxima sesión que sirva será una racha nueva para la VM.
+ * El reloj de logins no se toca.
+ */
+export async function recordNoSession(env: Env): Promise<void> {
+  const state = await readState(env);
+  if (!state.aliveSince) return;
+  delete state.aliveSince;
   await saveState(env, state);
 }
 

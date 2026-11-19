@@ -13,6 +13,28 @@ const RENEW_STAGES = new Set(["profile", "navigation", "adoption", "verification
 // Plazo del aviso de cycle-timeout: corto, porque tras él viene la salida y un
 // Worker lento no puede volver a dejar colgado el proceso.
 const CYCLE_TIMEOUT_REPORT_MS = 8000;
+// REINTENTO ANTICIPADO POR SESIÓN NUEVA. En backoff (hasta 60 min) la VM no
+// tocaba nada, así que tras un login del Dr. tardaba hasta una hora en adoptar
+// la sesión (19/nov/2026: 30 min sostenida solo por la extensión). Ahora, en
+// espera, pregunta al Worker (nunca al portal) por la "marca" de la sesión
+// guardada. El Worker solo da marca si SU keepAlive ya comprobó viva esa
+// sesión y la captura es reciente; la marca cambia con un login humano nuevo
+// (o si la misma sesión revive), no cuando la VM republica. Si es una marca
+// que esta VM no ha probado, se hace UN intento ya. Reglas para que el
+// anti-bot no vea más tráfico que antes salvo ese intento:
+//  - una marca se prueba una sola vez (se anota en disco antes de intentar);
+//  - una sesión que YA existía cuando la VM hizo su último intento no cuenta
+//    como nueva (el Worker dice desde cuándo existe): ya estuvo disponible;
+//  - al fallar cualquier ciclo se anota además la marca vigente (línea base);
+//  - como mucho UN intento anticipado por ventana de espera, y mínimo 5 min
+//    entre dos: una sesión que parpadea no multiplica los intentos;
+//  - el plazo de backoff en disco NO se toca: si el intento falla, cuelga o el
+//    proceso muere a mitad, la espera que corría sigue valiendo (nunca se
+//    acorta).
+const MARK_POLL_MS = 60000;
+const EARLY_RETRY_MIN_GAP_MS = 5 * 60000;
+const TRIED_MARKS_MAX = 8;
+const MARK_RE = /^[0-9a-f]{8,64}$/;
 
 function numberOption(value, fallback, minimum) {
   const n = Number(value);
@@ -99,6 +121,10 @@ function createPersistentWatcher(env, options = {}) {
   let activity = null;
   let fatal = false;
   let watchdogTimer = null;
+  // En memoria: tras un reinicio se consulta de nuevo (una petición barata).
+  let lastMarkPollAt = -Infinity;
+  // Plazo de backoff vigente cuando arrancó un intento anticipado (0 si no).
+  let backoffFloorAt = 0;
   const deadlineTimers = new Set();
 
   function persist() {
@@ -161,7 +187,7 @@ function createPersistentWatcher(env, options = {}) {
       // Cuenta como falla: el proceso nuevo respeta un backoff corto (no de
       // autenticación) en vez de reintentar en bucle, y el estado sobrevive.
       status.failures++;
-      status.nextAttemptAt = now() + retryMs({ reasonCode: "cycle-timeout" });
+      status.nextAttemptAt = Math.max(backoffFloorAt, now() + retryMs({ reasonCode: "cycle-timeout" }));
       status.nextScheduledAt = status.nextAttemptAt;
       status.lastCompletedAt = new Date(now()).toISOString();
       status.lastResult = { ...safeResult({ reasonCode: "cycle-timeout" }), stage: where };
@@ -225,6 +251,62 @@ function createPersistentWatcher(env, options = {}) {
     }
   }
 
+  // Marca de la sesión que el Worker tiene guardada y comprobada viva, y desde
+  // cuándo existe. null = sin dato (red, Worker viejo, sin sesión viva, sin
+  // TGC, respuesta rara): nunca dispara un reintento.
+  async function fetchSessionMark() {
+    try {
+      const answer = await request("/native-host/session-mark", null, 8000);
+      return answer?.found === true && typeof answer.mark === "string" && MARK_RE.test(answer.mark) &&
+        Number.isFinite(answer.since) ? { mark: answer.mark, since: answer.since } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function rememberTriedMark(mark) {
+    if (!mark) return;
+    const tried = Array.isArray(status.triedMarks) ? status.triedMarks.filter((m) => m !== mark) : [];
+    tried.push(mark);
+    status.triedMarks = tried.slice(-TRIED_MARKS_MAX);
+  }
+
+  /**
+   * En backoff: ¿llegó al Worker una sesión que esta VM aún no ha probado? Si
+   * sí, levanta la espera para UN intento. Devuelve true si hay que reintentar.
+   */
+  async function newSessionArrived() {
+    if (!(status.failures > 0)) return false;
+    if (now() - lastMarkPollAt < MARK_POLL_MS) return false;
+    lastMarkPollAt = now();
+    // Un solo intento anticipado por ventana de espera: lo rearma el siguiente
+    // ciclo normal (o el éxito). Mientras tanto ni se consulta.
+    if (status.earlyRetryUsed) return false;
+    if (now() - (status.lastEarlyRetryAt || 0) < EARLY_RETRY_MIN_GAP_MS) return false;
+    const current = await fetchSessionMark();
+    if (!current) return false;
+    const { mark, since } = current;
+    if (Array.isArray(status.triedMarks) && status.triedMarks.includes(mark)) return false;
+    // ¿Ya existía cuando empezó el último intento? Entonces ese intento ya la
+    // tuvo disponible para adoptar: es línea base, no sesión nueva. (Cubre el
+    // arranque tras un cycle-timeout y la sesión de siempre que acaba de
+    // fallar, aunque el Worker aún no la tuviera registrada en ese momento.)
+    const lastAttempt = Date.parse(status.lastAttemptAt || "");
+    if (!(since > lastAttempt)) {
+      rememberTriedMark(mark);
+      persist();
+      return false;
+    }
+    // Se anota ANTES de intentar y el plazo en disco queda igual: si el
+    // proceso muere a mitad, ni se repite la marca ni se pierde la espera.
+    rememberTriedMark(mark);
+    status.lastEarlyRetryAt = now();
+    status.earlyRetryUsed = true;
+    persist();
+    logger("info", "sesión nueva en el Worker; reintento anticipado");
+    return true;
+  }
+
   function retryMs(result) {
     // The session manager also persists its full-login cooldown across restarts.
     if (/captcha|blocked|credential|login|cooldown|challenge|config/i.test(result.reasonCode || "")) {
@@ -233,13 +315,19 @@ function createPersistentWatcher(env, options = {}) {
     return Math.min(600000, 90000 * Math.max(1, status.failures));
   }
 
-  async function runCycle(reason = "scheduled") {
+  async function runCycle(reason = "scheduled", { bypassBackoff = false } = {}) {
     if (closed || inFlight) return { skipped: true, reason: "busy" };
     // A new process must reopen a healthy profile immediately, even if it
     // stopped during the previous success's short polling throttle. Failed
     // cycles retain their durable retry deadline, including on startup.
     const resumeHealthyProfile = reason === "startup" && status.failures === 0;
-    if (now() < status.nextAttemptAt && !resumeHealthyProfile) return { skipped: true, reason: "backoff" };
+    // bypassBackoff: solo el intento anticipado por sesión nueva (en memoria).
+    const early = bypassBackoff && now() < status.nextAttemptAt;
+    if (now() < status.nextAttemptAt && !resumeHealthyProfile && !early) return { skipped: true, reason: "backoff" };
+    // Un intento anticipado nunca acorta la espera que ya corría.
+    backoffFloorAt = early ? status.nextAttemptAt : 0;
+    // Un ciclo normal abre una ventana de espera nueva: rearma el anticipado.
+    if (!early) delete status.earlyRetryUsed;
     inFlight = true;
     const previousActivity = activity;
     activity = { name: "cycle", since: monotonic() };
@@ -266,11 +354,19 @@ function createPersistentWatcher(env, options = {}) {
         status.lastSuccessAt = status.lastCompletedAt;
         status.successfulCycles++;
         status.failures = 0;
+        delete status.triedMarks;
+        delete status.lastEarlyRetryAt;
+        delete status.earlyRetryUsed;
         status.nextAttemptAt = now() + Math.min(pollMs, 30000);
         status.nextScheduledAt = now() + intervalMs;
       } else {
         status.failures++;
-        status.nextAttemptAt = now() + retryMs(summary);
+        // Línea base: la sesión que el Worker tiene AHORA ya se probó (o es la
+        // que acaba de fallar); solo otra distinta justifica un intento
+        // anticipado. Una petición al Worker por ciclo fallido, ninguna en
+        // marcha normal.
+        rememberTriedMark((await fetchSessionMark())?.mark);
+        status.nextAttemptAt = Math.max(backoffFloorAt, now() + retryMs(summary));
         status.nextScheduledAt = status.nextAttemptAt;
       }
       if (summary.loginAttempted && summary.authenticated) {
@@ -323,10 +419,16 @@ function createPersistentWatcher(env, options = {}) {
     activity = { name: "tick", since: monotonic() };
     try {
       await flushCompletion();
-      // El backoff se respeta tal cual (política deliberada, con pruebas): en
-      // espera no se consulta al Worker. Por eso el Worker avisa al Dr. solo
-      // tras 2 h sin eventos, muy por encima del backoff máximo de 60 min.
-      if (now() < status.nextAttemptAt) return;
+      // El backoff se respeta (política deliberada, con pruebas): en espera no
+      // se leen órdenes remotas ni se toca el portal. Única excepción: si al
+      // Worker llegó una sesión que esta VM no ha probado (login nuevo del
+      // Dr.), se hace UN intento ya. El Worker avisa al Dr. solo tras 2 h sin
+      // eventos, muy por encima del backoff máximo de 60 min.
+      if (now() < status.nextAttemptAt) {
+        if (!(await newSessionArrived())) return;
+        await runCycle("new-session", { bypassBackoff: true });
+        return;
+      }
       let pending = null;
       try { pending = await request("/native-host/check-refresh"); }
       catch { logger("warn", "no se pudo leer orden remota"); }

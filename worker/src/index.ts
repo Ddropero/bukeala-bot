@@ -11,7 +11,7 @@ import { handleListTemplates, handleCreateTemplates, handleCreateAgendaTemplate,
 import { handleDashboard } from "./handlers/dashboard";
 import { handlePanel } from "./handlers/panel";
 import { handleApiAgenda } from "./handlers/apiAgenda";
-import { handleNativeHostEvent, handleCheckRefresh, handleRefreshComplete, handleGetTgc, handleGetSession } from "./handlers/nativeHostEvent";
+import { handleNativeHostEvent, handleCheckRefresh, handleRefreshComplete, handleGetTgc, handleGetSession, handleGetSessionMark } from "./handlers/nativeHostEvent";
 import {
   handleExtensionRequestSend,
   handleExtensionCheckSend,
@@ -34,7 +34,7 @@ import { getDoctorRecipients } from "./users";
 import { processPendingRequests, loadPendingRequests } from "./claudeBookingAgent";
 import { requestRefresh } from "./handlers/nativeHostEvent";
 import { closeAutomaticRecovery, notifyRecoveryDelay } from "./sessionRecovery";
-import { recordAliveSession, recordSessionDeath, sessionExpiryNotice } from "./cron/sessionExpiryNotice";
+import { recordAliveSession, recordNoSession, recordSessionDeath, sessionExpiryNotice } from "./cron/sessionExpiryNotice";
 import { AGENDA_AREA_ID, checkSessionUsable, keepAliveAction, sessionCheckResponse, todayBogotaDashed } from "./sessionStatus";
 import { handleHandoffWebhook, setupHandoffWebhook } from "./handoffBot";
 import { handleQuotesWebhook, setupQuotesWebhook } from "./quotesBot";
@@ -73,6 +73,10 @@ app.get("/native-host/tgc", handleGetTgc);
 // La VM ADOPTA esta sesión (no loguea): Radware le bloquea el login, pero el
 // JSESSIONID de Bukeala sí es portable a otra IP. Ver handleGetSession.
 app.get("/native-host/session", handleGetSession);
+
+// Huella de la sesión guardada: la VM en backoff la consulta para reintentar
+// apenas llega un login nuevo. Ver handleGetSessionMark.
+app.get("/native-host/session-mark", handleGetSessionMark);
 
 // Cola de órdenes para la EXTENSIÓN del navegador del Dr. — renovación remota
 // SIN abrir el popup. Mismo patrón que /native-host/check-refresh pero con
@@ -958,6 +962,7 @@ async function keepAlive(env: Env): Promise<void> {
     // empujar (apagada, colgada) el blob expiraba a las 12h y nadie se
     // enteraba: /agenda muerto en silencio. Ahora pedimos renovación.
     console.log("[keepalive] sin sesión en KV → pidiendo renovación");
+    try { await recordNoSession(env); } catch { /* señal para la VM: no bloqueante */ }
     const lastNoSession = await env.STATE.get("keepalive:noSessionRefreshAt");
     if (!lastNoSession || Date.now() - parseInt(lastNoSession, 10) > 10 * 60 * 1000) {
       try {

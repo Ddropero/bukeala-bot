@@ -231,3 +231,52 @@ test("formato de hora Bogotá", () => {
   assert.equal(m.formatBogotaTime(T("2026-11-19T17:00:00Z")), "12:00 p. m.");
 });
 
+
+test("marca de sesión: solo con racha viva, captura reciente y algo que adoptar", () => {
+  const NOW = T("2026-11-19T17:00:00Z");
+  const bukeala = { name: "JSESSIONID", value: "j", domain: "appoint.tuscitasmedicas.com" };
+  const ses = (ageMin = 2, js = bukeala) => ({ cookies: [js], capturedAt: iso(NOW - ageMin * MIN) });
+  const since = NOW - 10 * MIN;
+  const a = m.sessionMarkBody(ses(), since, NOW);
+  assert.equal(a.found, true);
+  assert.match(a.mark, /^[0-9a-f]{12}$/);
+  assert.equal(a.since, since);
+  assert.equal(m.sessionMarkBody(ses(0, { ...bukeala, value: "otro" }), since, NOW).mark, a.mark,
+    "republicar la misma sesión viva no cambia la marca");
+  assert.notEqual(m.sessionMarkBody(ses(), since + MIN, NOW).mark, a.mark, "otra racha viva sí");
+  const no = { found: false };
+  assert.deepEqual(m.sessionMarkBody(null, since, NOW), no);
+  assert.deepEqual(m.sessionMarkBody(ses(), undefined, NOW), no, "el keepAlive no la tiene comprobada viva");
+  assert.deepEqual(m.sessionMarkBody(ses(26), since, NOW), no, "captura vieja: la VM la rechazaría");
+  assert.deepEqual(m.sessionMarkBody({ cookies: [bukeala] }, since, NOW), no, "sin capturedAt");
+  assert.deepEqual(m.sessionMarkBody(ses(2, { name: "JSESSIONID", value: "j", domain: "cas.otro.com" }), since, NOW),
+    no, "sin JSESSIONID de Bukeala no hay qué adoptar");
+});
+
+test("la racha viva arranca al pasar de muerta/ausente a viva, con o sin TGC, y no se mueve mientras siga viva", async (t) => {
+  const f = fixture(t);
+  const bukeala = { name: "JSESSIONID", value: "j", domain: "appoint.tuscitasmedicas.com" };
+  const now0 = Date.now() - 20 * MIN;
+  // Captura SIN TGC (lo habitual): igual cuenta.
+  const s = () => ({ cookies: [bukeala], capturedAt: new Date().toISOString() });
+  assert.deepEqual(await m.sessionMark(f.env, s()), { found: false }, "sin comprobar, no hay marca");
+  await m.recordAliveSession(f.env, s(), now0);
+  const viva = await m.sessionMark(f.env, s());
+  assert.equal(viva.found, true);
+  assert.equal(viva.since, now0);
+  await m.recordAliveSession(f.env, s(), now0 + 3 * MIN);
+  await m.recordAliveSession(f.env, { cookies: [bukeala, { name: "TGC", value: "TGT-x" }], capturedAt: s().capturedAt }, now0 + 6 * MIN);
+  assert.equal((await m.sessionMark(f.env, s())).mark, viva.mark, "seguir viva (aunque aparezca un TGC) no cambia la marca");
+  // Muere: sin marca. Revive (login nuevo): marca nueva y since nuevo.
+  await m.recordSessionDeath(f.env, s(), now0 + 9 * MIN);
+  assert.deepEqual(await m.sessionMark(f.env, s()), { found: false });
+  await m.recordAliveSession(f.env, s(), now0 + 12 * MIN);
+  const nueva = await m.sessionMark(f.env, s());
+  assert.equal(nueva.since, now0 + 12 * MIN);
+  assert.notEqual(nueva.mark, viva.mark);
+  // La sesión desaparece de KV: se corta la racha sin tocar el reloj de logins.
+  const antes = JSON.parse(await f.env.STATE.get("session:loginWatch")).logins;
+  await m.recordNoSession(f.env);
+  assert.deepEqual(await m.sessionMark(f.env, s()), { found: false });
+  assert.deepEqual(JSON.parse(await f.env.STATE.get("session:loginWatch")).logins, antes);
+});

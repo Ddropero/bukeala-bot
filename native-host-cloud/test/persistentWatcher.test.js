@@ -29,6 +29,7 @@ function fixture(t) {
   let clock = START;
   let pending = { pending: false };
   let networkFailure = null;
+  let sessionMark = { found: false };
   const env = {
     WORKER_URL: "https://worker.invalid/capture",
     CAPTURE_TOKEN: "synthetic-test-value",
@@ -57,7 +58,8 @@ function fixture(t) {
     return {
       ok: true,
       status: 200,
-      json: async () => parsed.pathname === "/native-host/check-refresh" ? pending : { ok: true },
+      json: async () => parsed.pathname === "/native-host/check-refresh" ? pending
+        : parsed.pathname === "/native-host/session-mark" ? sessionMark : { ok: true },
     };
   };
   t.after(async () => {
@@ -77,6 +79,8 @@ function fixture(t) {
     setTime: (value) => { clock = value; },
     advance: (value) => { clock += value; },
     setPending: (value) => { pending = value; },
+    // since: desde cuándo existe esa sesión en el Worker. Por defecto, "acaba de llegar".
+    setSessionMark: (mark, since = clock + 1) => { sessionMark = mark ? { found: true, mark, since } : { found: false }; },
     failNetworkWhen: (value) => { networkFailure = value; },
     create(manager, extra = {}) {
       const watcher = createPersistentWatcher(env, {
@@ -229,9 +233,11 @@ test("exceptions become failures; restart and on-demand requests cannot bypass b
   assert.equal((await failing.runCycle("startup")).reasonCode, "cycle_exception");
   f.setPending({ pending: true, requestedAt: "synthetic-request-1" });
   f.advance(30_000);
-  const callsBefore = f.requests.length;
   await failing.tick();
-  assert.equal(f.requests.length, callsBefore, "backoff must not pick up a remote request early");
+  // En espera solo se consulta la marca de sesión (barata, al Worker); la orden
+  // remota no se lee ni se toca el portal.
+  assert.equal(f.requests.filter((r) => r.pathname === "/native-host/check-refresh").length, 0,
+    "backoff must not pick up a remote request early");
   assert.equal(renewCalls, 1);
   await failing.close();
 
@@ -623,4 +629,223 @@ test("el vigilante externo lee el mismo latido que escribe el servicio y lo mata
   assert.ok(maxAge * 1000 > 10 * MINUTE);
   assert.match(script, /systemctl kill --signal=SIGKILL --kill-whom=all bukeala\.service/);
   assert.match(script, /systemctl enable --now bukeala-liveness\.timer/);
+});
+
+const authFailing = (counter) => ({
+  renew: async () => {
+    counter.calls++;
+    return counter.next ? counter.next() : { ok: false, authenticated: false, reasonCode: "auth-challenge" };
+  },
+  close: async () => {},
+});
+const MARK_A = "aaaaaaaaaaaaaaaaaaaaaaaa";
+const MARK_B = "bbbbbbbbbbbbbbbbbbbbbbbb";
+
+test("en backoff, una sesión nueva en el Worker dispara UN reintento inmediato y la VM la adopta", async (t) => {
+  const f = fixture(t);
+  const counter = { calls: 0 };
+  const watcher = f.create(authFailing(counter));
+  await watcher.runCycle("startup");
+  assert.equal(watcher.getStatus().nextAttemptAt, START + 30 * MINUTE);
+  // Sin sesión en el Worker: la espera sigue intacta.
+  for (let minute = 1; minute <= 5; minute++) { f.setTime(START + minute * MINUTE); await watcher.tick(); }
+  assert.equal(counter.calls, 1);
+  // El Dr. se loguea: aparece una marca nunca probada.
+  f.setSessionMark(MARK_A);
+  counter.next = () => healthy({ via: "persistent-adopted" });
+  f.setTime(START + 6 * MINUTE);
+  await watcher.tick();
+  assert.equal(counter.calls, 2, "debe reintentar sin esperar los 30 min");
+  assert.equal(watcher.getStatus().failures, 0);
+  assert.equal(watcher.getStatus().triedMarks, undefined, "el éxito limpia las marcas probadas");
+  assert.equal(f.logs.filter((l) => l.message === "ciclo persistente").at(-1).meta.reason, "new-session");
+});
+
+test("la sesión que había al fallar es la línea base: no se reintenta sin login nuevo", async (t) => {
+  const f = fixture(t);
+  const counter = { calls: 0 };
+  // La sesión de siempre sigue guardada en el Worker cuando la VM empieza a fallar.
+  f.setSessionMark(MARK_A, START - HOUR);
+  const watcher = f.create(authFailing(counter));
+  await watcher.runCycle("startup");
+  assert.deepEqual(watcher.getStatus().triedMarks, [MARK_A], "el primer fallo anota la marca vigente");
+  for (let minute = 1; minute <= 29; minute++) { f.setTime(START + minute * MINUTE); await watcher.tick(); }
+  assert.equal(counter.calls, 1, "sin login nuevo no hay segundo golpe al portal");
+  // Otra sesión (B) se prueba una vez; luego A/B alternando no cuentan más.
+  f.setSessionMark(MARK_B);
+  f.setTime(START + 29 * MINUTE + 30_000);
+  await watcher.tick();
+  await watcher.tick();
+  f.setTime(START + 29 * MINUTE + 61_000);
+  await watcher.tick();
+  assert.equal(counter.calls, 2);
+  for (let minute = 31; minute <= 50; minute++) {
+    f.setTime(START + minute * MINUTE);
+    f.setSessionMark(minute % 2 ? MARK_A : MARK_B);
+    await watcher.tick();
+  }
+  assert.equal(counter.calls, 2, "marcas alternadas ya probadas no generan más intentos");
+});
+
+test("un intento anticipado que falla nunca acorta la espera que ya corría", async (t) => {
+  const f = fixture(t);
+  const counter = { calls: 0 };
+  const watcher = f.create(authFailing(counter));
+  await watcher.runCycle("startup");
+  f.setTime(START + 30 * MINUTE);
+  await watcher.tick(); // segunda falla de autenticación → espera de 60 min
+  const deadline = START + 90 * MINUTE;
+  assert.equal(watcher.getStatus().nextAttemptAt, deadline);
+  // Login nuevo, pero el intento falla con un código NO de autenticación
+  // (retryMs daría minutos): el plazo de 60 min debe seguir en pie.
+  f.setSessionMark(MARK_A);
+  counter.next = () => ({ ok: false, authenticated: false, reasonCode: "navigation-failed" });
+  f.setTime(START + 40 * MINUTE);
+  await watcher.tick();
+  assert.equal(counter.calls, 3);
+  assert.equal(watcher.getStatus().nextAttemptAt, deadline);
+  for (let minute = 41; minute < 90; minute++) { f.setTime(START + minute * MINUTE); await watcher.tick(); }
+  assert.equal(counter.calls, 3, "ningún intento más hasta el plazo original");
+  f.setTime(deadline);
+  await watcher.tick();
+  assert.equal(counter.calls, 4);
+});
+
+test("si el proceso muere durante el intento anticipado, el reinicio respeta la espera y no repite la marca", async (t) => {
+  const f = fixture(t);
+  const counter = { calls: 0 };
+  const statusFile = path.join(f.dir, "watcher-status.json");
+  let onDisk = null;
+  const watcher = f.create({
+    renew: async () => {
+      counter.calls++;
+      if (counter.calls === 2) onDisk = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+      return { ok: false, authenticated: false, reasonCode: "auth-challenge" };
+    },
+    close: async () => {},
+  });
+  await watcher.runCycle("startup");
+  f.setSessionMark(MARK_A);
+  f.setTime(START + 3 * MINUTE);
+  await watcher.tick();
+  assert.equal(counter.calls, 2);
+  // Lo que había en disco MIENTRAS corría el intento (lo que vería un proceso
+  // nuevo tras un SIGKILL): plazo original intacto y la marca ya anotada.
+  assert.equal(onDisk.nextAttemptAt, START + 30 * MINUTE);
+  assert.deepEqual(onDisk.triedMarks, [MARK_A]);
+  fs.writeFileSync(statusFile, JSON.stringify(onDisk));
+  const restarted = f.create(authFailing(counter));
+  f.setTime(START + 4 * MINUTE);
+  assert.equal((await restarted.runCycle("startup")).reason, "backoff");
+  for (let minute = 5; minute <= 29; minute++) { f.setTime(START + minute * MINUTE); await restarted.tick(); }
+  assert.equal(counter.calls, 2);
+});
+
+test("un intento anticipado que se cuelga tampoco acorta la espera", async (t) => {
+  const f = fixture(t);
+  const counter = { calls: 0 };
+  const exits = [];
+  const watcher = f.create({
+    renew: () => {
+      counter.calls++;
+      return counter.calls === 1
+        ? Promise.resolve({ ok: false, authenticated: false, reasonCode: "auth-challenge" })
+        : new Promise(() => {});
+    },
+    close: async () => {},
+  }, { cycleTimeoutMs: 20, exit: (code) => exits.push(code) });
+  await watcher.runCycle("startup");
+  f.setSessionMark(MARK_A);
+  f.setTime(START + 3 * MINUTE);
+  await watcher.tick();
+  assert.deepEqual(exits, [3]);
+  assert.equal(watcher.getStatus().nextAttemptAt, START + 30 * MINUTE, "el cycle-timeout daría 3 min; manda la espera previa");
+});
+
+test("un solo intento anticipado por ventana de espera, aunque la sesión parpadee o lleguen más", async (t) => {
+  const f = fixture(t);
+  const counter = { calls: 0 };
+  const watcher = f.create(authFailing(counter));
+  await watcher.runCycle("startup"); // espera hasta el minuto 30
+  f.setTime(START + 1 * MINUTE);
+  f.setSessionMark(MARK_A);
+  await watcher.tick();
+  assert.equal(counter.calls, 2);
+  const deadline = watcher.getStatus().nextAttemptAt;
+  assert.equal(deadline, START + 61 * MINUTE);
+  // La sesión "revive" cada pocos minutos (marca distinta cada vez) y además
+  // llega otro login: nada de eso da otro intento en esta ventana.
+  for (let minute = 2; minute <= 60; minute++) {
+    f.setTime(START + minute * MINUTE);
+    f.setSessionMark(MARK_A.slice(0, 22) + (minute % 200).toString(16).padStart(2, "0"));
+    await watcher.tick();
+  }
+  assert.equal(counter.calls, 2, "una sesión que parpadea no multiplica los golpes al portal");
+  assert.equal(watcher.getStatus().nextAttemptAt, deadline);
+  // Vence la espera: ciclo normal, que rearma UN anticipado para la ventana nueva.
+  f.setTime(deadline);
+  await watcher.tick();
+  assert.equal(counter.calls, 3);
+  f.setTime(deadline + 6 * MINUTE);
+  f.setSessionMark(MARK_B);
+  await watcher.tick();
+  assert.equal(counter.calls, 4);
+  f.setTime(deadline + 12 * MINUTE);
+  f.setSessionMark("cccccccccccccccccccccccc");
+  await watcher.tick();
+  assert.equal(counter.calls, 4);
+});
+
+test("una sesión que ya existía en el último intento no es nueva, aunque el Worker la anuncie después", async (t) => {
+  const f = fixture(t);
+  const counter = { calls: 0 };
+  // El Worker todavía no la tiene registrada cuando la VM falla (su keepAlive
+  // corre cada 3 min): no hay marca que anotar como línea base.
+  const watcher = f.create(authFailing(counter));
+  f.setTime(START + 2 * MINUTE);
+  await watcher.runCycle("startup");
+  // Aparece la marca, pero la sesión existe desde ANTES del intento.
+  f.setSessionMark(MARK_A, START + 1 * MINUTE);
+  for (let minute = 3; minute <= 20; minute++) { f.setTime(START + minute * MINUTE); await watcher.tick(); }
+  assert.equal(counter.calls, 1);
+  assert.deepEqual(watcher.getStatus().triedMarks, [MARK_A]);
+  // Respuesta sin "since" (Worker viejo o raro): tampoco dispara nada.
+  f.setSessionMark(MARK_B, undefined);
+  f.setTime(START + 21 * MINUTE);
+  f.setSessionMark(MARK_B, null);
+  await watcher.tick();
+  assert.equal(counter.calls, 1);
+});
+
+test("marca inválida o Worker caído no disparan nada; un reinicio no repite la marca", async (t) => {
+  const f = fixture(t);
+  const counter = { calls: 0 };
+  let watcher = f.create(authFailing(counter));
+  await watcher.runCycle("startup");
+  f.setSessionMark("no-es-hex!!");
+  f.setTime(START + 2 * MINUTE);
+  await watcher.tick();
+  f.failNetworkWhen((request) => request.pathname === "/native-host/session-mark");
+  f.setSessionMark(MARK_A);
+  f.setTime(START + 4 * MINUTE);
+  await watcher.tick();
+  assert.equal(counter.calls, 1);
+  f.failNetworkWhen(null);
+  f.setTime(START + 6 * MINUTE);
+  await watcher.tick();
+  assert.equal(counter.calls, 2);
+  await watcher.close();
+  watcher = f.create(authFailing(counter));
+  f.setTime(START + 20 * MINUTE);
+  assert.equal((await watcher.runCycle("startup")).reason, "backoff");
+  await watcher.tick();
+  assert.equal(counter.calls, 2, "tras reiniciar, la marca ya probada sigue anotada en disco");
+});
+
+test("en marcha normal (sin fallos) no se consulta la marca de sesión", async (t) => {
+  const f = fixture(t);
+  const watcher = f.create({ renew: async () => healthy(), close: async () => {} });
+  await watcher.runCycle("startup");
+  for (let minute = 1; minute <= 25; minute++) { f.setTime(START + minute * MINUTE); await watcher.tick(); }
+  assert.equal(f.requests.filter((r) => r.pathname === "/native-host/session-mark").length, 0);
 });
