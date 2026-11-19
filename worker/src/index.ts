@@ -34,6 +34,7 @@ import { getDoctorRecipients } from "./users";
 import { processPendingRequests, loadPendingRequests } from "./claudeBookingAgent";
 import { requestRefresh } from "./handlers/nativeHostEvent";
 import { closeAutomaticRecovery, notifyRecoveryDelay } from "./sessionRecovery";
+import { recordAliveSession, recordSessionDeath, sessionExpiryNotice } from "./cron/sessionExpiryNotice";
 import { AGENDA_AREA_ID, checkSessionUsable, keepAliveAction, sessionCheckResponse, todayBogotaDashed } from "./sessionStatus";
 import { handleHandoffWebhook, setupHandoffWebhook } from "./handoffBot";
 import { handleQuotesWebhook, setupQuotesWebhook } from "./quotesBot";
@@ -1000,6 +1001,10 @@ async function keepAlive(env: Env): Promise<void> {
     }
     if (action === "expired") throw new SessionExpiredError();
     console.log(`[keepalive] sesión verificada: ${check.note}`);
+    // Reloj del aviso "tu sesión está por vencer" (cron/sessionExpiryNotice.ts).
+    try { await recordAliveSession(env, s); } catch (e) {
+      console.log("[keepalive] login-watch falló:", (e as Error).message);
+    }
     await closeAutomaticRecovery(env);
 
     // Telemetría: recordar el último ping OK de ESTA sesión (por capturedAt)
@@ -1051,6 +1056,7 @@ async function keepAlive(env: Env): Promise<void> {
       return;
     }
     console.log("[keepalive] session expired");
+    try { await recordSessionDeath(env, s); } catch { /* aviso previo: no bloqueante */ }
 
     // Telemetría: si ESTA misma sesión tuvo un ping OK antes, registrar cuánto
     // vivió realmente (responde "¿cuánto dura el JSESSIONID?" con datos).
@@ -1152,7 +1158,14 @@ export default {
       ctx.waitUntil(espejoCalendarCron(env, { origen: "cron" }));
     } else {
       // Default: keepAlive (cada 3 min)
-      ctx.waitUntil(keepAlive(env));
+      // + aviso al Dr. 30 min antes de que venza la sesión (y a las 6 a. m.
+      // si venció de noche). Va después del keepAlive para leer su veredicto.
+      ctx.waitUntil(
+        keepAlive(env)
+          .catch((e) => console.log("[keepalive] falló:", (e as Error).message))
+          .then(() => sessionExpiryNotice(env))
+          .catch((e) => console.log("[expiry-notice] falló:", (e as Error).message)),
+      );
     }
   },
 };
